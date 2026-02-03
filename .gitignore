@@ -16,6 +16,9 @@ credentials.json
 *.swp
 *.swo
 
+# Local tooling
+.cargo/
+
 # OS
 .DS_Store
 Thumbs.db
