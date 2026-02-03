@@ -16,3 +16,12 @@ This document explains the main pieces of the app at a high level. It is intende
 - A shared in-memory buffer bridges Spotify (producer) to Discord (consumer).
 - Simple EQ controls exist today: preamp, bass boost, treble boost.
 - The EQ runs in the audio sink; avoid heavy work in this path.
+
+## Config and Cache
+- Configuration is read from .env (see .env.example).
+- Spotify credentials are cached locally in .spotify_cache/credentials.json.
+- A stable device ID is used to avoid duplicate devices in Spotify.
+
+## Presence and Logs
+- The bot updates Discord presence with basic playback state.
+- Logs are quiet by default; use RUST_LOG for troubleshooting.
