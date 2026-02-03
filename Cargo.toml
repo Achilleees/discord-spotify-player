@@ -12,7 +12,8 @@ serenity = { version = "0.12.4", default-features = false, features = ["client",
 songbird = { version = "0.5", default-features = true, features = ["serenity", "rustls"] }
 symphonia = { version = "0.5", default-features = false, features = ["pcm"] }
 
-# Spotify Connect - using 0.4.x (has vergen compatibility)
+# Spotify Connect - staying on 0.4.x due to vergen ecosystem bug in 0.5+
+# See AGENTS.md for details on the upgrade attempt
 librespot = { version = "0.4" }
 librespot-core = "0.4"
 librespot-metadata = "0.4"
@@ -29,3 +30,4 @@ parking_lot = "0.12"  # Fast synchronization primitives
 futures-util = "0.3"
 hex = "0.4"
 rand = "0.8"
+

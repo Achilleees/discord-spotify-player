@@ -21,11 +21,11 @@ use tokio::sync::mpsc;
 
 const CACHE_DIR: &str = ".spotify_cache";
 const DEVICE_ID_FILE: &str = "device_id";
-const CONNECT_RETRIES: usize = 3;
-const CONNECT_RETRY_DELAY_MS: u64 = 500;
-const MAX_CACHED_RECONNECTS: usize = 3;
-const RECONNECT_BASE_DELAY_MS: u64 = 750;
-const MIN_STABLE_SESSION_SECS: u64 = 30;
+const CONNECT_RETRIES: usize = 5;
+const CONNECT_RETRY_DELAY_MS: u64 = 300;
+const MAX_CACHED_RECONNECTS: usize = 5;
+const RECONNECT_BASE_DELAY_MS: u64 = 500;
+const MIN_STABLE_SESSION_SECS: u64 = 60;
 
 enum CredentialOrigin {
     Discovery,
@@ -337,17 +337,25 @@ impl SpotifyPlayer {
                 if cached_reconnects < MAX_CACHED_RECONNECTS {
                     cached_reconnects += 1;
                     pending_cached = Some(creds);
-                    tracing::info!(
-                        "Spotify session ended. Scheduling reconnect attempt {}/{}.",
+                    // Note: This disconnect is caused by a keepalive bug in librespot 0.4.x
+                    // The fix exists in 0.5.0+ but can't be used due to vergen ecosystem issues
+                    // See AGENTS.md for details
+                    println!("Connection lost. Reconnecting ({}/{})...", cached_reconnects, MAX_CACHED_RECONNECTS);
+                    tracing::warn!(
+                        "Spotify session ended after {:?}. Scheduling reconnect attempt {}/{}. \
+                        (This is a known librespot 0.4.x keepalive issue)",
+                        session_duration,
                         cached_reconnects,
                         MAX_CACHED_RECONNECTS
                     );
                 } else {
-                    tracing::info!("Spotify session ended. Waiting for new connection...");
+                    println!("Connection lost. Please re-select '{}' in Spotify.", device_name);
+                    tracing::info!("Spotify session ended. Max reconnects reached, waiting for new pairing...");
                     pending_cached = None;
                     cached_reconnects = 0;
                 }
             } else {
+                println!("Connection lost. Please re-select '{}' in Spotify.", device_name);
                 tracing::info!("Spotify session ended. Waiting for new connection...");
             }
         }
