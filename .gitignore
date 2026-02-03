@@ -1,6 +1,7 @@
 # Build artifacts
 /target/
 *.zip
+releases/
 
 # Environment and secrets
 .env
