@@ -11,3 +11,8 @@ This document explains the main pieces of the app at a high level. It is intende
 - The app exposes a Spotify Connect device via discovery on the local network.
 - When you select the device, it pairs and starts a Spotify session.
 - Spotify playback is decoded and pushed into the audio bridge.
+
+## Audio Bridge and DSP
+- A shared in-memory buffer bridges Spotify (producer) to Discord (consumer).
+- Simple EQ controls exist today: preamp, bass boost, treble boost.
+- The EQ runs in the audio sink; avoid heavy work in this path.
