@@ -6,3 +6,8 @@ This document explains the main pieces of the app at a high level. It is intende
 - The bot logs in with your Discord bot token and connects to a single guild/channel.
 - Songbird joins the target voice channel and plays a raw PCM stream.
 - There are no text commands; the bot only handles voice.
+
+## Spotify Connect Path (Librespot)
+- The app exposes a Spotify Connect device via discovery on the local network.
+- When you select the device, it pairs and starts a Spotify session.
+- Spotify playback is decoded and pushed into the audio bridge.
