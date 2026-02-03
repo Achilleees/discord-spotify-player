@@ -1,0 +1,21 @@
+# Build artifacts
+/target/
+
+# Environment and secrets
+.env
+*.pem
+*.key
+
+# Spotify credentials cache
+credentials.json
+.spotify_cache/
+
+# IDE
+.idea/
+.claude/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
