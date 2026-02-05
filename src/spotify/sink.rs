@@ -1,5 +1,5 @@
 use crate::audio_bridge::AudioBridge;
-use librespot_playback::audio_backend::{Sink, SinkError, SinkResult};
+use librespot_playback::audio_backend::{Sink, SinkResult};
 use librespot_playback::decoder::AudioPacket;
 use librespot_playback::{NUM_CHANNELS, SAMPLE_RATE};
 use std::sync::Arc;
@@ -243,8 +243,9 @@ impl Sink for DiscordSink {
                 }
                 Ok(())
             }
-            AudioPacket::OggData(_) => {
-                Err(SinkError::OnWrite("OGG passthrough not supported".to_string()))
+            AudioPacket::Raw(_) => {
+                // Raw audio data - not used in our decode pipeline
+                Ok(())
             }
         }
     }

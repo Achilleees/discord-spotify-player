@@ -24,15 +24,13 @@ This repo is a Discord voice bridge for Spotify Connect. Use these notes when ma
 - README should explain what the bot does and expectations, not implementation details.
 - Do not include any user-specific identifiers or tokens.
 
-## Known Issues
+## Librespot Version
 
-### Spotify Disconnects Every ~2 Minutes (librespot 0.4.x keepalive bug)
-- **Symptom**: `subscription terminated` and `os error 10054` in logs, Spotify client loses connection
-- **Root cause**: librespot 0.4.x has a keepalive ping/pong bug. Fixed in 0.5.0 via PR #1359.
-- **Why we can't upgrade**: librespot 0.5+ has a vergen ecosystem bug - `vergen-gitcl 1.0.x` pulls in conflicting `vergen-lib` versions (0.1.6 and 9.1.0). This affects all librespot versions 0.5.0 through 0.8.0.
-- **Attempted fixes** (Feb 2025): Tried 0.5.0, 0.7.1, 0.8.0, git dev branch, various patch configurations. All fail with same vergen conflict.
-- **Workaround**: App reconnects automatically (up to 5 attempts). User may need to re-select device in Spotify after reconnect.
-- **Future**: Monitor vergen-gitcl releases for fix, then retry librespot upgrade.
+Using librespot **0.8.0** which includes the keepalive fix (PR #1359) for stable connections.
+
+### Upgrade Notes (Feb 2026)
+- The vergen-lib version conflict that blocked upgrades was fixed by pinning `vergen = "=9.0.6"` and `vergen-gitcl = "=1.0.5"` in build-dependencies
+- See https://github.com/librespot-org/librespot/issues/1681 for the upstream issue
 
 ### Librespot Legality
 - Gray area - reverse-engineered Spotify protocol, technically violates ToS
