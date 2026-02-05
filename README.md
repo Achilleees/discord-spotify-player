@@ -19,9 +19,27 @@ A personal Discord bot that makes your Spotify session available in a voice chan
 - Connects one Discord bot to one server and one voice channel at a time.
 - No UI yet; configuration is via `.env`.
 
-## What it does not do
-- No chat commands, slash commands, or music queues.
-- No library browsing or search inside Discord.
+## Roadmap
+
+Planned features (in progress):
+
+| Feature | Branch | Status |
+|---------|--------|--------|
+| **Now Playing Channel** | `feat/now-playing-channel` | Planned |
+| **Setup Wizard** | `feat/setup-wizard` | Planned |
+| **YouTube Support** | `feat/youtube-support` | Planned |
+
+### Now Playing Channel
+A dedicated text channel that displays the current track with a rich embed (album art, track info, Spotify link). Includes sticky playback controls (play/pause/skip buttons) so you can control Spotify without switching apps.
+
+### Setup Wizard
+Interactive first-run CLI that guides new users through configuration. Paste your Discord token, and it fetches your servers and channels automatically - no more manually copying IDs.
+
+### YouTube Support
+Play YouTube links or search YouTube directly from Discord. Audio routes through the same voice channel alongside Spotify.
+
+## What it does not do (yet)
+- No library browsing or search inside Discord (YouTube search planned).
 - No recording, downloads, or file storage of audio.
 - No multi-channel or multi-server routing.
 

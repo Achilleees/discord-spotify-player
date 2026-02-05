@@ -38,3 +38,51 @@ Using librespot **0.8.0** which includes the keepalive fix (PR #1359) for stable
 - No audio extraction/DRM bypass (intentionally limited)
 - Project has operated 10+ years without legal action
 - See: https://github.com/librespot-org/librespot
+
+## Roadmap
+
+Three feature branches are in progress. Update this section as work proceeds.
+
+### feat/now-playing-channel
+**Goal:** Text channel with rich embeds and playback controls.
+
+Implementation notes:
+- Add optional `DISCORD_NOW_PLAYING_CHANNEL_ID` to config
+- Create embed builder for track info (title, artist, album art, Spotify link)
+- Use Discord message components (buttons) for play/pause/skip
+- Keep one "sticky" message that gets edited on track change
+- Wire button interactions to Spirc commands
+- Fetch album art URL from librespot metadata
+
+Dependencies: None (serenity already supports embeds and components)
+
+### feat/setup-wizard
+**Goal:** Interactive CLI for first-run configuration.
+
+Implementation notes:
+- Detect missing/incomplete `.env` on startup
+- Add `dialoguer` crate for CLI prompts
+- Use Discord REST API (not gateway) to list guilds and channels
+- Flow: prompt token -> validate -> list guilds -> pick guild -> list voice channels -> pick channel -> write `.env`
+- Generate bot invite URL with correct permissions
+- Consider: also prompt for `DEVICE_NAME`
+
+Dependencies: `dialoguer`, `reqwest` (for REST calls without full gateway)
+
+### feat/youtube-support
+**Goal:** Play YouTube audio alongside Spotify.
+
+Implementation notes:
+- Use `yt-dlp` as external binary for extraction (avoid linking ffmpeg)
+- Add slash command or message trigger (`!yt <url>` or `/play <url>`)
+- Extract audio URL, stream through same AudioBridge
+- Need to handle: Spotify vs YouTube source switching, queue behavior
+- Consider: YouTube search via `yt-dlp --default-search ytsearch:`
+- Legal: YouTube ToS is stricter than Spotify; document risks
+
+Dependencies: `yt-dlp` binary, possibly `symphonia` for additional codecs
+
+### Branch workflow
+- Each feature branch starts from `main`
+- Merge to `main` when feature is complete and tested
+- Update README roadmap status when merging
