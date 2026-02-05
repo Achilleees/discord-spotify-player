@@ -99,7 +99,6 @@ impl SpotifyPlayer {
         match track_uri {
             SpotifyUri::Track { .. } => {
                 let track = Track::get(session, track_uri).await.ok()?;
-                // In 0.8, track.artists is already Vec<Artist> with name field
                 let artist_names: Vec<_> = track
                     .artists
                     .iter()
@@ -121,28 +120,21 @@ impl SpotifyPlayer {
         }
     }
 
-    /// Run Spotify Connect using discovery mode
-    /// This announces the device on the local network, and Spotify apps can connect to it
+    /// Run Spotify Connect in discovery mode.
+    /// Announces the device on the local network for Spotify clients to find.
     pub async fn run_discovery(
         config: &Config,
         bridge: Arc<AudioBridge>,
         presence_tx: mpsc::UnboundedSender<PresenceUpdate>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        tracing::info!("Starting Spotify Connect discovery...");
-        tracing::info!("Device name: '{}'", config.device_name);
-
         let cache = Self::create_cache()?;
         let device_id = Self::resolve_device_id(config);
         let device_name = config.device_name.clone();
         let client_id = SessionConfig::default().client_id;
         let mut discovery = Self::start_discovery(&device_id, &device_name, &client_id)?;
 
-        println!("Spotify device '{}' is ready. Select it in Spotify.", device_name);
-        tracing::info!("Spotify Connect device is now discoverable!");
-        tracing::info!(
-            "Open Spotify on your phone/computer and look for '{}' in the device list.",
-            device_name
-        );
+        tracing::info!(device = %device_name, "Spotify Connect discovery started");
+        println!("Spotify device '{}' ready.", device_name);
 
         let mut pending_cached = cache.credentials();
         let mut cached_reconnects: usize = 0;
@@ -166,18 +158,15 @@ impl SpotifyPlayer {
                 }
             };
 
-            match origin {
-                CredentialOrigin::Discovery => {
-                    println!("Spotify paired. Connecting...");
-                    tracing::info!("Received credentials from Spotify client!");
-                }
-                CredentialOrigin::Cache => {
-                    println!("Spotify reconnecting...");
-                    tracing::info!("Attempting Spotify reconnect using cached credentials.");
-                }
+            let is_reconnect = matches!(origin, CredentialOrigin::Cache);
+            if is_reconnect {
+                println!("Reconnecting...");
+                tracing::debug!("Using cached credentials");
+            } else {
+                println!("Paired. Connecting...");
+                tracing::debug!("New credentials from discovery");
             }
 
-            // Create session - Spirc::new will handle the actual connection
             let session = Self::create_session(&cache, &device_id);
 
             let session_start = std::time::Instant::now();
@@ -215,21 +204,24 @@ impl SpotifyPlayer {
                 let mut last_track: Option<SpotifyUri> = None;
                 let mut last_title = String::new();
                 let mut last_artist = String::new();
+
                 while let Some(event) = rx.recv().await {
                     match event {
                         PlayerEvent::Playing { track_id, .. } => {
-                            if last_track.as_ref() != Some(&track_id) {
+                            let is_new_track = last_track.as_ref() != Some(&track_id);
+                            if is_new_track {
                                 if let Some((title, artist)) =
                                     Self::fetch_track_info(&session_for_meta, &track_id).await
                                 {
-                                    last_track = Some(track_id);
+                                    println!("Playing: {} - {}", title, artist);
                                     last_title = title;
                                     last_artist = artist;
                                 } else {
-                                    last_track = Some(track_id);
+                                    println!("Playing: (unknown track)");
                                     last_title.clear();
                                     last_artist.clear();
                                 }
+                                last_track = Some(track_id);
                             }
                             let title = if last_title.is_empty() {
                                 "Unknown track".to_string()
@@ -242,39 +234,37 @@ impl SpotifyPlayer {
                                 last_artist.clone()
                             };
                             let _ = presence_tx_events.send(PresenceUpdate::Playing { title, artist });
-                            println!("Playback started.");
                         }
                         PlayerEvent::Paused { .. } => {
                             let _ = presence_tx_events.send(PresenceUpdate::Paused);
                             bridge_for_events.clear();
-                            println!("Playback paused.");
+                            tracing::debug!("Playback paused");
                         }
                         PlayerEvent::Stopped { .. } => {
                             let _ = presence_tx_events.send(PresenceUpdate::Idle);
                             bridge_for_events.clear();
-                            println!("Playback stopped.");
+                            tracing::debug!("Playback stopped");
                         }
                         PlayerEvent::TrackChanged { .. } => {
                             last_track = None;
-                            println!("Track changed.");
                         }
-                        PlayerEvent::Loading { .. } => println!("Loading track..."),
+                        PlayerEvent::Loading { .. } => {
+                            tracing::debug!("Loading track");
+                        }
                         PlayerEvent::EndOfTrack { .. } => {
                             let _ = presence_tx_events.send(PresenceUpdate::Idle);
                             bridge_for_events.clear();
-                            println!("Track ended.");
                         }
                         PlayerEvent::Unavailable { .. } => {
                             let _ = presence_tx_events.send(PresenceUpdate::Idle);
                             bridge_for_events.clear();
-                            println!("Track unavailable.");
+                            println!("Track unavailable");
                         }
                         _ => {}
                     }
                 }
             });
 
-            // Spirc::new handles the actual Spotify connection
             let (spirc, spirc_task) = match Spirc::new(
                 connect_config,
                 session.clone(),
@@ -285,29 +275,24 @@ impl SpotifyPlayer {
             .await
             {
                 Ok(result) => {
-                    println!("Spotify connected.");
-                    tracing::info!("Connected to Spotify!");
+                    println!("Connected.");
                     result
                 }
                 Err(e) => {
-                    match origin {
-                        CredentialOrigin::Cache => {
-                            tracing::warn!("Cached credentials failed: {:?}", e);
-                        }
-                        CredentialOrigin::Discovery => {
-                            tracing::error!("Failed to connect to Spotify: {:?}", e);
-                        }
+                    if is_reconnect {
+                        tracing::warn!(error = ?e, "Reconnect failed");
+                    } else {
+                        tracing::error!(error = ?e, "Connection failed");
                     }
                     continue;
                 }
             };
 
-            // Activate the device to sync state with Spotify
             if let Err(e) = spirc.activate() {
-                tracing::warn!("Failed to activate Spirc: {:?}", e);
+                tracing::warn!(error = ?e, "Device activation failed");
             }
 
-            tracing::info!("Spotify Connect is now active! Play music and it will stream to Discord.");
+            tracing::info!("Spotify Connect active");
 
             spirc_task.await;
             drop(spirc);
@@ -323,22 +308,22 @@ impl SpotifyPlayer {
                 if cached_reconnects < MAX_CACHED_RECONNECTS {
                     cached_reconnects += 1;
                     pending_cached = Some(creds);
-                    println!("Connection lost. Reconnecting ({}/{})...", cached_reconnects, MAX_CACHED_RECONNECTS);
+                    println!("Disconnected. Reconnecting ({}/{})...", cached_reconnects, MAX_CACHED_RECONNECTS);
                     tracing::warn!(
-                        "Spotify session ended after {:?}. Scheduling reconnect attempt {}/{}.",
-                        session_duration,
-                        cached_reconnects,
-                        MAX_CACHED_RECONNECTS
+                        duration = ?session_duration,
+                        attempt = cached_reconnects,
+                        max = MAX_CACHED_RECONNECTS,
+                        "Session ended, reconnecting"
                     );
                 } else {
-                    println!("Connection lost. Please re-select '{}' in Spotify.", device_name);
-                    tracing::info!("Spotify session ended. Max reconnects reached, waiting for new pairing...");
+                    println!("Disconnected. Re-select '{}' in Spotify.", device_name);
+                    tracing::info!("Max reconnects reached, waiting for new pairing");
                     pending_cached = None;
                     cached_reconnects = 0;
                 }
             } else {
-                println!("Connection lost. Please re-select '{}' in Spotify.", device_name);
-                tracing::info!("Spotify session ended. Waiting for new connection...");
+                println!("Disconnected. Select '{}' in Spotify.", device_name);
+                tracing::debug!("No cached credentials, waiting for discovery");
             }
         }
 
