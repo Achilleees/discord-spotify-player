@@ -62,7 +62,7 @@ Play YouTube links or search YouTube directly from Discord. Audio routes through
    - `DISCORD_TOKEN`
    - `DISCORD_GUILD_ID`
    - `DISCORD_CHANNEL_ID`
-   - Optional: `DEVICE_NAME`, `DEVICE_ID`, `RUST_LOG`
+   - Optional: `DEVICE_NAME`, `DEVICE_ID`, `AUDIO_BUFFER_SECONDS`, `PREBUFFER_SECONDS`, EQ settings, `RUST_LOG`
 6. Start the bot:
    - Build and run: `cargo build --release` then `target\release\discord-spotify-player.exe`
 7. Open Spotify on a device on the same network and select the new device in the Spotify Connect list.
@@ -81,9 +81,17 @@ Play YouTube links or search YouTube directly from Discord. Audio routes through
 
 ## Configuration inputs (high-level)
 - Discord token and IDs for the target server and voice channel.
-- A device name shown inside Spotify.
+- A device name shown inside Spotify (default: `Discord Player`).
 - Optional stable device ID to keep the device list clean.
-- Optional logging level via `RUST_LOG`.
+- Audio buffer size (`AUDIO_BUFFER_SECONDS`, default 8) and prebuffer time (`PREBUFFER_SECONDS`, default 2.0).
+- Optional EQ: `PREAMP_DB`, `BASS_BOOST_DB`, `TREBLE_BOOST_DB` (all default 0.0).
+- Logging level via `RUST_LOG` (default `info`). Simple values (`trace`, `debug`, `info`, `warn`, `error`) use app-centric presets that keep dependency logs quiet. Custom `RUST_LOG` filter strings are also accepted.
+
+## Logging and troubleshooting
+- By default only this app's `info`-level messages appear; dependency crates (serenity, songbird, librespot) stay at `warn`.
+- Set `RUST_LOG=debug` for more detail or `RUST_LOG=trace` for full diagnostics. These still only increase verbosity for this app, not dependencies.
+- For full control pass a custom filter: `RUST_LOG="debug,librespot=info"`.
+- Audio pipeline stats are emitted at `debug` level every 5 seconds on the `audio_stream` target.
 
 ## Further reading
 - `docs/components.md` for a component overview.

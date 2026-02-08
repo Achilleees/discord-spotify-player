@@ -16,6 +16,17 @@ This repo is a Discord voice bridge for Spotify Connect. Use these notes when ma
 - Use `RUST_LOG` to enable debug logs; default should stay quiet.
 - Keep Spotify device IDs stable to avoid duplicate devices.
 
+## Logging policy
+- All tracing messages should be lowercase (e.g. `tracing::info!("configuration loaded")`).
+- Use structured tracing fields instead of format strings (e.g. `tracing::debug!(samples = n, "push_samples")`).
+- Sink start/stop are `debug`, not `info`. Reserve `info` for startup milestones and connection events.
+- The `audio_stream` target is used for high-frequency audio diagnostics; gate these behind `debug` or sampled counters.
+
+## Dependency policy
+- `rand` is at 0.10. Use `rand::random::<T>()` (no `Rng` trait import needed for simple cases).
+- `librespot` is at 0.8 with pinned vergen workaround in build-deps. Check upstream before bumping.
+- Prefer `parking_lot::Mutex` over `std::sync::Mutex` for non-async locks (shorter critical sections, no poisoning).
+
 ## Behavior
 - This bot exposes a Spotify Connect device and routes audio into one Discord voice channel.
 - No text commands are expected; avoid adding them unless requested.

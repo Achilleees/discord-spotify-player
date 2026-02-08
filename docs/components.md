@@ -6,6 +6,7 @@ This document explains the main pieces of the app at a high level. It is intende
 - The bot logs in with your Discord bot token and connects to a single guild/channel.
 - Songbird joins the target voice channel and plays a raw PCM stream.
 - There are no text commands; the bot only handles voice.
+- Code lives in `src/discord/`: `bot.rs` (gateway handler + client), `voice.rs` (SimpleBridgeReader + track events), `presence.rs` (status text + presence loop).
 
 ## Spotify Connect Path (Librespot)
 - The app exposes a Spotify Connect device via discovery on the local network.
@@ -23,5 +24,6 @@ This document explains the main pieces of the app at a high level. It is intende
 - A stable device ID is used to avoid duplicate devices in Spotify.
 
 ## Presence and Logs
-- The bot updates Discord presence with basic playback state.
-- Logs are quiet by default; use RUST_LOG for troubleshooting.
+- The bot updates Discord presence with basic playback state (Unicode music notes for playing, plain text for idle/paused).
+- Presence logic lives in `src/discord/presence.rs`.
+- Logs use app-centric presets by default (app at `info`, deps at `warn`). Set `RUST_LOG` to `debug` or `trace` for more detail, or pass a custom filter string.
