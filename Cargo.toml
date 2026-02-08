@@ -29,7 +29,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 parking_lot = "0.12"  # Fast synchronization primitives
 futures-util = "0.3"
 hex = "0.4"
-rand = "0.8"
+rand = "0.10"
 
 # Force vergen 9.0.6 to fix librespot build (vergen-lib version conflict)
 # See: https://github.com/librespot-org/librespot/issues/1681
