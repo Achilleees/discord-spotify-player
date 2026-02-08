@@ -40,12 +40,12 @@ impl AudioBridge {
     pub fn push_samples(&self, samples: &[f32]) {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let count = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if count % 100 == 0 {
+        if count.is_multiple_of(100) {
             tracing::debug!(
                 target: "audio_stream",
-                "push_samples called {} times, samples: {}",
-                count,
-                samples.len()
+                calls = count,
+                samples = samples.len(),
+                "push_samples"
             );
         }
 
@@ -55,13 +55,12 @@ impl AudioBridge {
             self.stats
                 .total_dropped
                 .fetch_add(samples.len() as u64, std::sync::atomic::Ordering::Relaxed);
-            if count % 200 == 0 {
+            if count.is_multiple_of(200) {
                 tracing::warn!(
-                    "AudioBridge full; dropping {} samples (total dropped {})",
-                    samples.len(),
-                    self.stats
-                        .total_dropped
-                        .load(std::sync::atomic::Ordering::Relaxed)
+                    target: "audio_stream",
+                    dropped = samples.len(),
+                    total_dropped = self.stats.total_dropped.load(std::sync::atomic::Ordering::Relaxed),
+                    "bridge full, dropping samples"
                 );
             }
             return;
@@ -72,17 +71,16 @@ impl AudioBridge {
                 (samples.len() - to_take) as u64,
                 std::sync::atomic::Ordering::Relaxed,
             );
-            if count % 200 == 0 {
+            if count.is_multiple_of(200) {
                 tracing::warn!(
-                    "AudioBridge nearly full; dropping {} samples (total dropped {})",
-                    samples.len() - to_take,
-                    self.stats
-                        .total_dropped
-                        .load(std::sync::atomic::Ordering::Relaxed)
+                    target: "audio_stream",
+                    dropped = samples.len() - to_take,
+                    total_dropped = self.stats.total_dropped.load(std::sync::atomic::Ordering::Relaxed),
+                    "bridge nearly full, dropping samples"
                 );
             }
         }
-        buffer.extend(samples.iter().take(to_take).copied());
+        buffer.extend(&samples[..to_take]);
         if to_take > 0 {
             self.stats
                 .total_pushed
@@ -102,23 +100,29 @@ impl AudioBridge {
         let mut buffer = self.buffer.lock();
         let available = buffer.len().min(output.len());
 
-        if count % 100 == 0 {
+        if count.is_multiple_of(100) {
             tracing::debug!(
                 target: "audio_stream",
-                "pull_samples called {} times, buffer: {}, requested: {}",
-                count,
-                buffer.len(),
-                output.len()
+                calls = count,
+                buffered = buffer.len(),
+                requested = output.len(),
+                "pull_samples"
             );
         }
 
-        for out in output.iter_mut().take(available) {
-            if let Some(sample) = buffer.pop_front() {
-                *out = sample;
+        // Copy via VecDeque's two contiguous slices, then drain.
+        // Avoids per-element pop_front and temporary Vec allocation.
+        {
+            let (head, tail) = buffer.as_slices();
+            if available <= head.len() {
+                output[..available].copy_from_slice(&head[..available]);
             } else {
-                break;
+                let from_head = head.len();
+                output[..from_head].copy_from_slice(head);
+                output[from_head..available].copy_from_slice(&tail[..available - from_head]);
             }
         }
+        buffer.drain(..available);
 
         if available > 0 {
             self.stats

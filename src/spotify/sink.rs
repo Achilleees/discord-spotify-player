@@ -162,7 +162,7 @@ impl DiscordSink {
 
 impl Sink for DiscordSink {
     fn start(&mut self) -> SinkResult<()> {
-        tracing::info!("Spotify sink started");
+        tracing::debug!("spotify sink started");
         self.bridge.clear();
         self.start_instant = None;
         self.frames_sent = 0;
@@ -170,75 +170,83 @@ impl Sink for DiscordSink {
     }
 
     fn stop(&mut self) -> SinkResult<()> {
-        tracing::info!("Spotify sink stopped");
+        tracing::debug!("spotify sink stopped");
         self.bridge.clear();
         self.start_instant = None;
         self.frames_sent = 0;
         Ok(())
     }
 
-    fn write(&mut self, packet: AudioPacket, _converter: &mut librespot_playback::convert::Converter) -> SinkResult<()> {
+    fn write(
+        &mut self,
+        packet: AudioPacket,
+        _converter: &mut librespot_playback::convert::Converter,
+    ) -> SinkResult<()> {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         match packet {
             AudioPacket::Samples(samples) => {
                 let count = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let _frames = samples.len() / NUM_CHANNELS as usize;
-                if count < 5 || count % 200 == 0 {
+                if count < 5 || count.is_multiple_of(200) {
                     tracing::debug!(
                         target: "audio_stream",
-                        "Sink write: {} samples",
-                        samples.len()
+                        samples = samples.len(),
+                        "sink write"
                     );
                 }
 
-                if self.scratch.len() < samples.len() {
-                    self.scratch.resize(samples.len(), 0.0);
+                let n = samples.len();
+                if self.scratch.len() < n {
+                    self.scratch.resize(n, 0.0);
                 }
 
-                for (idx, (dst, src)) in self.scratch[..samples.len()]
-                    .iter_mut()
-                    .zip(samples.iter())
-                    .enumerate()
-                {
-                    let mut value = *src as f32;
-                    if self.dsp_enabled {
-                        value *= self.preamp_gain;
-                        if idx % 2 == 0 {
-                            value = self.low_l.process(value);
-                            value = self.high_l.process(value);
-                        } else {
-                            value = self.low_r.process(value);
-                            value = self.high_r.process(value);
-                        }
+                if self.dsp_enabled {
+                    let gain = self.preamp_gain;
+                    // Process stereo frames (L/R pairs) to avoid per-sample branch.
+                    let frame_count = n / 2;
+                    for i in 0..frame_count {
+                        let li = i * 2;
+                        let mut l = samples[li] as f32 * gain;
+                        let mut r = samples[li + 1] as f32 * gain;
+                        l = self.low_l.process(l);
+                        l = self.high_l.process(l);
+                        r = self.low_r.process(r);
+                        r = self.high_r.process(r);
+                        self.scratch[li] = l.clamp(-1.0, 1.0);
+                        self.scratch[li + 1] = r.clamp(-1.0, 1.0);
                     }
-                    *dst = value.clamp(-1.0, 1.0);
+                    // Handle trailing sample if odd count (shouldn't happen with stereo).
+                    if n % 2 != 0 {
+                        self.scratch[n - 1] = (samples[n - 1] as f32 * gain).clamp(-1.0, 1.0);
+                    }
+                } else {
+                    for (dst, src) in self.scratch[..n].iter_mut().zip(samples.iter()) {
+                        *dst = (*src as f32).clamp(-1.0, 1.0);
+                    }
                 }
 
-                self.bridge.push_samples(&self.scratch[..samples.len()]);
+                self.bridge.push_samples(&self.scratch[..n]);
 
                 // Pace Spotify decode to real-time to avoid rapid skipping.
-                let frames_out = (samples.len() / NUM_CHANNELS as usize) as u64;
-                if self.start_instant.is_none() {
-                    self.start_instant = Some(std::time::Instant::now());
+                let frames_out = (n / NUM_CHANNELS as usize) as u64;
+                let start = *self.start_instant.get_or_insert_with(|| {
                     self.frames_sent = 0;
-                }
-                if let Some(start) = self.start_instant {
-                    self.frames_sent = self.frames_sent.saturating_add(frames_out);
-                    let target = start
-                        + std::time::Duration::from_secs_f64(
-                            self.frames_sent as f64 / SAMPLE_RATE as f64,
-                        );
-                    let now = std::time::Instant::now();
-                    if target > now {
-                        let remaining = target - now;
-                        if remaining > std::time::Duration::from_millis(2) {
-                            std::thread::sleep(remaining - std::time::Duration::from_millis(1));
-                            while std::time::Instant::now() < target {
-                                std::hint::spin_loop();
-                            }
-                        } else {
-                            std::thread::yield_now();
+                    std::time::Instant::now()
+                });
+                self.frames_sent = self.frames_sent.saturating_add(frames_out);
+                let target = start
+                    + std::time::Duration::from_secs_f64(
+                        self.frames_sent as f64 / SAMPLE_RATE as f64,
+                    );
+                let now = std::time::Instant::now();
+                if target > now {
+                    let remaining = target - now;
+                    if remaining > std::time::Duration::from_millis(2) {
+                        std::thread::sleep(remaining - std::time::Duration::from_millis(1));
+                        while std::time::Instant::now() < target {
+                            std::hint::spin_loop();
                         }
+                    } else {
+                        std::thread::yield_now();
                     }
                 }
                 Ok(())
