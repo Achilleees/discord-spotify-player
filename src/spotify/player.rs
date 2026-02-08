@@ -69,15 +69,19 @@ impl SpotifyPlayer {
         device_name: &str,
         client_id: &str,
     ) -> Result<Discovery, Box<dyn std::error::Error + Send + Sync>> {
-        Ok(Discovery::builder(device_id.to_string(), client_id.to_string())
-            .name(device_name.to_string())
-            .device_type(DeviceType::Computer)
-            .launch()?)
+        Ok(
+            Discovery::builder(device_id.to_string(), client_id.to_string())
+                .name(device_name.to_string())
+                .device_type(DeviceType::Computer)
+                .launch()?,
+        )
     }
 
     fn create_session(cache: &Cache, device_id: &str) -> Session {
-        let mut session_config = SessionConfig::default();
-        session_config.device_id = device_id.to_string();
+        let session_config = SessionConfig {
+            device_id: device_id.to_string(),
+            ..SessionConfig::default()
+        };
         Session::new(session_config, Some(cache.clone()))
     }
 
@@ -133,7 +137,7 @@ impl SpotifyPlayer {
         let client_id = SessionConfig::default().client_id;
         let mut discovery = Self::start_discovery(&device_id, &device_name, &client_id)?;
 
-        tracing::info!(device = %device_name, "Spotify Connect discovery started");
+        tracing::info!(device = %device_name, "spotify connect discovery started");
         println!("Spotify device '{}' ready.", device_name);
 
         let mut pending_cached = cache.credentials();
@@ -161,10 +165,10 @@ impl SpotifyPlayer {
             let is_reconnect = matches!(origin, CredentialOrigin::Cache);
             if is_reconnect {
                 println!("Reconnecting...");
-                tracing::debug!("Using cached credentials");
+                tracing::debug!("using cached credentials");
             } else {
                 println!("Paired. Connecting...");
-                tracing::debug!("New credentials from discovery");
+                tracing::debug!("new credentials from discovery");
             }
 
             let session = Self::create_session(&cache, &device_id);
@@ -172,8 +176,7 @@ impl SpotifyPlayer {
             let session_start = std::time::Instant::now();
             let connect_config = Self::connect_config(&device_name);
             let mixer: Arc<dyn Mixer> = Arc::new(
-                SoftMixer::open(MixerConfig::default())
-                    .expect("Failed to create audio mixer"),
+                SoftMixer::open(MixerConfig::default()).expect("Failed to create audio mixer"),
             );
 
             let player_config = PlayerConfig {
@@ -188,15 +191,9 @@ impl SpotifyPlayer {
                 config.bass_boost_db,
                 config.treble_boost_db,
             );
-            let player = Player::new(
-                player_config,
-                session.clone(),
-                mixer.get_soft_volume(),
-                {
-                    let dsp_config = dsp_config;
-                    move || Box::new(DiscordSink::new(bridge_clone.clone(), dsp_config))
-                },
-            );
+            let player = Player::new(player_config, session.clone(), mixer.get_soft_volume(), {
+                move || Box::new(DiscordSink::new(bridge_clone.clone(), dsp_config))
+            });
             let mut rx = player.get_player_event_channel();
             let presence_tx_events = presence_tx.clone();
             let session_for_meta = session.clone();
@@ -233,23 +230,24 @@ impl SpotifyPlayer {
                             } else {
                                 last_artist.clone()
                             };
-                            let _ = presence_tx_events.send(PresenceUpdate::Playing { title, artist });
+                            let _ =
+                                presence_tx_events.send(PresenceUpdate::Playing { title, artist });
                         }
                         PlayerEvent::Paused { .. } => {
                             let _ = presence_tx_events.send(PresenceUpdate::Paused);
                             bridge_for_events.clear();
-                            tracing::debug!("Playback paused");
+                            tracing::debug!("playback paused");
                         }
                         PlayerEvent::Stopped { .. } => {
                             let _ = presence_tx_events.send(PresenceUpdate::Idle);
                             bridge_for_events.clear();
-                            tracing::debug!("Playback stopped");
+                            tracing::debug!("playback stopped");
                         }
                         PlayerEvent::TrackChanged { .. } => {
                             last_track = None;
                         }
                         PlayerEvent::Loading { .. } => {
-                            tracing::debug!("Loading track");
+                            tracing::debug!("loading track");
                         }
                         PlayerEvent::EndOfTrack { .. } => {
                             let _ = presence_tx_events.send(PresenceUpdate::Idle);
@@ -280,19 +278,19 @@ impl SpotifyPlayer {
                 }
                 Err(e) => {
                     if is_reconnect {
-                        tracing::warn!(error = ?e, "Reconnect failed");
+                        tracing::warn!(error = ?e, "reconnect failed");
                     } else {
-                        tracing::error!(error = ?e, "Connection failed");
+                        tracing::error!(error = ?e, "connection failed");
                     }
                     continue;
                 }
             };
 
             if let Err(e) = spirc.activate() {
-                tracing::warn!(error = ?e, "Device activation failed");
+                tracing::warn!(error = ?e, "device activation failed");
             }
 
-            tracing::info!("Spotify Connect active");
+            tracing::info!("spotify connect active");
 
             spirc_task.await;
             drop(spirc);
@@ -308,22 +306,25 @@ impl SpotifyPlayer {
                 if cached_reconnects < MAX_CACHED_RECONNECTS {
                     cached_reconnects += 1;
                     pending_cached = Some(creds);
-                    println!("Disconnected. Reconnecting ({}/{})...", cached_reconnects, MAX_CACHED_RECONNECTS);
+                    println!(
+                        "Disconnected. Reconnecting ({}/{})...",
+                        cached_reconnects, MAX_CACHED_RECONNECTS
+                    );
                     tracing::warn!(
                         duration = ?session_duration,
                         attempt = cached_reconnects,
                         max = MAX_CACHED_RECONNECTS,
-                        "Session ended, reconnecting"
+                        "session ended, reconnecting"
                     );
                 } else {
                     println!("Disconnected. Re-select '{}' in Spotify.", device_name);
-                    tracing::info!("Max reconnects reached, waiting for new pairing");
+                    tracing::info!("max reconnects reached, waiting for new pairing");
                     pending_cached = None;
                     cached_reconnects = 0;
                 }
             } else {
                 println!("Disconnected. Select '{}' in Spotify.", device_name);
-                tracing::debug!("No cached credentials, waiting for discovery");
+                tracing::debug!("no cached credentials, waiting for discovery");
             }
         }
 

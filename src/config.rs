@@ -85,7 +85,9 @@ impl std::fmt::Display for ConfigError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ConfigError::Missing(var) => write!(f, "Missing environment variable: {}", var),
-            ConfigError::Invalid(var) => write!(f, "Invalid value for environment variable: {}", var),
+            ConfigError::Invalid(var) => {
+                write!(f, "Invalid value for environment variable: {}", var)
+            }
         }
     }
 }
