@@ -1,6 +1,6 @@
 [package]
 name = "discord-spotify-player"
-version = "0.2.0"
+version = "0.2.5-pre"
 edition = "2021"
 
 [dependencies]
@@ -22,6 +22,7 @@ librespot-discovery = "0.8"
 
 # Configuration
 dotenvy = "0.15"
+dialoguer = "0.11"
 
 # Utilities
 tracing = "0.1"
