@@ -23,7 +23,7 @@ Use `cargo check` for fast compile-error feedback without a full build. There ar
 
 ## Configuration
 
-All config is via `.env` (see `.env.example`). Required: `DISCORD_TOKEN`, `DISCORD_GUILD_ID`, `DISCORD_CHANNEL_ID`. Logging is controlled by `RUST_LOG` — simple levels (`trace`, `debug`, `info`, `warn`, `error`) use app-centric presets where this crate gets that level and dependency crates stay at `warn`. Any other value is passed through as a raw `EnvFilter` string for full control. Default (no `RUST_LOG` set) is app=`info`, deps=`warn`.
+All config is via `.env` (see `.env.example`). Required: `DISCORD_TOKEN`, `DISCORD_GUILD_ID`, `DISCORD_CHANNEL_ID`. Logging is controlled by `RUST_LOG` — simple levels (`trace`, `debug`, `info`, `warn`, `error`) use app-centric presets where this crate gets that level and dependency crates stay at `warn`. Any other value is passed through as a raw `EnvFilter` string for full control. Default (no `RUST_LOG` set) is `warn` for all crates — only `println!` app messages appear in the console. Set `RUST_LOG=info` to enable structured tracing output.
 
 ## Architecture
 

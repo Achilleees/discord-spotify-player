@@ -17,7 +17,7 @@ A personal Discord bot that makes your Spotify session available in a voice chan
 ## Current scope and limitations
 - Runs locally on your machine (there is no hosted service).
 - Connects one Discord bot to one server and one voice channel at a time.
-- No UI yet; configuration is via `.env`.
+- No UI yet; configuration is via the CLI setup wizard or `.env`.
 
 ## Roadmap
 
@@ -26,7 +26,7 @@ Planned features (in progress):
 | Feature | Branch | Status |
 |---------|--------|--------|
 | **Now Playing Channel** | `feat/now-playing-channel` | Planned |
-| **Setup Wizard** | `feat/setup-wizard` | Planned |
+| **Setup Wizard** | `feat/setup-wizard` | Merged |
 | **YouTube Support** | `feat/youtube-support` | Planned |
 
 ### Now Playing Channel
@@ -55,17 +55,11 @@ Play YouTube links or search YouTube directly from Discord. Audio routes through
 
 ## Setup for your own server
 1. Create a Discord application and bot at the Discord Developer Portal.
-2. Invite the bot to your server with permission to join/speak in voice.
-3. Copy your server (guild) ID and the target voice channel ID.
-4. Create a `.env` file based on `.env.example`.
-5. Fill in:
-   - `DISCORD_TOKEN`
-   - `DISCORD_GUILD_ID`
-   - `DISCORD_CHANNEL_ID`
-   - Optional: `DEVICE_NAME`, `DEVICE_ID`, `AUDIO_BUFFER_SECONDS`, `PREBUFFER_SECONDS`, EQ settings, `RUST_LOG`
-6. Start the bot:
-   - Build and run: `cargo build --release` then `target\release\discord-spotify-player.exe`
-7. Open Spotify on a device on the same network and select the new device in the Spotify Connect list.
+2. Build the app: `cargo build --release`
+3. Run the setup wizard once: `target\\release\\discord-spotify-player.exe --setup`
+4. Follow prompts to paste your token, choose a server, and choose a voice channel.
+5. Start normally: `target\\release\\discord-spotify-player.exe`
+6. Open Spotify on a device on the same network and select the new device in the Spotify Connect list.
 
 **Note:** The bot routes audio to exactly one voice channel (the one in `DISCORD_CHANNEL_ID`). To use a different server/channel, change those IDs and restart.
 
@@ -85,10 +79,10 @@ Play YouTube links or search YouTube directly from Discord. Audio routes through
 - Optional stable device ID to keep the device list clean.
 - Audio buffer size (`AUDIO_BUFFER_SECONDS`, default 8) and prebuffer time (`PREBUFFER_SECONDS`, default 2.0).
 - Optional EQ: `PREAMP_DB`, `BASS_BOOST_DB`, `TREBLE_BOOST_DB` (all default 0.0).
-- Logging level via `RUST_LOG` (default `info`). Simple values (`trace`, `debug`, `info`, `warn`, `error`) use app-centric presets that keep dependency logs quiet. Custom `RUST_LOG` filter strings are also accepted.
+- Logging level via `RUST_LOG` (default `warn`). Simple values (`trace`, `debug`, `info`, `warn`, `error`) use app-centric presets that keep dependency logs quiet. Custom `RUST_LOG` filter strings are also accepted.
 
 ## Logging and troubleshooting
-- By default only this app's `info`-level messages appear; dependency crates (serenity, songbird, librespot) stay at `warn`.
+- By default logs stay at `warn` for all crates, so output is minimal.
 - Set `RUST_LOG=debug` for more detail or `RUST_LOG=trace` for full diagnostics. These still only increase verbosity for this app, not dependencies.
 - For full control pass a custom filter: `RUST_LOG="debug,librespot=info"`.
 - Audio pipeline stats are emitted at `debug` level every 5 seconds on the `audio_stream` target.
