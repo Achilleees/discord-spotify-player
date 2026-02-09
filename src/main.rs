@@ -2,6 +2,7 @@ mod audio_bridge;
 mod config;
 mod discord;
 mod presence;
+mod setup;
 mod spotify;
 
 use audio_bridge::AudioBridge;
@@ -12,7 +13,7 @@ use spotify::SpotifyPlayer;
 use tokio::sync::mpsc;
 
 /// Build a filter string that sets the app crate to `level` and keeps noisy
-/// dependencies at `warn`.  The base level is `warn` so only our crate gets
+/// dependencies at `warn`. The base level is `warn` so only our crate gets
 /// the verbose output.
 fn app_centric_filter(level: &str) -> String {
     format!(
@@ -24,33 +25,46 @@ fn app_centric_filter(level: &str) -> String {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Initialize logging.
-    //   - No RUST_LOG          -> app=info, deps=warn
+    //   - No RUST_LOG          -> warn for all (clean output, only println messages visible)
     //   - RUST_LOG=<level>     -> app-centric preset (app gets that level, deps stay warn)
     //   - Anything else        -> pass through as a custom EnvFilter string
     let env_filter = match std::env::var("RUST_LOG") {
-        Err(_) => tracing_subscriber::EnvFilter::new(app_centric_filter("info")),
-        Ok(val) => {
-            let trimmed = val.trim().to_ascii_lowercase();
+        Err(_) => tracing_subscriber::EnvFilter::new(app_centric_filter("warn")),
+        Ok(value) => {
+            let trimmed = value.trim().to_ascii_lowercase();
             match trimmed.as_str() {
                 "trace" => tracing_subscriber::EnvFilter::new(app_centric_filter("trace")),
                 "debug" => tracing_subscriber::EnvFilter::new(app_centric_filter("debug")),
                 "info" => tracing_subscriber::EnvFilter::new(app_centric_filter("info")),
                 "warn" => tracing_subscriber::EnvFilter::new(app_centric_filter("warn")),
                 "error" => tracing_subscriber::EnvFilter::new(app_centric_filter("error")),
-                _ => tracing_subscriber::EnvFilter::new(val),
+                _ => tracing_subscriber::EnvFilter::new(value),
             }
         }
     };
     tracing_subscriber::fmt().with_env_filter(env_filter).init();
 
-    println!("Hello! Discord Spotify Player starting...");
     tracing::info!("starting discord spotify player");
 
-    // Load configuration
-    let config = Config::from_env()?;
+    // Load configuration. Run wizard on --setup or when .env is missing/invalid.
+    let config = if std::env::args().any(|arg| arg == "--setup") {
+        setup::run_setup_wizard().await?
+    } else {
+        match Config::from_env() {
+            Ok(config) => config,
+            Err(err) => {
+                println!("Configuration missing or invalid: {err}");
+                println!("Launching setup wizard...");
+                setup::run_setup_wizard().await?
+            }
+        }
+    };
+
+    println!();
+    println!("Discord Spotify Player v{}", env!("CARGO_PKG_VERSION"));
     tracing::info!("configuration loaded");
 
-    // Create shared audio bridge
+    // Create shared audio bridge.
     let bridge = AudioBridge::new(config.audio_buffer_seconds);
     tracing::debug!("audio bridge initialized");
 
@@ -77,17 +91,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     });
 
-    // Start Discord bot (connects to voice channel)
+    // Start Discord bot (connects to voice channel).
     let discord_bot = DiscordBot::new(&config, bridge.clone(), presence_rx).await?;
     let mut ready_rx = discord_bot.start_background().await?;
 
-    // Wait for Discord to be ready
+    // Wait for Discord to be ready.
     tracing::info!("waiting for discord connection");
     ready_rx.recv().await;
     println!("Discord connected. Waiting for Spotify Connect pairing...");
     tracing::info!("discord ready");
 
-    // Run Spotify Connect discovery (this will block)
+    // Run Spotify Connect discovery (this will block).
     let _ = presence_tx.send(PresenceUpdate::Idle);
     SpotifyPlayer::run_discovery(&config, bridge, presence_tx).await?;
 
