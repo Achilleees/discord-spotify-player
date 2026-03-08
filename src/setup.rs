@@ -4,14 +4,14 @@ use serenity::all::{ChannelType, Http};
 use std::path::Path;
 
 const DISCORD_DEV_PORTAL: &str = "https://discord.com/developers/applications";
-const BOT_PERMISSIONS: u64 = 3145728; // Connect + Speak
+const BOT_PERMISSIONS: u64 = 7340032; // Connect + Speak + Mute Members
 const MAX_TOKEN_ATTEMPTS: u32 = 3;
 
 #[derive(Debug)]
 pub enum SetupError {
     InvalidToken,
     NoGuilds,
-    NoVoiceChannels,
+    NoAudioChannels,
     Cancelled,
     Io(std::io::Error),
     Dialoguer(dialoguer::Error),
@@ -23,8 +23,8 @@ impl std::fmt::Display for SetupError {
         match self {
             SetupError::InvalidToken => write!(f, "invalid bot token after multiple attempts"),
             SetupError::NoGuilds => write!(f, "bot is not in any servers"),
-            SetupError::NoVoiceChannels => {
-                write!(f, "no voice channels found in the selected server")
+            SetupError::NoAudioChannels => {
+                write!(f, "no voice or stage channels found in the selected server")
             }
             SetupError::Cancelled => write!(f, "setup cancelled"),
             SetupError::Io(e) => write!(f, "io error: {e}"),
@@ -117,38 +117,46 @@ pub async fn run_setup_wizard() -> Result<Config, SetupError> {
         (guilds[idx].id, guilds[idx].name.clone())
     };
 
-    // Step 4: Select voice channel.
+    // Step 4: Select audio channel.
     let channels = http.get_channels(guild_id).await?;
-    let voice_channels: Vec<_> = channels
+    let audio_channels: Vec<_> = channels
         .iter()
-        .filter(|channel| channel.kind == ChannelType::Voice)
+        .filter(|channel| matches!(channel.kind, ChannelType::Voice | ChannelType::Stage))
         .collect();
 
-    if voice_channels.is_empty() {
+    if audio_channels.is_empty() {
         println!();
-        println!("No voice channels found in \"{guild_name}\".");
-        println!("Create a voice channel in Discord first, then re-run with --setup.");
-        return Err(SetupError::NoVoiceChannels);
+        println!("No voice or stage channels found in \"{guild_name}\".");
+        println!("Create a stage channel in Discord first, then re-run with --setup.");
+        return Err(SetupError::NoAudioChannels);
     }
 
-    let (channel_id, channel_name) = if voice_channels.len() == 1 {
-        let channel = voice_channels[0];
-        println!("Auto-selected voice channel: {}", channel.name);
-        (channel.id, channel.name.clone())
+    let (channel_id, channel_name, channel_kind) = if audio_channels.len() == 1 {
+        let channel = audio_channels[0];
+        println!(
+            "Auto-selected {} channel: {}",
+            channel_kind_label(channel.kind),
+            channel.name
+        );
+        (channel.id, channel.name.clone(), channel.kind)
     } else {
-        let names: Vec<String> = voice_channels
+        let names: Vec<String> = audio_channels
             .iter()
-            .map(|channel| channel.name.clone())
+            .map(|channel| format!("{} ({})", channel.name, channel_kind_label(channel.kind)))
             .collect();
         let idx = blocking(move || {
             Select::new()
-                .with_prompt("Which voice channel?")
+                .with_prompt("Which audio channel?")
                 .items(&names)
                 .default(0)
                 .interact()
         })
         .await?;
-        (voice_channels[idx].id, voice_channels[idx].name.clone())
+        (
+            audio_channels[idx].id,
+            audio_channels[idx].name.clone(),
+            audio_channels[idx].kind,
+        )
     };
 
     // Step 5: Device name.
@@ -164,7 +172,11 @@ pub async fn run_setup_wizard() -> Result<Config, SetupError> {
     println!();
     println!("--- Configuration Summary ---");
     println!("  Server:         {guild_name}");
-    println!("  Voice channel:  {channel_name}");
+    println!(
+        "  Audio channel:  {} ({})",
+        channel_name,
+        channel_kind_label(channel_kind)
+    );
     println!("  Device name:    {device_name}");
     let masked_token = if token.len() >= 10 {
         format!("{}...{}", &token[..6], &token[token.len() - 4..])
@@ -191,6 +203,12 @@ pub async fn run_setup_wizard() -> Result<Config, SetupError> {
     write_env_file(&token, guild_id_u64, channel_id_u64, &device_name)?;
     println!();
     println!(".env written successfully!");
+    if channel_kind != ChannelType::Stage {
+        println!(
+            "warning: discord now requires stage channels for this bot to play audio reliably."
+        );
+        println!("re-run --setup and pick a stage channel if playback still fails.");
+    }
 
     // Step 8: Load config and return.
     let config =
@@ -325,6 +343,14 @@ DEVICE_NAME={device_name}
     }
 
     Ok(())
+}
+
+fn channel_kind_label(kind: ChannelType) -> &'static str {
+    match kind {
+        ChannelType::Stage => "stage",
+        ChannelType::Voice => "voice",
+        _ => "other",
+    }
 }
 
 /// Run a blocking closure on the Tokio blocking thread pool.

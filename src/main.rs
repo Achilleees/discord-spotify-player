@@ -10,6 +10,7 @@ use config::Config;
 use discord::DiscordBot;
 use presence::PresenceUpdate;
 use spotify::SpotifyPlayer;
+use std::io;
 use tokio::sync::mpsc;
 
 /// Build a filter string that sets the app crate to `level` and keeps noisy
@@ -18,7 +19,9 @@ use tokio::sync::mpsc;
 fn app_centric_filter(level: &str) -> String {
     format!(
         "warn,discord_spotify_player={level},audio_stream={level},\
-         serenity=warn,songbird=warn,librespot=warn"
+         serenity=warn,songbird=warn,librespot=warn,\
+         librespot_connect::state::context=error,\
+         symphonia_bundle_mp3=error"
     )
 }
 
@@ -97,7 +100,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // Wait for Discord to be ready.
     tracing::info!("waiting for discord connection");
-    ready_rx.recv().await;
+    match ready_rx.recv().await {
+        Some(Ok(())) => {}
+        Some(Err(error)) => return Err(io::Error::other(error).into()),
+        None => return Err(io::Error::other("discord startup channel closed unexpectedly").into()),
+    }
     println!("Discord connected. Waiting for Spotify Connect pairing...");
     tracing::info!("discord ready");
 

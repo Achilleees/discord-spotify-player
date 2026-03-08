@@ -3,7 +3,9 @@ use super::voice::{SimpleBridgeReader, TrackErrorHandler, CHANNELS, SAMPLE_RATE}
 use crate::audio_bridge::AudioBridge;
 use crate::config::Config;
 use crate::presence::PresenceUpdate;
-use serenity::all::{ChannelId, GatewayIntents, GuildId, Ready};
+use serenity::all::{
+    Channel, ChannelId, ChannelType, EditVoiceState, GatewayIntents, GuildId, Ready,
+};
 use serenity::async_trait;
 use serenity::client::{Client, Context, EventHandler};
 use songbird::events::{Event, TrackEvent};
@@ -11,14 +13,31 @@ use songbird::SerenityInit;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 
+type ReadySignal = Result<(), String>;
+
 struct Handler {
     guild_id: GuildId,
     channel_id: ChannelId,
     bridge: Arc<AudioBridge>,
-    ready_tx: mpsc::Sender<()>,
+    ready_tx: mpsc::Sender<ReadySignal>,
     presence_rx: Mutex<Option<mpsc::UnboundedReceiver<PresenceUpdate>>>,
     prebuffer_samples: usize,
     prebuffer_wait: std::time::Duration,
+}
+
+fn is_dave_required_error(error_text: &str) -> bool {
+    error_text.contains("4017") && error_text.to_ascii_lowercase().contains("dave")
+}
+
+async fn configured_channel_kind(ctx: &Context, channel_id: ChannelId) -> Option<ChannelType> {
+    match channel_id.to_channel(ctx).await {
+        Ok(Channel::Guild(channel)) => Some(channel.kind),
+        Ok(_) => None,
+        Err(error) => {
+            tracing::debug!(channel_id = %channel_id, error = ?error, "failed to resolve configured channel");
+            None
+        }
+    }
 }
 
 #[async_trait]
@@ -51,13 +70,51 @@ impl EventHandler for Handler {
                 let _ = track_handle.add_event(Event::Track(TrackEvent::End), TrackErrorHandler);
 
                 tracing::info!(track_uuid = ?track_handle.uuid(), "audio source connected to voice channel");
+
+                if matches!(
+                    configured_channel_kind(&ctx, self.channel_id).await,
+                    Some(ChannelType::Stage)
+                ) {
+                    match self.channel_id.to_channel(&ctx).await {
+                        Ok(Channel::Guild(channel)) => {
+                            let builder = EditVoiceState::new().suppress(false);
+                            match channel.edit_own_voice_state(&ctx, builder).await {
+                                Ok(()) => tracing::info!("unsuppressed bot in stage channel"),
+                                Err(error) => tracing::warn!(
+                                    error = ?error,
+                                    "failed to unsuppress bot in stage channel"
+                                ),
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(error) => tracing::warn!(
+                            channel_id = %self.channel_id,
+                            error = ?error,
+                            "failed to fetch stage channel after voice join"
+                        ),
+                    }
+                }
+
+                let _ = self.ready_tx.send(Ok(())).await;
             }
             Err(e) => {
+                let error_text = format!("{e:?}");
+                let channel_kind = configured_channel_kind(&ctx, self.channel_id).await;
+
                 tracing::error!(error = ?e, "failed to join voice channel");
+
+                if is_dave_required_error(&error_text)
+                    && !matches!(channel_kind, Some(ChannelType::Stage))
+                {
+                    tracing::error!(
+                        channel_id = %self.channel_id,
+                        "discord now requires dave/e2ee for non-stage voice channels; use a stage channel until songbird adds dave support"
+                    );
+                }
+
+                let _ = self.ready_tx.send(Err(error_text)).await;
             }
         }
-
-        let _ = self.ready_tx.send(()).await;
 
         // Take the receiver exactly once; the spawned task owns it from here.
         let mut presence_rx = self.presence_rx.lock().await;
@@ -72,7 +129,7 @@ impl EventHandler for Handler {
 
 pub struct DiscordBot {
     client: Client,
-    ready_rx: mpsc::Receiver<()>,
+    ready_rx: mpsc::Receiver<ReadySignal>,
 }
 
 impl DiscordBot {
@@ -109,7 +166,7 @@ impl DiscordBot {
 
     pub async fn start_background(
         mut self,
-    ) -> Result<mpsc::Receiver<()>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<mpsc::Receiver<ReadySignal>, Box<dyn std::error::Error + Send + Sync>> {
         tokio::spawn(async move {
             if let Err(e) = self.client.start().await {
                 tracing::error!(error = ?e, "discord client error");
