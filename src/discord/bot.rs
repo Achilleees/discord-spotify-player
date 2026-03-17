@@ -25,10 +25,6 @@ struct Handler {
     prebuffer_wait: std::time::Duration,
 }
 
-fn is_dave_required_error(error_text: &str) -> bool {
-    error_text.contains("4017") && error_text.to_ascii_lowercase().contains("dave")
-}
-
 async fn configured_channel_kind(ctx: &Context, channel_id: ChannelId) -> Option<ChannelType> {
     match channel_id.to_channel(ctx).await {
         Ok(Channel::Guild(channel)) => Some(channel.kind),
@@ -98,21 +94,8 @@ impl EventHandler for Handler {
                 let _ = self.ready_tx.send(Ok(())).await;
             }
             Err(e) => {
-                let error_text = format!("{e:?}");
-                let channel_kind = configured_channel_kind(&ctx, self.channel_id).await;
-
                 tracing::error!(error = ?e, "failed to join voice channel");
-
-                if is_dave_required_error(&error_text)
-                    && !matches!(channel_kind, Some(ChannelType::Stage))
-                {
-                    tracing::error!(
-                        channel_id = %self.channel_id,
-                        "discord now requires dave/e2ee for non-stage voice channels; use a stage channel until songbird adds dave support"
-                    );
-                }
-
-                let _ = self.ready_tx.send(Err(error_text)).await;
+                let _ = self.ready_tx.send(Err(format!("{e:?}"))).await;
             }
         }
 

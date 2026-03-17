@@ -127,7 +127,7 @@ pub async fn run_setup_wizard() -> Result<Config, SetupError> {
     if audio_channels.is_empty() {
         println!();
         println!("No voice or stage channels found in \"{guild_name}\".");
-        println!("Create a stage channel in Discord first, then re-run with --setup.");
+        println!("Create a voice channel in Discord first, then re-run with --setup.");
         return Err(SetupError::NoAudioChannels);
     }
 
@@ -203,12 +203,6 @@ pub async fn run_setup_wizard() -> Result<Config, SetupError> {
     write_env_file(&token, guild_id_u64, channel_id_u64, &device_name)?;
     println!();
     println!(".env written successfully!");
-    if channel_kind != ChannelType::Stage {
-        println!(
-            "warning: discord now requires stage channels for this bot to play audio reliably."
-        );
-        println!("re-run --setup and pick a stage channel if playback still fails.");
-    }
 
     // Step 8: Load config and return.
     let config =
