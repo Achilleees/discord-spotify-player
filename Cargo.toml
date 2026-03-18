@@ -8,7 +8,7 @@ edition = "2021"
 tokio = { version = "1", features = ["full"] }
 
 # Discord - using serenity 0.12 with songbird 0.5
-serenity = { version = "0.12.4", default-features = false, features = ["client", "gateway", "model", "voice", "rustls_backend"] }
+serenity = { version = "0.12.4", default-features = false, features = ["client", "gateway", "model", "voice", "rustls_backend", "cache"] }
 songbird = { git = "https://github.com/beerpsi-forks/songbird.git", branch = "davey", default-features = true, features = ["serenity", "rustls"] }
 symphonia = { version = "0.5", default-features = false, features = ["pcm"] }
 

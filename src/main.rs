@@ -1,3 +1,4 @@
+mod audio;
 mod audio_bridge;
 mod config;
 mod discord;
@@ -173,6 +174,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     .parse::<u64>()
                     .unwrap_or(0);
                 let spotify_name = user.spotify_username.clone();
+                let access_token_for_session = token.clone();
 
                 let handle = tokio::spawn(async move {
                     match SpotifyPlayer::run_with_token(
@@ -188,12 +190,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     }
                 });
 
-                let mut lock = active_session.lock().await;
-                *lock = Some(discord::ActiveSession {
-                    discord_user_id,
-                    spotify_name,
-                    handle,
-                });
+                {
+                    let mut lock = active_session.lock().unwrap_or_else(|e| e.into_inner());
+                    *lock = Some(discord::ActiveSession {
+                        discord_user_id,
+                        spotify_name,
+                        access_token: access_token_for_session,
+                        handle,
+                    });
+                } // lock dropped here
 
                 // Park main task — the bot runs indefinitely
                 std::future::pending::<()>().await;

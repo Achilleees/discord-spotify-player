@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use url::Url;
 
-pub const REDIRECT_URI: &str = "https://localhost:8766/callback";
+pub const REDIRECT_URI: &str = "http://127.0.0.1:8766/callback";
 
 pub struct SpotifyOAuth {
     pub client_id: String,
@@ -70,7 +70,7 @@ impl SpotifyOAuth {
 
     /// Build the Spotify authorization URL (standard code flow).
     pub fn auth_url(&self, state: &str) -> String {
-        let scopes = "streaming user-read-playback-state user-modify-playback-state user-read-currently-playing";
+        let scopes = "streaming user-read-playback-state user-modify-playback-state user-read-currently-playing user-read-private";
         format!(
             "https://accounts.spotify.com/authorize?response_type=code&client_id={}&scope={}&redirect_uri={}&state={}",
             pct_encode(&self.client_id),

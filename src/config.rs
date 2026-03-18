@@ -5,6 +5,7 @@ pub struct Config {
     pub discord_token: String,
     pub discord_guild_id: u64,
     pub discord_channel_id: u64,
+    pub discord_text_channel_id: u64,
     pub device_name: String,
     pub device_id: Option<String>,
     pub audio_buffer_seconds: usize,
@@ -65,6 +66,11 @@ impl Config {
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty());
 
+        let discord_text_channel_id = env::var("TEXT_CHANNEL_ID")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(428011920184967168);
+
         Ok(Config {
             discord_token: env::var("DISCORD_TOKEN")
                 .map_err(|_| ConfigError::Missing("DISCORD_TOKEN"))?,
@@ -76,6 +82,7 @@ impl Config {
                 .map_err(|_| ConfigError::Missing("DISCORD_CHANNEL_ID"))?
                 .parse()
                 .map_err(|_| ConfigError::Invalid("DISCORD_CHANNEL_ID"))?,
+            discord_text_channel_id,
             device_name: env::var("DEVICE_NAME").unwrap_or_else(|_| "Discord Player".to_string()),
             device_id,
             audio_buffer_seconds,

@@ -342,8 +342,12 @@ impl SpotifyPlayer {
         let cache = Self::create_cache()?;
         let device_id = Self::resolve_device_id(config);
         let device_name = config.device_name.clone();
+        let mut reconnects: usize = 0;
 
-        let credentials = Credentials::with_access_token(access_token);
+        // Use the initial token; loop handles fast reconnects before token refresh
+        let credentials = Credentials::with_access_token(access_token.clone());
+
+        loop {
 
         let session = Self::create_session(&cache, &device_id);
         let connect_config = Self::connect_config(&device_name);
@@ -432,7 +436,7 @@ impl SpotifyPlayer {
         let (spirc, spirc_task) = Spirc::new(
             connect_config,
             session.clone(),
-            credentials,
+            credentials.clone(),
             player,
             mixer,
         )
@@ -447,11 +451,29 @@ impl SpotifyPlayer {
         }
 
         tracing::info!("spotify connect active (oauth)");
+        let session_start = std::time::Instant::now();
         spirc_task.await;
+        let _ = spirc.shutdown();
         drop(spirc);
 
+        let session_duration = session_start.elapsed();
+        if session_duration >= std::time::Duration::from_secs(MIN_STABLE_SESSION_SECS) {
+            reconnects = 0;
+        }
+
+        if reconnects < MAX_CACHED_RECONNECTS {
+            reconnects += 1;
+            let delay = std::time::Duration::from_secs(2u64.saturating_mul(reconnects as u64));
+            tracing::info!(attempt = reconnects, delay = ?delay, "oauth session dropped, fast reconnect");
+            tokio::time::sleep(delay).await;
+            // Loop back — reuse same token (fast reconnect without going to outer task)
+            continue;
+        }
+
+        tracing::info!("max reconnects reached, returning for token refresh");
         let _ = presence_tx.send(PresenceUpdate::Idle);
-        Ok(())
+        return Ok(());
+    } // end loop
     }
 
 }
