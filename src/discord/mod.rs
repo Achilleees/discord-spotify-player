@@ -2,4 +2,4 @@ mod bot;
 mod presence;
 mod voice;
 
-pub use bot::DiscordBot;
+pub use bot::{ActiveSession, DiscordBot};

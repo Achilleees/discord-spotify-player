@@ -4,6 +4,7 @@ use crate::audio_bridge::AudioBridge;
 use crate::config::Config;
 use crate::oauth::SpotifyOAuth;
 use crate::presence::PresenceUpdate;
+use crate::spotify::SpotifyPlayer;
 use crate::users::{UserCredentials, UserStore};
 use serenity::all::{
     Channel, ChannelId, ChannelType, CreateCommand, CreateInteractionResponse,
@@ -17,19 +18,30 @@ use songbird::events::{Event, TrackEvent};
 use songbird::SerenityInit;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
+use tokio::task::JoinHandle;
 
 type ReadySignal = Result<(), String>;
+
+/// An active librespot session spawned after OAuth login.
+pub struct ActiveSession {
+    pub discord_user_id: u64,
+    pub spotify_name: String,
+    pub handle: JoinHandle<()>,
+}
 
 struct Handler {
     guild_id: GuildId,
     channel_id: ChannelId,
     bridge: Arc<AudioBridge>,
+    config: Arc<Config>,
     ready_tx: mpsc::Sender<ReadySignal>,
     presence_rx: Mutex<Option<mpsc::UnboundedReceiver<PresenceUpdate>>>,
+    presence_tx: mpsc::UnboundedSender<PresenceUpdate>,
     prebuffer_samples: usize,
     prebuffer_wait: std::time::Duration,
     user_store: Arc<UserStore>,
     oauth: Option<Arc<SpotifyOAuth>>,
+    active_session: Arc<Mutex<Option<ActiveSession>>>,
 }
 
 async fn configured_channel_kind(ctx: &Context, channel_id: ChannelId) -> Option<ChannelType> {
@@ -163,13 +175,17 @@ impl EventHandler for Handler {
             });
 
         let user_id = cmd.user.id.to_string();
+        let user_id_u64 = cmd.user.id.get();
         let username = cmd.user.name.clone();
 
         let reply = match cmd.data.name.as_str() {
-            "login" => self.handle_login(&user_id, &username, code_arg.as_deref()).await,
-            "logout" => self.handle_logout(&user_id).await,
+            "login" => {
+                self.handle_login(&user_id, user_id_u64, &username, code_arg.as_deref())
+                    .await
+            }
+            "logout" => self.handle_logout(&user_id, user_id_u64).await,
             "forget" => self.handle_forget(&user_id).await,
-            "who" => self.handle_who(&user_id).await,
+            "who" => self.handle_who().await,
             _ => return,
         };
 
@@ -186,35 +202,169 @@ impl EventHandler for Handler {
 }
 
 impl Handler {
+    /// Spawn a librespot session using an OAuth access_token.
+    /// Stops any currently running session first.
+    async fn spawn_session(
+        &self,
+        discord_user_id: u64,
+        spotify_name: String,
+        access_token: String,
+    ) {
+        let config = self.config.clone();
+        let bridge = self.bridge.clone();
+        let presence_tx = self.presence_tx.clone();
+        let active_session = self.active_session.clone();
+
+        // Abort any existing session first
+        {
+            let mut lock = active_session.lock().await;
+            if let Some(old) = lock.take() {
+                tracing::info!(
+                    old_user = old.discord_user_id,
+                    "aborting existing librespot session"
+                );
+                old.handle.abort();
+            }
+        }
+
+        let active_session_for_task = active_session.clone();
+        let spotify_name_clone = spotify_name.clone();
+        let handle = tokio::spawn(async move {
+            tracing::info!(user = discord_user_id, "librespot OAuth session starting");
+            match SpotifyPlayer::run_with_token(&config, bridge, presence_tx, access_token).await {
+                Ok(()) => {
+                    tracing::info!(user = discord_user_id, "librespot session ended cleanly")
+                }
+                Err(e) => tracing::warn!(
+                    user = discord_user_id,
+                    error = ?e,
+                    "librespot session ended with error"
+                ),
+            }
+            // Clear active session when task exits naturally
+            let mut lock = active_session_for_task.lock().await;
+            if let Some(s) = lock.as_ref() {
+                if s.discord_user_id == discord_user_id {
+                    *lock = None;
+                }
+            }
+        });
+
+        let mut lock = active_session.lock().await;
+        *lock = Some(ActiveSession {
+            discord_user_id,
+            spotify_name,
+            handle,
+        });
+        tracing::info!(
+            user = discord_user_id,
+            spotify = %spotify_name_clone,
+            "librespot session spawned"
+        );
+    }
+
     /// /login — no args: start OAuth or reactivate existing session.
     /// /login code:<url|token>: complete the OAuth flow.
     async fn handle_login(
         &self,
         user_id: &str,
+        user_id_u64: u64,
         _discord_username: &str,
         code_arg: Option<&str>,
     ) -> String {
         // Check for existing credentials first
         if let Some(existing) = self.user_store.load(user_id) {
-            // If no code provided and we have stored creds, just reactivate
+            // If no code provided and we have stored creds, reactivate
             if code_arg.is_none() {
+                let oauth = match &self.oauth {
+                    Some(o) => o.clone(),
+                    None => {
+                        // No OAuth configured — just flip active flag
+                        let mut creds = existing.clone();
+                        creds.active = true;
+                        match self.user_store.save(&creds) {
+                            Ok(()) => {
+                                return format!(
+                                    "Session reactivated as **{}**!",
+                                    creds.spotify_username
+                                )
+                            }
+                            Err(e) => {
+                                tracing::error!("failed to reactivate session: {}", e);
+                                return "Failed to reactivate session. Please try again."
+                                    .to_string();
+                            }
+                        }
+                    }
+                };
+
                 if existing.active {
-                    return format!(
-                        "Already logged in as **{}**. Use `/logout` to deactivate or `/forget` to remove credentials.",
-                        existing.spotify_username
-                    );
-                } else {
-                    // Reactivate without OAuth
-                    let mut creds = existing;
-                    creds.active = true;
-                    match self.user_store.save(&creds) {
-                        Ok(()) => {
-                            tracing::info!(user = %user_id, spotify = %creds.spotify_username, "session reactivated");
-                            return format!("Session reactivated as **{}**!", creds.spotify_username);
+                    // Already active — refresh token and restart session
+                    match oauth.refresh_access_token(&existing.refresh_token).await {
+                        Ok(new_token) => {
+                            let mut creds = existing.clone();
+                            creds.access_token = new_token.access_token.clone();
+                            if let Some(rt) = new_token.refresh_token {
+                                creds.refresh_token = rt;
+                            }
+                            let _ = self.user_store.save(&creds);
+                            self.spawn_session(
+                                user_id_u64,
+                                existing.spotify_username.clone(),
+                                new_token.access_token,
+                            )
+                            .await;
+                            return format!(
+                                "Session restarted for **{}**!",
+                                existing.spotify_username
+                            );
                         }
                         Err(e) => {
-                            tracing::error!("failed to reactivate session: {}", e);
-                            return "Failed to reactivate session. Please try again.".to_string();
+                            tracing::warn!("token refresh failed for reactivation: {}", e);
+                            return format!(
+                                "Already logged in as **{}** but couldn't refresh the token. \
+                                 Use `/logout` then `/login` to re-authorize.",
+                                existing.spotify_username
+                            );
+                        }
+                    }
+                } else {
+                    // Inactive — reactivate and spawn
+                    match oauth.refresh_access_token(&existing.refresh_token).await {
+                        Ok(new_token) => {
+                            let mut creds = existing.clone();
+                            creds.active = true;
+                            creds.access_token = new_token.access_token.clone();
+                            if let Some(rt) = new_token.refresh_token {
+                                creds.refresh_token = rt;
+                            }
+                            match self.user_store.save(&creds) {
+                                Ok(()) => {
+                                    self.spawn_session(
+                                        user_id_u64,
+                                        existing.spotify_username.clone(),
+                                        new_token.access_token,
+                                    )
+                                    .await;
+                                    tracing::info!(
+                                        user = %user_id,
+                                        spotify = %existing.spotify_username,
+                                        "session reactivated"
+                                    );
+                                    return format!(
+                                        "Session reactivated as **{}**!",
+                                        existing.spotify_username
+                                    );
+                                }
+                                Err(e) => {
+                                    tracing::error!("failed to save reactivated session: {}", e);
+                                    return "Failed to save session. Please try again.".to_string();
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("token refresh failed during reactivation: {}", e);
+                            return "Couldn't refresh your Spotify token. Please run `/login` to re-authorize.".to_string();
                         }
                     }
                 }
@@ -234,7 +384,9 @@ impl Handler {
                 let state = generate_state();
                 let url = oauth.auth_url(&state);
                 format!(
-                    "Connect your Spotify account:\n\n<{}>\n\nClick the link, authorize, then copy the full URL your browser tried to navigate to (it will fail with connection refused — that's expected). Run `/login code:<that URL>` to complete.",
+                    "Connect your Spotify account:\n\n<{}>\n\nClick the link, authorize, then \
+                     copy the full URL your browser tried to navigate to (it will fail with \
+                     connection refused — that's expected). Run `/login code:<that URL>` to complete.",
                     url
                 )
             }
@@ -252,22 +404,24 @@ impl Handler {
                         let refresh_token = match token.refresh_token {
                             Some(rt) => rt,
                             None => {
-                                return "Spotify didn't return a refresh token. Please try again.".to_string();
+                                return "Spotify didn't return a refresh token. Please try again."
+                                    .to_string();
                             }
                         };
 
-                        let display_name = match oauth.get_user_profile(&token.access_token).await {
-                            Ok(name) => name,
-                            Err(e) => {
-                                tracing::warn!("failed to fetch Spotify profile: {}", e);
-                                "Unknown".to_string()
-                            }
-                        };
+                        let display_name =
+                            match oauth.get_user_profile(&token.access_token).await {
+                                Ok(name) => name,
+                                Err(e) => {
+                                    tracing::warn!("failed to fetch Spotify profile: {}", e);
+                                    "Unknown".to_string()
+                                }
+                            };
 
                         let creds = UserCredentials {
                             discord_user_id: user_id.to_string(),
                             spotify_username: display_name.clone(),
-                            access_token: token.access_token,
+                            access_token: token.access_token.clone(),
                             refresh_token,
                             paired_at: unix_timestamp_str(),
                             active: true,
@@ -275,8 +429,21 @@ impl Handler {
 
                         match self.user_store.save(&creds) {
                             Ok(()) => {
-                                tracing::info!(user = %user_id, spotify = %display_name, "OAuth login successful");
-                                format!("Logged in as **{}**!", display_name)
+                                tracing::info!(
+                                    user = %user_id,
+                                    spotify = %display_name,
+                                    "OAuth login successful"
+                                );
+                                self.spawn_session(
+                                    user_id_u64,
+                                    display_name.clone(),
+                                    token.access_token,
+                                )
+                                .await;
+                                format!(
+                                    "Logged in as **{}**! Spotify session started.",
+                                    display_name
+                                )
                             }
                             Err(e) => {
                                 tracing::error!("failed to save credentials: {}", e);
@@ -286,15 +453,32 @@ impl Handler {
                     }
                     Err(e) => {
                         tracing::warn!("OAuth code exchange failed: {}", e);
-                        "Failed to exchange code with Spotify. The code may have expired — run `/login` to start over.".to_string()
+                        "Failed to exchange code with Spotify. The code may have expired — \
+                         run `/login` to start over."
+                            .to_string()
                     }
                 }
             }
         }
     }
 
-    /// /logout — soft deactivate (keeps creds stored)
-    async fn handle_logout(&self, user_id: &str) -> String {
+    /// /logout — soft deactivate (keeps creds stored) and abort active session
+    async fn handle_logout(&self, user_id: &str, user_id_u64: u64) -> String {
+        // Abort the active session if it belongs to this user
+        {
+            let mut lock = self.active_session.lock().await;
+            if let Some(session) = lock.as_ref() {
+                if session.discord_user_id == user_id_u64 {
+                    session.handle.abort();
+                    *lock = None;
+                    tracing::info!(user = %user_id, "active librespot session aborted");
+                }
+            }
+        }
+
+        // Send idle presence
+        let _ = self.presence_tx.send(PresenceUpdate::Idle);
+
         match self.user_store.deactivate(user_id) {
             Ok(true) => {
                 tracing::info!(user = %user_id, "session deactivated");
@@ -323,19 +507,15 @@ impl Handler {
         }
     }
 
-    /// /who — show active session info
-    async fn handle_who(&self, user_id: &str) -> String {
-        match self.user_store.load(user_id) {
-            Some(creds) if creds.active => {
-                format!("Active session: **{}** (paired {})", creds.spotify_username, creds.paired_at)
-            }
-            Some(creds) => {
-                format!(
-                    "Inactive session for **{}** (paired {}). Run `/login` to reactivate.",
-                    creds.spotify_username, creds.paired_at
-                )
-            }
-            None => "No Spotify session. Run `/login` to connect.".to_string(),
+    /// /who — show active session info (reads shared state, not per-user store)
+    async fn handle_who(&self) -> String {
+        let lock = self.active_session.lock().await;
+        match lock.as_ref() {
+            Some(session) => format!(
+                "Active session: **{}** (Discord user {})",
+                session.spotify_name, session.discord_user_id
+            ),
+            None => "No active Spotify session. Run `/login` to connect.".to_string(),
         }
     }
 }
@@ -357,13 +537,15 @@ fn unix_timestamp_str() -> String {
 pub struct DiscordBot {
     client: Client,
     ready_rx: mpsc::Receiver<ReadySignal>,
+    active_session: Arc<Mutex<Option<ActiveSession>>>,
 }
 
 impl DiscordBot {
     pub async fn new(
-        config: &Config,
+        config: Arc<Config>,
         bridge: Arc<AudioBridge>,
         presence_rx: mpsc::UnboundedReceiver<PresenceUpdate>,
+        presence_tx: mpsc::UnboundedSender<PresenceUpdate>,
         user_store: Arc<UserStore>,
         oauth: Option<Arc<SpotifyOAuth>>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
@@ -376,35 +558,52 @@ impl DiscordBot {
         let prebuffer_wait =
             std::time::Duration::from_secs_f32((config.prebuffer_seconds + 0.5).clamp(0.0, 5.0));
 
+        let active_session: Arc<Mutex<Option<ActiveSession>>> = Arc::new(Mutex::new(None));
+
         let handler = Handler {
             guild_id: GuildId::new(config.discord_guild_id),
             channel_id: ChannelId::new(config.discord_channel_id),
             bridge,
+            config: config.clone(),
             ready_tx,
             presence_rx: Mutex::new(Some(presence_rx)),
+            presence_tx,
             prebuffer_samples,
             prebuffer_wait,
             user_store,
             oauth,
+            active_session: active_session.clone(),
         };
 
-        let client = Client::builder(&config.discord_token, intents)
+        let token = config.discord_token.clone();
+        let client = Client::builder(&token, intents)
             .event_handler(handler)
             .register_songbird()
             .await?;
 
-        Ok(Self { client, ready_rx })
+        Ok(Self {
+            client,
+            ready_rx,
+            active_session,
+        })
     }
 
     pub async fn start_background(
         mut self,
-    ) -> Result<mpsc::Receiver<ReadySignal>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<
+        (
+            mpsc::Receiver<ReadySignal>,
+            Arc<Mutex<Option<ActiveSession>>>,
+        ),
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
+        let active_session = self.active_session.clone();
         tokio::spawn(async move {
             if let Err(e) = self.client.start().await {
                 tracing::error!(error = ?e, "discord client error");
             }
         });
 
-        Ok(self.ready_rx)
+        Ok((self.ready_rx, active_session))
     }
 }

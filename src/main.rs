@@ -84,7 +84,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let bridge = AudioBridge::new(config.audio_buffer_seconds);
     tracing::debug!("audio bridge initialized");
 
-    let (presence_tx, presence_rx) = mpsc::unbounded_channel();
+    let (presence_tx, presence_rx) = mpsc::unbounded_channel::<PresenceUpdate>();
 
     let bridge_stats = bridge.clone();
     tokio::spawn(async move {
@@ -106,8 +106,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     });
 
-    let discord_bot = DiscordBot::new(&config, bridge.clone(), presence_rx, user_store, oauth).await?;
-    let mut ready_rx = discord_bot.start_background().await?;
+    let config = Arc::new(config);
+
+    let discord_bot = DiscordBot::new(
+        config.clone(),
+        bridge.clone(),
+        presence_rx,
+        presence_tx.clone(),
+        user_store.clone(),
+        oauth.clone(),
+    )
+    .await?;
+
+    let (mut ready_rx, active_session) = discord_bot.start_background().await?;
 
     tracing::info!("waiting for discord connection");
     match ready_rx.recv().await {
@@ -115,11 +126,86 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Some(Err(error)) => return Err(io::Error::other(error).into()),
         None => return Err(io::Error::other("discord startup channel closed unexpectedly").into()),
     }
-    println!("Discord connected. Waiting for Spotify Connect pairing...");
+    println!("Discord connected.");
     tracing::info!("discord ready");
 
     let _ = presence_tx.send(PresenceUpdate::Idle);
-    SpotifyPlayer::run_discovery(&config, bridge, presence_tx).await?;
+
+    // Auto-start: if any user has stored credentials marked active, start their session.
+    let active_users: Vec<_> = user_store.list().into_iter().filter(|u| u.active).collect();
+    if !active_users.is_empty() {
+        if let Some(oauth_client) = &oauth {
+            if let Some(user) = active_users.into_iter().next() {
+                tracing::info!(
+                    spotify = %user.spotify_username,
+                    "auto-starting OAuth session for stored active user"
+                );
+                println!(
+                    "Auto-starting Spotify session for {}...",
+                    user.spotify_username
+                );
+
+                let token = match oauth_client.refresh_access_token(&user.refresh_token).await {
+                    Ok(t) => {
+                        // Persist the refreshed token
+                        let mut updated = user.clone();
+                        updated.access_token = t.access_token.clone();
+                        if let Some(rt) = t.refresh_token.clone() {
+                            updated.refresh_token = rt;
+                        }
+                        let _ = user_store.save(&updated);
+                        t.access_token
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = ?e,
+                            "failed to refresh token for auto-start; falling back to stored token"
+                        );
+                        user.access_token.clone()
+                    }
+                };
+
+                let config_for_task = config.clone();
+                let bridge_for_task = bridge.clone();
+                let presence_tx_for_task = presence_tx.clone();
+                let discord_user_id = user
+                    .discord_user_id
+                    .parse::<u64>()
+                    .unwrap_or(0);
+                let spotify_name = user.spotify_username.clone();
+
+                let handle = tokio::spawn(async move {
+                    match SpotifyPlayer::run_with_token(
+                        &config_for_task,
+                        bridge_for_task,
+                        presence_tx_for_task,
+                        token,
+                    )
+                    .await
+                    {
+                        Ok(()) => tracing::info!("auto-start session ended cleanly"),
+                        Err(e) => tracing::warn!(error = ?e, "auto-start session ended with error"),
+                    }
+                });
+
+                let mut lock = active_session.lock().await;
+                *lock = Some(discord::ActiveSession {
+                    discord_user_id,
+                    spotify_name,
+                    handle,
+                });
+
+                // Park main task — the bot runs indefinitely
+                std::future::pending::<()>().await;
+            }
+        } else {
+            tracing::warn!("stored active users found but OAuth not configured — falling back to discovery");
+            SpotifyPlayer::run_discovery(&config, bridge, presence_tx).await?;
+        }
+    } else {
+        println!("No stored OAuth sessions. Waiting for Spotify Connect pairing (discovery mode)...");
+        SpotifyPlayer::run_discovery(&config, bridge, presence_tx).await?;
+    }
 
     Ok(())
 }
