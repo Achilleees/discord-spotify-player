@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 
 /// Maximum YouTube duration (seconds). Configurable via env YOUTUBE_MAX_DURATION_SECS.
-pub const YOUTUBE_MAX_DURATION_SECS: u64 = 900; // 15 minutes default
+pub const YOUTUBE_MAX_DURATION_SECS: u64 = 7200; // 2 hours default
 
 #[derive(Clone, Debug)]
 pub enum MediaSource {
