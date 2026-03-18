@@ -1,6 +1,6 @@
 [package]
 name = "discord-spotify-player"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 
 [dependencies]
@@ -8,7 +8,7 @@ edition = "2021"
 tokio = { version = "1", features = ["full"] }
 
 # Discord - using serenity 0.12 with songbird 0.5
-serenity = { version = "0.12.4", default-features = false, features = ["client", "gateway", "model", "voice", "rustls_backend"] }
+serenity = { version = "0.12.4", default-features = false, features = ["client", "gateway", "model", "voice", "rustls_backend", "cache"] }
 songbird = { git = "https://github.com/beerpsi-forks/songbird.git", branch = "davey", default-features = true, features = ["serenity", "rustls"] }
 symphonia = { version = "0.5", default-features = false, features = ["pcm"] }
 
@@ -19,6 +19,13 @@ librespot-connect = "0.8"
 librespot-metadata = "0.8"
 librespot-playback = "0.8"
 librespot-discovery = "0.8"
+
+# HTTP client for OAuth
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+url = "2"
 
 # Configuration
 dotenvy = "0.15"
@@ -37,4 +44,3 @@ rand = "0.10"
 [build-dependencies]
 vergen = "=9.0.6"
 vergen-gitcl = "=1.0.5"
-

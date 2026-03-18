@@ -84,14 +84,13 @@ impl Read for SimpleBridgeReader {
             );
         }
 
-        // Block until the bridge has enough samples to avoid start/unpause stutters.
-        if !self.prebuffer_done
-            && self.prebuffer_samples > 0
-            && self.bridge.len() < self.prebuffer_samples
-        {
+        // On first read, wait until at least one sample arrives (max 5s).
+        // This avoids pulling silence before librespot starts pushing, without
+        // accumulating a large buffer that causes catchup speed issues.
+        if !self.prebuffer_done {
             let start = std::time::Instant::now();
-            while self.bridge.len() < self.prebuffer_samples
-                && start.elapsed() < self.prebuffer_wait
+            while self.bridge.len() == 0
+                && start.elapsed() < std::time::Duration::from_secs(5)
             {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
