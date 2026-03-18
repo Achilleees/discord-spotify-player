@@ -137,7 +137,7 @@ impl SpotifyPlayer {
         bridge_for_events: Arc<AudioBridge>,
         presence_tx_events: mpsc::UnboundedSender<PresenceUpdate>,
         access_token: String,
-    ) {
+    ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let mut rx = rx;
             let mut last_track: Option<SpotifyUri> = None;
@@ -209,7 +209,7 @@ impl SpotifyPlayer {
                     _ => {}
                 }
             }
-        });
+        })
     }
 
     /// Run Spotify Connect in discovery mode.
@@ -362,7 +362,14 @@ impl SpotifyPlayer {
 
         let credentials = Credentials::with_access_token(access_token.clone());
 
+        let mut event_loop_handle: Option<tokio::task::JoinHandle<()>> = None;
+
         loop {
+            // Abort previous event loop and clear stale audio
+            if let Some(h) = event_loop_handle.take() {
+                h.abort();
+            }
+            bridge.clear();
             let session = Self::create_session(&cache, &device_id);
             let connect_config = Self::connect_config(&device_name);
             let mixer: Arc<dyn Mixer> = Arc::new(
@@ -386,13 +393,13 @@ impl SpotifyPlayer {
             });
             let rx = player.get_player_event_channel();
 
-            Self::spawn_event_loop(
+            event_loop_handle = Some(Self::spawn_event_loop(
                 rx,
                 session.clone(),
                 bridge_for_events,
                 presence_tx.clone(),
                 access_token.clone(),
-            );
+            ));
 
             let (spirc, spirc_task) = Spirc::new(
                 connect_config,

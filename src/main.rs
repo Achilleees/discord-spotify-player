@@ -195,6 +195,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     *lock = Some(discord::ActiveSession {
                         discord_user_id,
                         spotify_name,
+                        discord_name: "Auto-start".to_string(),
                         access_token: access_token_for_session,
                         handle,
                     });
