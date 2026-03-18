@@ -1,4 +1,4 @@
-mod bot;
+pub mod bot;
 mod presence;
 mod voice;
 

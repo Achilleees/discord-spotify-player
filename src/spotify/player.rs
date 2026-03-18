@@ -30,6 +30,12 @@ enum CredentialOrigin {
     Cache,
 }
 
+/// Commands that can be sent to the active Spirc instance from the priority queue manager.
+pub enum SpircCommand {
+    Pause,
+    Play,
+}
+
 fn extract_track_id(uri: &SpotifyUri) -> String {
     uri.to_id().unwrap_or_default()
 }
@@ -129,14 +135,13 @@ impl SpotifyPlayer {
         }
     }
 
-    /// Spawn the player event loop, sending PresenceUpdate messages.
-    /// `access_token` is passed through so the Discord side can use it for Web API calls.
     fn spawn_event_loop(
         rx: tokio::sync::mpsc::UnboundedReceiver<PlayerEvent>,
         session_for_meta: Session,
         bridge_for_events: Arc<AudioBridge>,
         presence_tx_events: mpsc::UnboundedSender<PresenceUpdate>,
         access_token: String,
+        end_of_track_tx: Option<mpsc::UnboundedSender<()>>,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let mut rx = rx;
@@ -200,6 +205,10 @@ impl SpotifyPlayer {
                     PlayerEvent::EndOfTrack { .. } => {
                         let _ = presence_tx_events.send(PresenceUpdate::Idle);
                         bridge_for_events.clear();
+                        // Signal the priority queue manager
+                        if let Some(ref tx) = end_of_track_tx {
+                            let _ = tx.send(());
+                        }
                     }
                     PlayerEvent::Unavailable { .. } => {
                         let _ = presence_tx_events.send(PresenceUpdate::Idle);
@@ -280,13 +289,13 @@ impl SpotifyPlayer {
             });
             let rx = player.get_player_event_channel();
 
-            // Discovery mode doesn't have an access_token
             Self::spawn_event_loop(
                 rx,
                 session.clone(),
                 bridge_for_events,
                 presence_tx.clone(),
                 String::new(),
+                None,
             );
 
             let (spirc, spirc_task) = match Spirc::new(
@@ -354,6 +363,8 @@ impl SpotifyPlayer {
         bridge: Arc<AudioBridge>,
         presence_tx: mpsc::UnboundedSender<PresenceUpdate>,
         access_token: String,
+        end_of_track_tx: Option<mpsc::UnboundedSender<()>>,
+        spirc_cmd_rx: Option<mpsc::UnboundedReceiver<SpircCommand>>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let cache = Self::create_cache()?;
         let device_id = Self::resolve_device_id(config);
@@ -363,9 +374,9 @@ impl SpotifyPlayer {
         let credentials = Credentials::with_access_token(access_token.clone());
 
         let mut event_loop_handle: Option<tokio::task::JoinHandle<()>> = None;
+        let mut spirc_cmd_rx = spirc_cmd_rx;
 
         loop {
-            // Abort previous event loop and clear stale audio
             if let Some(h) = event_loop_handle.take() {
                 h.abort();
             }
@@ -399,6 +410,7 @@ impl SpotifyPlayer {
                 bridge_for_events,
                 presence_tx.clone(),
                 access_token.clone(),
+                end_of_track_tx.clone(),
             ));
 
             let (spirc, spirc_task) = Spirc::new(
@@ -420,7 +432,28 @@ impl SpotifyPlayer {
 
             tracing::info!("spotify connect active (oauth)");
             let session_start = std::time::Instant::now();
-            spirc_task.await;
+
+            // Process spirc commands while waiting for spirc_task to complete
+            if let Some(mut cmd_rx) = spirc_cmd_rx.take() {
+                tokio::pin!(spirc_task);
+                loop {
+                    tokio::select! {
+                        _ = &mut spirc_task => {
+                            break;
+                        }
+                        cmd = cmd_rx.recv() => {
+                            match cmd {
+                                Some(SpircCommand::Pause) => { let _ = spirc.pause(); }
+                                Some(SpircCommand::Play) => { let _ = spirc.play(); }
+                                None => { break; }
+                            }
+                        }
+                    }
+                }
+            } else {
+                spirc_task.await;
+            }
+
             let _ = spirc.shutdown();
             drop(spirc);
 

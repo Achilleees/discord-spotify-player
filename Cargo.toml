@@ -39,6 +39,11 @@ futures-util = "0.3"
 hex = "0.4"
 rand = "0.10"
 
+# YouTube/file playback support
+tokio-util = { version = "0.7", features = ["rt"] }
+uuid = { version = "1", features = ["v4"] }
+thiserror = "1"
+
 # Force vergen 9.0.6 to fix librespot build (vergen-lib version conflict)
 # See: https://github.com/librespot-org/librespot/issues/1681
 [build-dependencies]
