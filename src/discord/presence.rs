@@ -9,7 +9,7 @@ fn status_text(state: &PresenceUpdate, dance_flip: bool) -> String {
     match state {
         PresenceUpdate::Idle => "Idle".to_string(),
         PresenceUpdate::Paused => "Paused".to_string(),
-        PresenceUpdate::Playing { title, artist } => {
+        PresenceUpdate::Playing { title, artist, .. } => {
             let note = if dance_flip { "\u{266A}" } else { "\u{266C}" };
             let base = format!("{note} {title} - {artist}");
             truncate_status(&base, 96)

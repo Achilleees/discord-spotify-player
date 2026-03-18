@@ -2,5 +2,10 @@
 pub enum PresenceUpdate {
     Idle,
     Paused,
-    Playing { title: String, artist: String },
+    Playing {
+        title: String,
+        artist: String,
+        track_id: String,
+        access_token: String,
+    },
 }

@@ -5,17 +5,21 @@ use crate::audio_bridge::AudioBridge;
 use crate::config::Config;
 use crate::oauth::SpotifyOAuth;
 use crate::presence::PresenceUpdate;
+use crate::spotify::metadata::{fetch_track_metadata, TrackMetadata};
 use crate::spotify::SpotifyPlayer;
 use crate::users::{UserCredentials, UserStore};
 use serenity::all::{
     Channel, ChannelId, ChannelType, CreateCommand, CreateInteractionResponse,
+    UserId,
     CreateInteractionResponseMessage, EditVoiceState, GatewayIntents, GuildId, Interaction, Ready,
 };
 use serenity::async_trait;
-use serenity::builder::{CreateActionRow, CreateButton, CreateCommandOption, CreateMessage};
+use serenity::builder::{CreateActionRow, CreateButton, CreateCommandOption, CreateEmbed, CreateEmbedAuthor, CreateEmbedFooter, CreateMessage, EditMessage};
 use serenity::client::{Client, Context, EventHandler};
 use serenity::model::application::{ButtonStyle, CommandOptionType};
+use serenity::model::id::MessageId;
 use serenity::model::voice::VoiceState;
+use serenity::model::Timestamp;
 use songbird::events::{Event, TrackEvent};
 use songbird::input::{Input, RawAdapter};
 use songbird::tracks::TrackHandle;
@@ -50,6 +54,9 @@ struct Handler {
     oauth: Option<Arc<SpotifyOAuth>>,
     active_session: Arc<Mutex<Option<ActiveSession>>>,
     track_handle: Arc<Mutex<Option<TrackHandle>>>,
+    ctx: Arc<Mutex<Option<Context>>>,
+    controls_message_id: Arc<Mutex<Option<MessageId>>>,
+    now_playing_message_id: Arc<Mutex<Option<MessageId>>>,
 }
 
 async fn configured_channel_kind(ctx: &Context, channel_id: ChannelId) -> Option<ChannelType> {
@@ -81,6 +88,16 @@ fn register_commands() -> Vec<CreateCommand> {
             .description("Permanently delete your stored Spotify credentials"),
         CreateCommand::new("who")
             .description("Show whose Spotify account is currently active"),
+        CreateCommand::new("queue")
+            .description("Add a track to the Spotify queue")
+            .add_option(
+                CreateCommandOption::new(
+                    CommandOptionType::String,
+                    "url",
+                    "Spotify track URL or URI (e.g. https://open.spotify.com/track/... or spotify:track:...)",
+                )
+                .required(true),
+            ),
     ]
 }
 
@@ -143,60 +160,128 @@ async fn play_join_sound_then_bridge(
     let _ = track_handle.add_event(Event::Track(TrackEvent::Error), TrackErrorHandler);
     let _ = track_handle.add_event(Event::Track(TrackEvent::End), TrackErrorHandler);
     tracing::info!(track_uuid = ?track_handle.uuid(), "bridge reader connected after join sound");
-    // Start paused; will resume on first Playing event
     let _ = track_handle.pause();
     let mut lock = track_handle_store.lock().unwrap_or_else(|e| e.into_inner());
     *lock = Some(track_handle);
 }
 
-async fn post_or_update_controls(
-    ctx: &Context,
-    text_channel_id: ChannelId,
-    bot_id: serenity::model::id::UserId,
-) {
-    let controls_text = concat!(
-        "🎛️ **Spotibot Controls**\n",
-        "Use `/login` to take over the session\n",
-        "Use `/logout` to release\n",
-        "Use `/who` to see who's playing"
-    );
+// --- Embed builders ---
 
-    let buttons = CreateActionRow::Buttons(vec![
+fn build_now_playing_embed(meta: &TrackMetadata, spotify_name: &str) -> CreateEmbed {
+    let mut embed = CreateEmbed::new()
+        .color(0x1DB954u32)
+        .title(&meta.title)
+        .url(format!("https://open.spotify.com/track/{}", meta.spotify_track_id))
+        .author(CreateEmbedAuthor::new(&meta.artist))
+        .timestamp(Timestamp::now());
+
+    if !spotify_name.is_empty() {
+        embed = embed.footer(CreateEmbedFooter::new(format!("via {}", spotify_name)));
+    }
+
+    if let Some(ref art_url) = meta.album_art_url {
+        embed = embed.thumbnail(art_url);
+    }
+
+    embed
+}
+
+fn build_history_embed(meta: &TrackMetadata, spotify_name: &str) -> CreateEmbed {
+    let mut embed = CreateEmbed::new()
+        .color(0x2B2D31u32)
+        .title(&meta.title)
+        .url(format!("https://open.spotify.com/track/{}", meta.spotify_track_id))
+        .author(CreateEmbedAuthor::new(&meta.artist));
+
+    let footer_text = if spotify_name.is_empty() {
+        "✅ played".to_string()
+    } else {
+        format!("✅ played · via {}", spotify_name)
+    };
+    embed = embed.footer(CreateEmbedFooter::new(footer_text));
+
+    if let Some(ref art_url) = meta.album_art_url {
+        embed = embed.thumbnail(art_url);
+    }
+
+    embed
+}
+
+fn build_controls_embed() -> CreateEmbed {
+    CreateEmbed::new()
+        .color(0x5865F2u32)
+        .title("🎛️ Spotibot")
+        .description("*Use /login to take over • /logout to release • /who to see who's playing*")
+}
+
+fn build_controls_buttons() -> CreateActionRow {
+    CreateActionRow::Buttons(vec![
         CreateButton::new("ctrl_prev").label("⏮").style(ButtonStyle::Secondary),
         CreateButton::new("ctrl_pause_toggle").label("⏸").style(ButtonStyle::Secondary),
         CreateButton::new("ctrl_next").label("⏭").style(ButtonStyle::Secondary),
-    ]);
+        CreateButton::new("ctrl_queue_hint").label("➕ Queue").style(ButtonStyle::Secondary).disabled(true),
+    ])
+}
 
-    let pins = match text_channel_id.pins(ctx).await {
-        Ok(p) => p,
+async fn post_controls(ctx: &Context, text_channel_id: ChannelId) -> Option<MessageId> {
+    let embed = build_controls_embed();
+    let buttons = build_controls_buttons();
+    let msg = CreateMessage::new()
+        .embed(embed)
+        .components(vec![buttons]);
+    match text_channel_id.send_message(ctx, msg).await {
+        Ok(m) => {
+            tracing::info!("posted controls message");
+            Some(m.id)
+        }
         Err(e) => {
-            tracing::warn!(error = ?e, "failed to fetch pins");
-            vec![]
-        }
-    };
-
-    let existing_pin = pins.iter().find(|msg| msg.author.id == bot_id);
-
-    if let Some(pinned_msg) = existing_pin {
-        use serenity::builder::EditMessage;
-        let edit = EditMessage::new().content(controls_text).components(vec![buttons]);
-        match text_channel_id.edit_message(ctx, pinned_msg.id, edit).await {
-            Ok(_) => tracing::info!("updated existing pinned controls message"),
-            Err(e) => tracing::warn!(error = ?e, "failed to edit pinned controls message"),
-        }
-    } else {
-        let msg = CreateMessage::new().content(controls_text).components(vec![buttons]);
-        match text_channel_id.send_message(ctx, msg).await {
-            Ok(m) => {
-                if let Err(e) = m.pin(ctx).await {
-                    tracing::warn!(error = ?e, "failed to pin controls message");
-                } else {
-                    tracing::info!("posted and pinned controls message");
-                }
-            }
-            Err(e) => tracing::warn!(error = ?e, "failed to post controls message"),
+            tracing::warn!(error = ?e, "failed to post controls message");
+            None
         }
     }
+}
+
+async fn delete_and_repost_controls(
+    ctx: &Context,
+    text_channel_id: ChannelId,
+    controls_message_id: &Arc<Mutex<Option<MessageId>>>,
+) {
+    // Delete old controls
+    let old_id = {
+        let lock = controls_message_id.lock().unwrap_or_else(|e| e.into_inner());
+        *lock
+    };
+    if let Some(mid) = old_id {
+        let _ = text_channel_id.delete_message(ctx, mid).await;
+    }
+
+    // Post new controls at bottom
+    let new_id = post_controls(ctx, text_channel_id).await;
+    let mut lock = controls_message_id.lock().unwrap_or_else(|e| e.into_inner());
+    *lock = new_id;
+}
+
+/// Parse a Spotify track ID from a URL or URI.
+fn parse_track_id_from_url(input: &str) -> Option<String> {
+    let input = input.trim();
+    // spotify:track:<id>
+    if let Some(id) = input.strip_prefix("spotify:track:") {
+        let id = id.split('?').next().unwrap_or(id);
+        if !id.is_empty() {
+            return Some(id.to_string());
+        }
+    }
+    // https://open.spotify.com/track/<id>?...
+    if input.contains("open.spotify.com/track/") {
+        if let Some(after) = input.split("open.spotify.com/track/").nth(1) {
+            let id = after.split('?').next().unwrap_or(after);
+            let id = id.split('/').next().unwrap_or(id);
+            if !id.is_empty() {
+                return Some(id.to_string());
+            }
+        }
+    }
+    None
 }
 
 async fn spotify_playback_command(access_token: &str, method: &str, endpoint: &str) {
@@ -224,6 +309,8 @@ async fn run_presence_loop_with_track(
     track_handle_store: Arc<Mutex<Option<TrackHandle>>>,
     active_session: Arc<Mutex<Option<ActiveSession>>>,
     text_channel_id: ChannelId,
+    controls_message_id: Arc<Mutex<Option<MessageId>>>,
+    now_playing_message_id: Arc<Mutex<Option<MessageId>>>,
 ) {
     let (fwd_tx, fwd_rx) = mpsc::unbounded_channel::<PresenceUpdate>();
     let ctx_presence = ctx.clone();
@@ -232,6 +319,9 @@ async fn run_presence_loop_with_track(
     });
 
     let mut last_track_key: Option<String> = None;
+    // Cache the last now-playing metadata so we can build a history embed when editing
+    let mut last_meta: Option<TrackMetadata> = None;
+    let mut last_spotify_name: String = String::new();
 
     while let Some(update) = rx.recv().await {
         let _ = fwd_tx.send(update.clone());
@@ -247,36 +337,93 @@ async fn run_presence_loop_with_track(
             }
         }
 
-        // Now-playing message on new track
-        if let PresenceUpdate::Playing { title, artist } = &update {
+        // Now-playing embed on new track
+        if let PresenceUpdate::Playing { title, artist, track_id, access_token } = &update {
             let track_key = format!("{} — {}", title, artist);
             if last_track_key.as_deref() != Some(&track_key) {
                 last_track_key = Some(track_key.clone());
+
                 let spotify_name = {
                     let lock = active_session.lock().unwrap_or_else(|e| e.into_inner());
                     lock.as_ref().map(|s| s.spotify_name.clone()).unwrap_or_default()
                 };
-                let msg_content = if spotify_name.is_empty() {
-                    format!("🎵 **{}** — {}", title, artist)
-                } else {
-                    format!("🎵 **{}** — {} *(via {})*", title, artist, spotify_name)
+
+                // Edit previous now-playing to history
+                let prev_msg_id = {
+                    let lock = now_playing_message_id.lock().unwrap_or_else(|e| e.into_inner());
+                    *lock
                 };
-                let ctx_msg = ctx.clone();
-                let title_owned = title.clone();
-                let artist_owned = artist.clone();
-                tokio::spawn(async move {
-                    let msg = CreateMessage::new()
-                        .content(msg_content);
-                    match text_channel_id.send_message(&ctx_msg, msg).await {
-                        Ok(_) => tracing::info!(title = %title_owned, artist = %artist_owned, "now-playing message sent"),
-                        Err(e) => tracing::warn!(error = ?e, "failed to send now-playing message"),
+                if let Some(mid) = prev_msg_id {
+                    if let Some(ref meta) = last_meta {
+                        let history_embed = build_history_embed(meta, &last_spotify_name);
+                        let edit = EditMessage::new().embed(history_embed);
+                        let _ = text_channel_id.edit_message(&ctx, mid, edit).await;
                     }
+                }
+
+                // Fetch metadata from Spotify Web API
+                let meta = if !track_id.is_empty() && !access_token.is_empty() {
+                    fetch_track_metadata(track_id, access_token).await
+                } else {
+                    None
+                };
+
+                let meta = meta.unwrap_or(TrackMetadata {
+                    title: title.clone(),
+                    artist: artist.clone(),
+                    album_art_url: None,
+                    spotify_track_id: track_id.clone(),
                 });
+
+                // Post now-playing embed
+                let embed = build_now_playing_embed(&meta, &spotify_name);
+                let msg = CreateMessage::new().embed(embed);
+                match text_channel_id.send_message(&ctx, msg).await {
+                    Ok(m) => {
+                        tracing::info!(title = %title, artist = %artist, "now-playing embed sent");
+                        let mut lock = now_playing_message_id.lock().unwrap_or_else(|e| e.into_inner());
+                        *lock = Some(m.id);
+                    }
+                    Err(e) => tracing::warn!(error = ?e, "failed to send now-playing embed"),
+                }
+
+                last_meta = Some(meta);
+                last_spotify_name = spotify_name;
+
+                // Delete + repost controls at bottom
+                delete_and_repost_controls(&ctx, text_channel_id, &controls_message_id).await;
             }
         } else if matches!(update, PresenceUpdate::Idle) {
             last_track_key = None;
         }
     }
+}
+
+/// On startup, clean up old bot messages and post fresh controls
+async fn startup_controls(
+    ctx: &Context,
+    text_channel_id: ChannelId,
+    bot_id: serenity::model::id::UserId,
+    controls_message_id: &Arc<Mutex<Option<MessageId>>>,
+) {
+    // Fetch recent messages to find and delete old bot controls
+    use serenity::all::GetMessages;
+    let builder = GetMessages::new().limit(20);
+    if let Ok(messages) = text_channel_id.messages(ctx, builder).await {
+        for msg in &messages {
+            if msg.author.id == bot_id && !msg.embeds.is_empty() {
+                // Check if it's a controls embed (has our title)
+                if msg.embeds.iter().any(|e| e.title.as_deref() == Some("🎛️ Spotibot")) {
+                    let _ = text_channel_id.delete_message(ctx, msg.id).await;
+                }
+            }
+        }
+    }
+
+    // Post fresh controls
+    let new_id = post_controls(ctx, text_channel_id).await;
+    let mut lock = controls_message_id.lock().unwrap_or_else(|e| e.into_inner());
+    *lock = new_id;
 }
 
 #[async_trait]
@@ -289,52 +436,20 @@ impl EventHandler for Handler {
             Err(e) => tracing::warn!(error = ?e, "failed to register slash commands"),
         }
 
-        let manager = match songbird::get(&ctx).await {
-            Some(m) => m,
-            None => { tracing::error!("songbird voice manager not registered"); return; }
-        };
-
-        match manager.join(self.guild_id, self.channel_id).await {
-            Ok(call) => {
-                tracing::info!("joined voice channel");
-
-                if matches!(
-                    configured_channel_kind(&ctx, self.channel_id).await,
-                    Some(ChannelType::Stage)
-                ) {
-                    match self.channel_id.to_channel(&ctx).await {
-                        Ok(Channel::Guild(channel)) => {
-                            let builder = EditVoiceState::new().suppress(false);
-                            match channel.edit_own_voice_state(&ctx, builder).await {
-                                Ok(()) => tracing::info!("unsuppressed bot in stage channel"),
-                                Err(error) => tracing::warn!(error = ?error, "failed to unsuppress bot in stage channel"),
-                            }
-                        }
-                        Ok(_) => {}
-                        Err(error) => tracing::warn!(channel_id = %self.channel_id, error = ?error, "failed to fetch stage channel after voice join"),
-                    }
-                }
-
-                let _ = self.ready_tx.send(Ok(())).await;
-
-                let bridge = self.bridge.clone();
-                let prebuffer_samples = self.prebuffer_samples;
-                let prebuffer_wait = self.prebuffer_wait;
-                let track_handle_store = self.track_handle.clone();
-                tokio::spawn(play_join_sound_then_bridge(call, bridge, prebuffer_samples, prebuffer_wait, track_handle_store));
-
-                let ctx_for_controls = ctx.clone();
-                let text_channel_id = self.text_channel_id;
-                let bot_id = ready.user.id;
-                tokio::spawn(async move {
-                    post_or_update_controls(&ctx_for_controls, text_channel_id, bot_id).await;
-                });
-            }
-            Err(e) => {
-                tracing::error!(error = ?e, "failed to join voice channel");
-                let _ = self.ready_tx.send(Err(format!("{e:?}"))).await;
-            }
+        {
+            let mut ctx_store = self.ctx.lock().unwrap_or_else(|e| e.into_inner());
+            *ctx_store = Some(ctx.clone());
         }
+        let _ = self.ready_tx.send(Ok(())).await;
+
+        // Startup: clean old controls and post fresh
+        let ctx_for_controls = ctx.clone();
+        let text_channel_id = self.text_channel_id;
+        let bot_id = ready.user.id;
+        let controls_id = self.controls_message_id.clone();
+        tokio::spawn(async move {
+            startup_controls(&ctx_for_controls, text_channel_id, bot_id, &controls_id).await;
+        });
 
         let mut presence_rx = self.presence_rx.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(rx) = presence_rx.take() {
@@ -342,8 +457,13 @@ impl EventHandler for Handler {
             let track_handle_store = self.track_handle.clone();
             let active_session = self.active_session.clone();
             let text_channel_id = self.text_channel_id;
+            let controls_id = self.controls_message_id.clone();
+            let np_id = self.now_playing_message_id.clone();
             tokio::spawn(async move {
-                run_presence_loop_with_track(ctx_presence, rx, track_handle_store, active_session, text_channel_id).await;
+                run_presence_loop_with_track(
+                    ctx_presence, rx, track_handle_store, active_session,
+                    text_channel_id, controls_id, np_id,
+                ).await;
             });
         }
     }
@@ -353,7 +473,6 @@ impl EventHandler for Handler {
             return;
         }
 
-        // Extract what we need from cache before any await points (CacheRef is !Send)
         let humans_in_channel = {
             let bot_id = ctx.cache.current_user().id;
             match self.guild_id.to_guild_cached(&ctx) {
@@ -445,6 +564,9 @@ impl EventHandler for Handler {
                             "⏸ Paused"
                         }
                     }
+                    "ctrl_queue_hint" => {
+                        "Use /queue <spotify_url> to add tracks!"
+                    }
                     _ => "Unknown button",
                 }
             } else {
@@ -488,6 +610,21 @@ impl EventHandler for Handler {
             "logout" => self.handle_logout(&user_id, user_id_u64).await,
             "forget" => self.handle_forget(&user_id).await,
             "who" => self.handle_who().await,
+            "queue" => {
+                let url_arg: Option<String> = cmd
+                    .data
+                    .options
+                    .iter()
+                    .find(|o| o.name == "url")
+                    .and_then(|o| {
+                        if let serenity::model::application::CommandDataOptionValue::String(s) = &o.value {
+                            Some(s.clone())
+                        } else {
+                            None
+                        }
+                    });
+                self.handle_queue(url_arg.as_deref()).await
+            }
             _ => return,
         };
 
@@ -502,6 +639,41 @@ impl EventHandler for Handler {
 }
 
 impl Handler {
+    async fn join_voice_for_user(&self, discord_user_id: u64) {
+        let ctx = {
+            let lock = self.ctx.lock().unwrap_or_else(|e| e.into_inner());
+            match lock.clone() {
+                Some(c) => c,
+                None => { tracing::warn!("no ctx available for voice join"); return; }
+            }
+        };
+
+        let user_channel = self.guild_id.to_guild_cached(&ctx)
+            .and_then(|guild| {
+                guild.voice_states.get(&UserId::new(discord_user_id))
+                    .and_then(|vs| vs.channel_id)
+            });
+
+        let target_channel = user_channel.unwrap_or(self.channel_id);
+
+        let manager = match songbird::get(&ctx).await {
+            Some(m) => m,
+            None => { tracing::error!("songbird not registered"); return; }
+        };
+
+        match manager.join(self.guild_id, target_channel).await {
+            Ok(call) => {
+                tracing::info!(channel = %target_channel, "joined voice channel for login");
+                let bridge = self.bridge.clone();
+                let prebuffer_samples = self.prebuffer_samples;
+                let prebuffer_wait = self.prebuffer_wait;
+                let track_handle_store = self.track_handle.clone();
+                tokio::spawn(play_join_sound_then_bridge(call, bridge, prebuffer_samples, prebuffer_wait, track_handle_store));
+            }
+            Err(e) => tracing::warn!(error = ?e, "failed to join voice channel on login"),
+        }
+    }
+
     async fn spawn_session(
         &self,
         discord_user_id: u64,
@@ -527,6 +699,7 @@ impl Handler {
             }
         }
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        self.join_voice_for_user(discord_user_id).await;
 
         let active_session_for_task = active_session.clone();
         let spotify_name_clone = spotify_name.clone();
@@ -742,6 +915,58 @@ Click the link, authorize, then copy the full URL your browser tried to navigate
             None => "No active Spotify session. Run `/login` to connect.".to_string(),
         }
     }
+
+    async fn handle_queue(&self, url_arg: Option<&str>) -> String {
+        let url_str = match url_arg {
+            Some(u) => u,
+            None => return "Please provide a Spotify track URL or URI.".to_string(),
+        };
+
+        let track_id = match parse_track_id_from_url(url_str) {
+            Some(id) => id,
+            None => return "Couldn't parse a Spotify track from that input. Use a URL like `https://open.spotify.com/track/...` or `spotify:track:...`".to_string(),
+        };
+
+        let access_token = {
+            let lock = self.active_session.lock().unwrap_or_else(|e| e.into_inner());
+            lock.as_ref().map(|s| s.access_token.clone())
+        };
+
+        let token = match access_token {
+            Some(t) => t,
+            None => return "No active Spotify session. Use /login first.".to_string(),
+        };
+
+        let uri = format!("spotify:track:{}", track_id);
+        let client = reqwest::Client::new();
+        let url = format!(
+            "https://api.spotify.com/v1/me/player/queue?uri={}",
+            uri.replace(":", "%3A")
+        );
+
+        match client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", token))
+            .header("Content-Length", "0")
+            .send()
+            .await
+        {
+            Ok(resp) => {
+                let status = resp.status().as_u16();
+                if status == 204 || status == 200 {
+                    "✅ Added to queue!".to_string()
+                } else {
+                    let body = resp.text().await.unwrap_or_default();
+                    tracing::warn!(status, body = %body, "queue API error");
+                    format!("Failed to add to queue (HTTP {})", status)
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = ?e, "queue API request failed");
+                "Failed to reach Spotify API.".to_string()
+            }
+        }
+    }
 }
 
 fn generate_state() -> String {
@@ -799,6 +1024,9 @@ impl DiscordBot {
             oauth,
             active_session: active_session.clone(),
             track_handle,
+            ctx: Arc::new(Mutex::new(None)),
+            controls_message_id: Arc::new(Mutex::new(None)),
+            now_playing_message_id: Arc::new(Mutex::new(None)),
         };
 
         let token = config.discord_token.clone();

@@ -30,6 +30,10 @@ enum CredentialOrigin {
     Cache,
 }
 
+fn extract_track_id(uri: &SpotifyUri) -> String {
+    uri.to_id().unwrap_or_default()
+}
+
 pub struct SpotifyPlayer;
 
 impl SpotifyPlayer {
@@ -91,7 +95,7 @@ impl SpotifyPlayer {
             name: device_name.to_string(),
             device_type: DeviceType::Computer,
             is_group: false,
-            initial_volume: 32767, // 50%
+            initial_volume: 32767,
             disable_volume: false,
             volume_steps: 64,
         }
@@ -125,8 +129,90 @@ impl SpotifyPlayer {
         }
     }
 
+    /// Spawn the player event loop, sending PresenceUpdate messages.
+    /// `access_token` is passed through so the Discord side can use it for Web API calls.
+    fn spawn_event_loop(
+        rx: tokio::sync::mpsc::UnboundedReceiver<PlayerEvent>,
+        session_for_meta: Session,
+        bridge_for_events: Arc<AudioBridge>,
+        presence_tx_events: mpsc::UnboundedSender<PresenceUpdate>,
+        access_token: String,
+    ) {
+        tokio::spawn(async move {
+            let mut rx = rx;
+            let mut last_track: Option<SpotifyUri> = None;
+            let mut last_title = String::new();
+            let mut last_artist = String::new();
+            let mut last_track_id = String::new();
+
+            while let Some(event) = rx.recv().await {
+                match event {
+                    PlayerEvent::Playing { track_id, .. } => {
+                        let is_new_track = last_track.as_ref() != Some(&track_id);
+                        if is_new_track {
+                            last_track_id = extract_track_id(&track_id);
+                            if let Some((title, artist)) =
+                                Self::fetch_track_info(&session_for_meta, &track_id).await
+                            {
+                                println!("Playing: {} - {}", title, artist);
+                                last_title = title;
+                                last_artist = artist;
+                            } else {
+                                println!("Playing: (unknown track)");
+                                last_title.clear();
+                                last_artist.clear();
+                            }
+                            last_track = Some(track_id);
+                        }
+                        let title = if last_title.is_empty() {
+                            "Unknown track".to_string()
+                        } else {
+                            last_title.clone()
+                        };
+                        let artist = if last_artist.is_empty() {
+                            "Unknown artist".to_string()
+                        } else {
+                            last_artist.clone()
+                        };
+                        let _ = presence_tx_events.send(PresenceUpdate::Playing {
+                            title,
+                            artist,
+                            track_id: last_track_id.clone(),
+                            access_token: access_token.clone(),
+                        });
+                    }
+                    PlayerEvent::Paused { .. } => {
+                        let _ = presence_tx_events.send(PresenceUpdate::Paused);
+                        bridge_for_events.clear();
+                        tracing::debug!("playback paused");
+                    }
+                    PlayerEvent::Stopped { .. } => {
+                        let _ = presence_tx_events.send(PresenceUpdate::Idle);
+                        bridge_for_events.clear();
+                        tracing::debug!("playback stopped");
+                    }
+                    PlayerEvent::TrackChanged { .. } => {
+                        last_track = None;
+                    }
+                    PlayerEvent::Loading { .. } => {
+                        tracing::debug!("loading track");
+                    }
+                    PlayerEvent::EndOfTrack { .. } => {
+                        let _ = presence_tx_events.send(PresenceUpdate::Idle);
+                        bridge_for_events.clear();
+                    }
+                    PlayerEvent::Unavailable { .. } => {
+                        let _ = presence_tx_events.send(PresenceUpdate::Idle);
+                        bridge_for_events.clear();
+                        println!("Track unavailable");
+                    }
+                    _ => {}
+                }
+            }
+        });
+    }
+
     /// Run Spotify Connect in discovery mode.
-    /// Announces the device on the local network for Spotify clients to find.
     pub async fn run_discovery(
         config: &Config,
         bridge: Arc<AudioBridge>,
@@ -166,14 +252,11 @@ impl SpotifyPlayer {
             let is_reconnect = matches!(origin, CredentialOrigin::Cache);
             if is_reconnect {
                 println!("Reconnecting...");
-                tracing::debug!("using cached credentials");
             } else {
                 println!("Paired. Connecting...");
-                tracing::debug!("new credentials from discovery");
             }
 
             let session = Self::create_session(&cache, &device_id);
-
             let session_start = std::time::Instant::now();
             let connect_config = Self::connect_config(&device_name);
             let mixer: Arc<dyn Mixer> = Arc::new(
@@ -195,74 +278,16 @@ impl SpotifyPlayer {
             let player = Player::new(player_config, session.clone(), mixer.get_soft_volume(), {
                 move || Box::new(DiscordSink::new(bridge_clone.clone(), dsp_config))
             });
-            let mut rx = player.get_player_event_channel();
-            let presence_tx_events = presence_tx.clone();
-            let session_for_meta = session.clone();
-            tokio::spawn(async move {
-                let mut last_track: Option<SpotifyUri> = None;
-                let mut last_title = String::new();
-                let mut last_artist = String::new();
+            let rx = player.get_player_event_channel();
 
-                while let Some(event) = rx.recv().await {
-                    match event {
-                        PlayerEvent::Playing { track_id, .. } => {
-                            let is_new_track = last_track.as_ref() != Some(&track_id);
-                            if is_new_track {
-                                if let Some((title, artist)) =
-                                    Self::fetch_track_info(&session_for_meta, &track_id).await
-                                {
-                                    println!("Playing: {} - {}", title, artist);
-                                    last_title = title;
-                                    last_artist = artist;
-                                } else {
-                                    println!("Playing: (unknown track)");
-                                    last_title.clear();
-                                    last_artist.clear();
-                                }
-                                last_track = Some(track_id);
-                            }
-                            let title = if last_title.is_empty() {
-                                "Unknown track".to_string()
-                            } else {
-                                last_title.clone()
-                            };
-                            let artist = if last_artist.is_empty() {
-                                "Unknown artist".to_string()
-                            } else {
-                                last_artist.clone()
-                            };
-                            let _ =
-                                presence_tx_events.send(PresenceUpdate::Playing { title, artist });
-                        }
-                        PlayerEvent::Paused { .. } => {
-                            let _ = presence_tx_events.send(PresenceUpdate::Paused);
-                            bridge_for_events.clear();
-                            tracing::debug!("playback paused");
-                        }
-                        PlayerEvent::Stopped { .. } => {
-                            let _ = presence_tx_events.send(PresenceUpdate::Idle);
-                            bridge_for_events.clear();
-                            tracing::debug!("playback stopped");
-                        }
-                        PlayerEvent::TrackChanged { .. } => {
-                            last_track = None;
-                        }
-                        PlayerEvent::Loading { .. } => {
-                            tracing::debug!("loading track");
-                        }
-                        PlayerEvent::EndOfTrack { .. } => {
-                            let _ = presence_tx_events.send(PresenceUpdate::Idle);
-                            bridge_for_events.clear();
-                        }
-                        PlayerEvent::Unavailable { .. } => {
-                            let _ = presence_tx_events.send(PresenceUpdate::Idle);
-                            bridge_for_events.clear();
-                            println!("Track unavailable");
-                        }
-                        _ => {}
-                    }
-                }
-            });
+            // Discovery mode doesn't have an access_token
+            Self::spawn_event_loop(
+                rx,
+                session.clone(),
+                bridge_for_events,
+                presence_tx.clone(),
+                String::new(),
+            );
 
             let (spirc, spirc_task) = match Spirc::new(
                 connect_config,
@@ -292,7 +317,6 @@ impl SpotifyPlayer {
             }
 
             tracing::info!("spotify connect active");
-
             spirc_task.await;
             drop(spirc);
 
@@ -311,28 +335,20 @@ impl SpotifyPlayer {
                         "Disconnected. Reconnecting ({}/{})...",
                         cached_reconnects, MAX_CACHED_RECONNECTS
                     );
-                    tracing::warn!(
-                        duration = ?session_duration,
-                        attempt = cached_reconnects,
-                        max = MAX_CACHED_RECONNECTS,
-                        "session ended, reconnecting"
-                    );
                 } else {
                     println!("Disconnected. Re-select '{}' in Spotify.", device_name);
-                    tracing::info!("max reconnects reached, waiting for new pairing");
                     pending_cached = None;
                     cached_reconnects = 0;
                 }
             } else {
                 println!("Disconnected. Select '{}' in Spotify.", device_name);
-                tracing::debug!("no cached credentials, waiting for discovery");
             }
         }
 
         Ok(())
     }
+
     /// Run Spotify Connect using an OAuth access token (no discovery).
-    /// Connects once, plays until the session ends, then returns.
     pub async fn run_with_token(
         config: &Config,
         bridge: Arc<AudioBridge>,
@@ -344,136 +360,79 @@ impl SpotifyPlayer {
         let device_name = config.device_name.clone();
         let mut reconnects: usize = 0;
 
-        // Use the initial token; loop handles fast reconnects before token refresh
         let credentials = Credentials::with_access_token(access_token.clone());
 
         loop {
+            let session = Self::create_session(&cache, &device_id);
+            let connect_config = Self::connect_config(&device_name);
+            let mixer: Arc<dyn Mixer> = Arc::new(
+                SoftMixer::open(MixerConfig::default()).expect("Failed to create audio mixer"),
+            );
 
-        let session = Self::create_session(&cache, &device_id);
-        let connect_config = Self::connect_config(&device_name);
-        let mixer: Arc<dyn Mixer> = Arc::new(
-            SoftMixer::open(MixerConfig::default()).expect("Failed to create audio mixer"),
-        );
+            let player_config = PlayerConfig {
+                bitrate: librespot_playback::config::Bitrate::Bitrate320,
+                ..Default::default()
+            };
 
-        let player_config = PlayerConfig {
-            bitrate: librespot_playback::config::Bitrate::Bitrate320,
-            ..Default::default()
-        };
+            let bridge_clone = bridge.clone();
+            let bridge_for_events = bridge.clone();
+            let dsp_config = DspConfig::new(
+                config.preamp_db,
+                config.bass_boost_db,
+                config.treble_boost_db,
+            );
+            let player = Player::new(player_config, session.clone(), mixer.get_soft_volume(), {
+                move || Box::new(DiscordSink::new(bridge_clone.clone(), dsp_config))
+            });
+            let rx = player.get_player_event_channel();
 
-        let bridge_clone = bridge.clone();
-        let bridge_for_events = bridge.clone();
-        let dsp_config = DspConfig::new(
-            config.preamp_db,
-            config.bass_boost_db,
-            config.treble_boost_db,
-        );
-        let player = Player::new(player_config, session.clone(), mixer.get_soft_volume(), {
-            move || Box::new(DiscordSink::new(bridge_clone.clone(), dsp_config))
-        });
-        let mut rx = player.get_player_event_channel();
-        let presence_tx_events = presence_tx.clone();
-        let session_for_meta = session.clone();
-        tokio::spawn(async move {
-            let mut last_track: Option<SpotifyUri> = None;
-            let mut last_title = String::new();
-            let mut last_artist = String::new();
+            Self::spawn_event_loop(
+                rx,
+                session.clone(),
+                bridge_for_events,
+                presence_tx.clone(),
+                access_token.clone(),
+            );
 
-            while let Some(event) = rx.recv().await {
-                match event {
-                    PlayerEvent::Playing { track_id, .. } => {
-                        let is_new_track = last_track.as_ref() != Some(&track_id);
-                        if is_new_track {
-                            if let Some((title, artist)) =
-                                Self::fetch_track_info(&session_for_meta, &track_id).await
-                            {
-                                println!("Playing: {} - {}", title, artist);
-                                last_title = title;
-                                last_artist = artist;
-                            } else {
-                                println!("Playing: (unknown track)");
-                                last_title.clear();
-                                last_artist.clear();
-                            }
-                            last_track = Some(track_id);
-                        }
-                        let title = if last_title.is_empty() {
-                            "Unknown track".to_string()
-                        } else {
-                            last_title.clone()
-                        };
-                        let artist = if last_artist.is_empty() {
-                            "Unknown artist".to_string()
-                        } else {
-                            last_artist.clone()
-                        };
-                        let _ = presence_tx_events.send(PresenceUpdate::Playing { title, artist });
-                    }
-                    PlayerEvent::Paused { .. } => {
-                        let _ = presence_tx_events.send(PresenceUpdate::Paused);
-                        bridge_for_events.clear();
-                    }
-                    PlayerEvent::Stopped { .. } => {
-                        let _ = presence_tx_events.send(PresenceUpdate::Idle);
-                        bridge_for_events.clear();
-                    }
-                    PlayerEvent::TrackChanged { .. } => {
-                        last_track = None;
-                    }
-                    PlayerEvent::EndOfTrack { .. } => {
-                        let _ = presence_tx_events.send(PresenceUpdate::Idle);
-                        bridge_for_events.clear();
-                    }
-                    PlayerEvent::Unavailable { .. } => {
-                        let _ = presence_tx_events.send(PresenceUpdate::Idle);
-                        bridge_for_events.clear();
-                        println!("Track unavailable");
-                    }
-                    _ => {}
-                }
+            let (spirc, spirc_task) = Spirc::new(
+                connect_config,
+                session.clone(),
+                credentials.clone(),
+                player,
+                mixer,
+            )
+            .await
+            .map_err(|e| {
+                tracing::error!(error = ?e, "OAuth session connect failed");
+                e
+            })?;
+
+            if let Err(e) = spirc.activate() {
+                tracing::warn!(error = ?e, "device activation failed");
             }
-        });
 
-        let (spirc, spirc_task) = Spirc::new(
-            connect_config,
-            session.clone(),
-            credentials.clone(),
-            player,
-            mixer,
-        )
-        .await
-        .map_err(|e| {
-            tracing::error!(error = ?e, "OAuth session connect failed");
-            e
-        })?;
+            tracing::info!("spotify connect active (oauth)");
+            let session_start = std::time::Instant::now();
+            spirc_task.await;
+            let _ = spirc.shutdown();
+            drop(spirc);
 
-        if let Err(e) = spirc.activate() {
-            tracing::warn!(error = ?e, "device activation failed");
+            let session_duration = session_start.elapsed();
+            if session_duration >= std::time::Duration::from_secs(MIN_STABLE_SESSION_SECS) {
+                reconnects = 0;
+            }
+
+            if reconnects < MAX_CACHED_RECONNECTS {
+                reconnects += 1;
+                let delay = std::time::Duration::from_secs(2u64.saturating_mul(reconnects as u64));
+                tracing::info!(attempt = reconnects, delay = ?delay, "oauth session dropped, fast reconnect");
+                tokio::time::sleep(delay).await;
+                continue;
+            }
+
+            tracing::info!("max reconnects reached, returning for token refresh");
+            let _ = presence_tx.send(PresenceUpdate::Idle);
+            return Ok(());
         }
-
-        tracing::info!("spotify connect active (oauth)");
-        let session_start = std::time::Instant::now();
-        spirc_task.await;
-        let _ = spirc.shutdown();
-        drop(spirc);
-
-        let session_duration = session_start.elapsed();
-        if session_duration >= std::time::Duration::from_secs(MIN_STABLE_SESSION_SECS) {
-            reconnects = 0;
-        }
-
-        if reconnects < MAX_CACHED_RECONNECTS {
-            reconnects += 1;
-            let delay = std::time::Duration::from_secs(2u64.saturating_mul(reconnects as u64));
-            tracing::info!(attempt = reconnects, delay = ?delay, "oauth session dropped, fast reconnect");
-            tokio::time::sleep(delay).await;
-            // Loop back — reuse same token (fast reconnect without going to outer task)
-            continue;
-        }
-
-        tracing::info!("max reconnects reached, returning for token refresh");
-        let _ = presence_tx.send(PresenceUpdate::Idle);
-        return Ok(());
-    } // end loop
     }
-
 }
