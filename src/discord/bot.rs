@@ -1313,20 +1313,14 @@ impl Handler {
             lock.len()
         };
 
-        let reply = if has_spotify {
-            if queue_len == 1 && !is_priority_playing {
-                format!("✅ **{}** will play after the current Spotify track.", title)
-            } else {
-                format!("✅ Added to queue: **{}** · Position #{}", title, queue_len)
-            }
+        // Always play immediately if nothing is actively playing
+        // (even if a Spotify session exists but is idle/paused)
+        let reply = if is_priority_playing {
+            format!("✅ Added to queue: **{}** · Position #{}", title, queue_len)
         } else {
-            if is_priority_playing {
-                format!("✅ Added to queue: **{}** · Position #{}", title, queue_len)
-            } else {
-                // Nothing playing at all — trigger direct play
-                self.trigger_priority_queue_drain().await;
-                format!("✅ Now playing: **{}**", title)
-            }
+            // Nothing actively playing — start immediately
+            self.trigger_priority_queue_drain().await;
+            format!("▶ Playing: **{}**", title)
         };
 
         let _ = cmd.edit_response(ctx, EditInteractionResponse::new()
@@ -1356,8 +1350,18 @@ impl Handler {
                 // Check if already in a call
                 let in_call = manager.get(self.guild_id).is_some();
                 if !in_call {
-                    // Join configured voice channel
-                    match manager.join(self.guild_id, self.channel_id).await {
+                    // Join the queuing user's voice channel, fallback to configured
+                    let user_channel = self.guild_id.to_guild_cached(ctx)
+                        .and_then(|guild| {
+                            // Find any human in a voice channel to follow
+                            let bot_id = ctx.cache.current_user().id;
+                            guild.voice_states.values()
+                                .filter(|vs| vs.user_id != bot_id)
+                                .filter_map(|vs| vs.channel_id)
+                                .next()
+                        })
+                        .unwrap_or(self.channel_id);
+                    match manager.join(self.guild_id, user_channel).await {
                         Ok(call) => {
                             let bridge_clone = self.bridge.clone();
                             let prebuffer_samples = self.prebuffer_samples;

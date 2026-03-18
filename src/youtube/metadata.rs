@@ -57,21 +57,31 @@ struct YtDlpJson {
 
 /// Run `yt-dlp --dump-json <url>` and parse the result (metadata only, no download).
 pub async fn fetch_youtube_metadata(url: &str) -> Result<YoutubeMetadata, YoutubeError> {
+    let cookies_path = "/opt/openclaw/services/spotibot/youtube-cookies.txt";
+    let mut args = vec!["--dump-json", "--no-playlist", "--flat-playlist", "--remote-components", "ejs:github"];
+    if std::path::Path::new(cookies_path).exists() {
+        args.extend(["--cookies", cookies_path]);
+    }
+    args.push(url);
     let output = tokio::process::Command::new("yt-dlp")
-        .args(["--dump-json", "--no-playlist", "--flat-playlist", url])
+        .args(&args)
         .output()
         .await
         .map_err(|e| YoutubeError::Network(e.to_string()))?;
 
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
-        if stderr.contains("sign in") || stderr.contains("age") {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr_lower = stderr.to_lowercase();
+        tracing::warn!(stderr = %stderr, "yt-dlp failed");
+        if stderr_lower.contains("age") && (stderr_lower.contains("sign in") || stderr_lower.contains("confirm your age")) {
             return Err(YoutubeError::AgeRestricted);
         }
-        if stderr.contains("unavailable") || stderr.contains("private") || stderr.contains("removed") {
+        if stderr_lower.contains("unavailable") || stderr_lower.contains("private") || stderr_lower.contains("removed") {
             return Err(YoutubeError::Unavailable);
         }
-        return Err(YoutubeError::NotFound);
+        // Show actual error to user for debugging
+        let short_err = stderr.lines().last().unwrap_or("Unknown error").trim();
+        return Err(YoutubeError::Network(short_err.to_string()));
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);

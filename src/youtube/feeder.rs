@@ -41,8 +41,14 @@ async fn download_youtube(url: &str, token: &CancellationToken) -> Result<std::p
     let id = Uuid::new_v4().to_string();
     let output_template = format!("{}/yt-{}.%(ext)s", TMP_DIR, id);
 
+    let cookies_path = "/opt/openclaw/services/spotibot/youtube-cookies.txt";
+    let mut args = vec!["-f".to_string(), "bestaudio*".to_string(), "--no-playlist".to_string(), "--no-part".to_string(), "--remote-components".to_string(), "ejs:github".to_string(), "-o".to_string(), output_template.clone()];
+    if std::path::Path::new(cookies_path).exists() {
+        args.extend(["--cookies".to_string(), cookies_path.to_string()]);
+    }
+    args.push(url.to_string());
     let mut child = Command::new("yt-dlp")
-        .args(["-f", "bestaudio", "--no-playlist", "--no-part", "-o", &output_template, url])
+        .args(&args)
         .kill_on_drop(true)
         .spawn()
         .map_err(|e| FeederError::DownloadFailed(e.to_string()))?;
