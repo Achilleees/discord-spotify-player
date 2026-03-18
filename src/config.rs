@@ -12,6 +12,8 @@ pub struct Config {
     pub preamp_db: f32,
     pub bass_boost_db: f32,
     pub treble_boost_db: f32,
+    pub spotify_client_id: Option<String>,
+    pub spotify_client_secret: Option<String>,
 }
 
 impl Config {
@@ -53,6 +55,16 @@ impl Config {
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
 
+        let spotify_client_id = env::var("SPOTIFY_CLIENT_ID")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+
+        let spotify_client_secret = env::var("SPOTIFY_CLIENT_SECRET")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+
         Ok(Config {
             discord_token: env::var("DISCORD_TOKEN")
                 .map_err(|_| ConfigError::Missing("DISCORD_TOKEN"))?,
@@ -71,6 +83,8 @@ impl Config {
             preamp_db,
             bass_boost_db,
             treble_boost_db,
+            spotify_client_id,
+            spotify_client_secret,
         })
     }
 }

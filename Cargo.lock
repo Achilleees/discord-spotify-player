@@ -846,8 +846,9 @@ dependencies = [
 
 [[package]]
 name = "discord-spotify-player"
-version = "0.2.5-pre"
+version = "0.3.0"
 dependencies = [
+ "base64",
  "dialoguer",
  "dotenvy",
  "futures-util",
@@ -860,12 +861,16 @@ dependencies = [
  "librespot-playback",
  "parking_lot 0.12.5",
  "rand 0.10.0",
+ "reqwest",
+ "serde",
+ "serde_json",
  "serenity",
  "songbird",
  "symphonia",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "url",
  "vergen",
  "vergen-gitcl",
 ]

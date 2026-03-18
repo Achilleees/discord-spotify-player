@@ -2,12 +2,17 @@ use super::presence::run_presence_loop;
 use super::voice::{SimpleBridgeReader, TrackErrorHandler, CHANNELS, SAMPLE_RATE};
 use crate::audio_bridge::AudioBridge;
 use crate::config::Config;
+use crate::oauth::SpotifyOAuth;
 use crate::presence::PresenceUpdate;
+use crate::users::{UserCredentials, UserStore};
 use serenity::all::{
-    Channel, ChannelId, ChannelType, EditVoiceState, GatewayIntents, GuildId, Ready,
+    Channel, ChannelId, ChannelType, CreateCommand, CreateInteractionResponse,
+    CreateInteractionResponseMessage, EditVoiceState, GatewayIntents, GuildId, Interaction, Ready,
 };
 use serenity::async_trait;
+use serenity::builder::CreateCommandOption;
 use serenity::client::{Client, Context, EventHandler};
+use serenity::model::application::CommandOptionType;
 use songbird::events::{Event, TrackEvent};
 use songbird::SerenityInit;
 use std::sync::Arc;
@@ -23,6 +28,8 @@ struct Handler {
     presence_rx: Mutex<Option<mpsc::UnboundedReceiver<PresenceUpdate>>>,
     prebuffer_samples: usize,
     prebuffer_wait: std::time::Duration,
+    user_store: Arc<UserStore>,
+    oauth: Option<Arc<SpotifyOAuth>>,
 }
 
 async fn configured_channel_kind(ctx: &Context, channel_id: ChannelId) -> Option<ChannelType> {
@@ -36,10 +43,37 @@ async fn configured_channel_kind(ctx: &Context, channel_id: ChannelId) -> Option
     }
 }
 
+fn register_commands() -> Vec<CreateCommand> {
+    vec![
+        CreateCommand::new("login")
+            .description("Connect your Spotify account (or reactivate existing session)")
+            .add_option(
+                CreateCommandOption::new(
+                    CommandOptionType::String,
+                    "code",
+                    "Paste the redirect URL (or code) after authorizing",
+                )
+                .required(false),
+            ),
+        CreateCommand::new("logout")
+            .description("Deactivate your Spotify session (credentials kept for quick re-login)"),
+        CreateCommand::new("forget")
+            .description("Permanently delete your stored Spotify credentials"),
+        CreateCommand::new("who")
+            .description("Show whose Spotify account is currently active"),
+    ]
+}
+
 #[async_trait]
 impl EventHandler for Handler {
     async fn ready(&self, ctx: Context, ready: Ready) {
         tracing::info!(user = %ready.user.name, "discord bot connected");
+
+        // Register slash commands for this guild
+        match self.guild_id.set_commands(&ctx, register_commands()).await {
+            Ok(cmds) => tracing::info!("registered {} slash commands", cmds.len()),
+            Err(e) => tracing::warn!(error = ?e, "failed to register slash commands"),
+        }
 
         let manager = match songbird::get(&ctx).await {
             Some(m) => m,
@@ -99,7 +133,6 @@ impl EventHandler for Handler {
             }
         }
 
-        // Take the receiver exactly once; the spawned task owns it from here.
         let mut presence_rx = self.presence_rx.lock().await;
         if let Some(rx) = presence_rx.take() {
             let ctx = ctx.clone();
@@ -108,6 +141,217 @@ impl EventHandler for Handler {
             });
         }
     }
+
+    async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
+        let cmd = match interaction.command() {
+            Some(c) => c,
+            None => return,
+        };
+
+        // Extract the optional "code" string option
+        let code_arg: Option<String> = cmd
+            .data
+            .options
+            .iter()
+            .find(|o| o.name == "code")
+            .and_then(|o| {
+                if let serenity::model::application::CommandDataOptionValue::String(s) = &o.value {
+                    Some(s.clone())
+                } else {
+                    None
+                }
+            });
+
+        let user_id = cmd.user.id.to_string();
+        let username = cmd.user.name.clone();
+
+        let reply = match cmd.data.name.as_str() {
+            "login" => self.handle_login(&user_id, &username, code_arg.as_deref()).await,
+            "logout" => self.handle_logout(&user_id).await,
+            "forget" => self.handle_forget(&user_id).await,
+            "who" => self.handle_who(&user_id).await,
+            _ => return,
+        };
+
+        let response = CreateInteractionResponse::Message(
+            CreateInteractionResponseMessage::new()
+                .content(reply)
+                .ephemeral(true),
+        );
+
+        if let Err(e) = cmd.create_response(&ctx, response).await {
+            tracing::warn!(error = ?e, "failed to create interaction response");
+        }
+    }
+}
+
+impl Handler {
+    /// /login — no args: start OAuth or reactivate existing session.
+    /// /login code:<url|token>: complete the OAuth flow.
+    async fn handle_login(
+        &self,
+        user_id: &str,
+        _discord_username: &str,
+        code_arg: Option<&str>,
+    ) -> String {
+        // Check for existing credentials first
+        if let Some(existing) = self.user_store.load(user_id) {
+            // If no code provided and we have stored creds, just reactivate
+            if code_arg.is_none() {
+                if existing.active {
+                    return format!(
+                        "Already logged in as **{}**. Use `/logout` to deactivate or `/forget` to remove credentials.",
+                        existing.spotify_username
+                    );
+                } else {
+                    // Reactivate without OAuth
+                    let mut creds = existing;
+                    creds.active = true;
+                    match self.user_store.save(&creds) {
+                        Ok(()) => {
+                            tracing::info!(user = %user_id, spotify = %creds.spotify_username, "session reactivated");
+                            return format!("Session reactivated as **{}**!", creds.spotify_username);
+                        }
+                        Err(e) => {
+                            tracing::error!("failed to reactivate session: {}", e);
+                            return "Failed to reactivate session. Please try again.".to_string();
+                        }
+                    }
+                }
+            }
+        }
+
+        let oauth = match &self.oauth {
+            Some(o) => o.clone(),
+            None => {
+                return "OAuth not configured. Set SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET in .env.".to_string();
+            }
+        };
+
+        match code_arg {
+            None => {
+                // No code, no existing creds — start OAuth flow
+                let state = generate_state();
+                let url = oauth.auth_url(&state);
+                format!(
+                    "Connect your Spotify account:\n\n<{}>\n\nClick the link, authorize, then copy the full URL your browser tried to navigate to (it will fail with connection refused — that's expected). Run `/login code:<that URL>` to complete.",
+                    url
+                )
+            }
+            Some(raw) => {
+                // Complete the flow
+                let code = match SpotifyOAuth::extract_code(raw) {
+                    Some(c) => c,
+                    None => {
+                        return "Couldn't extract a code from that input. Please paste the full redirect URL from your browser.".to_string();
+                    }
+                };
+
+                match oauth.exchange_code(&code).await {
+                    Ok(token) => {
+                        let refresh_token = match token.refresh_token {
+                            Some(rt) => rt,
+                            None => {
+                                return "Spotify didn't return a refresh token. Please try again.".to_string();
+                            }
+                        };
+
+                        let display_name = match oauth.get_user_profile(&token.access_token).await {
+                            Ok(name) => name,
+                            Err(e) => {
+                                tracing::warn!("failed to fetch Spotify profile: {}", e);
+                                "Unknown".to_string()
+                            }
+                        };
+
+                        let creds = UserCredentials {
+                            discord_user_id: user_id.to_string(),
+                            spotify_username: display_name.clone(),
+                            access_token: token.access_token,
+                            refresh_token,
+                            paired_at: unix_timestamp_str(),
+                            active: true,
+                        };
+
+                        match self.user_store.save(&creds) {
+                            Ok(()) => {
+                                tracing::info!(user = %user_id, spotify = %display_name, "OAuth login successful");
+                                format!("Logged in as **{}**!", display_name)
+                            }
+                            Err(e) => {
+                                tracing::error!("failed to save credentials: {}", e);
+                                "Failed to save credentials. Please try again.".to_string()
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("OAuth code exchange failed: {}", e);
+                        "Failed to exchange code with Spotify. The code may have expired — run `/login` to start over.".to_string()
+                    }
+                }
+            }
+        }
+    }
+
+    /// /logout — soft deactivate (keeps creds stored)
+    async fn handle_logout(&self, user_id: &str) -> String {
+        match self.user_store.deactivate(user_id) {
+            Ok(true) => {
+                tracing::info!(user = %user_id, "session deactivated");
+                "Session deactivated. Your credentials are kept — run `/login` to reactivate without re-authorizing.".to_string()
+            }
+            Ok(false) => "You don't have an active session.".to_string(),
+            Err(e) => {
+                tracing::error!("failed to deactivate session: {}", e);
+                "Failed to deactivate session.".to_string()
+            }
+        }
+    }
+
+    /// /forget — hard delete stored credentials
+    async fn handle_forget(&self, user_id: &str) -> String {
+        match self.user_store.remove(user_id) {
+            Ok(true) => {
+                tracing::info!(user = %user_id, "credentials forgotten");
+                "Credentials permanently deleted. Run `/login` to connect again.".to_string()
+            }
+            Ok(false) => "No stored credentials to delete.".to_string(),
+            Err(e) => {
+                tracing::error!("failed to delete credentials: {}", e);
+                "Failed to delete credentials.".to_string()
+            }
+        }
+    }
+
+    /// /who — show active session info
+    async fn handle_who(&self, user_id: &str) -> String {
+        match self.user_store.load(user_id) {
+            Some(creds) if creds.active => {
+                format!("Active session: **{}** (paired {})", creds.spotify_username, creds.paired_at)
+            }
+            Some(creds) => {
+                format!(
+                    "Inactive session for **{}** (paired {}). Run `/login` to reactivate.",
+                    creds.spotify_username, creds.paired_at
+                )
+            }
+            None => "No Spotify session. Run `/login` to connect.".to_string(),
+        }
+    }
+}
+
+fn generate_state() -> String {
+    use rand::distr::SampleString;
+    rand::distr::Alphanumeric.sample_string(&mut rand::rng(), 16)
+}
+
+fn unix_timestamp_str() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format!("unix:{}", secs)
 }
 
 pub struct DiscordBot {
@@ -120,8 +364,11 @@ impl DiscordBot {
         config: &Config,
         bridge: Arc<AudioBridge>,
         presence_rx: mpsc::UnboundedReceiver<PresenceUpdate>,
+        user_store: Arc<UserStore>,
+        oauth: Option<Arc<SpotifyOAuth>>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let intents = GatewayIntents::GUILDS | GatewayIntents::GUILD_VOICE_STATES;
+
         let (ready_tx, ready_rx) = mpsc::channel(1);
 
         let prebuffer_samples =
@@ -137,6 +384,8 @@ impl DiscordBot {
             presence_rx: Mutex::new(Some(presence_rx)),
             prebuffer_samples,
             prebuffer_wait,
+            user_store,
+            oauth,
         };
 
         let client = Client::builder(&config.discord_token, intents)
