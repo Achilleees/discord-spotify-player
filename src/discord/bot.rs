@@ -10,10 +10,11 @@ use crate::spotify::metadata::{fetch_track_metadata, TrackMetadata};
 use crate::spotify::SpotifyPlayer;
 use crate::spotify::SpircCommand;
 use crate::youtube::metadata::{fetch_youtube_metadata, validate_attachment};
+// P0/P1 imports used below
 use crate::youtube::feeder::{feed_youtube_to_bridge, feed_file_to_bridge, FeederError};
 use crate::users::{UserCredentials, UserStore};
 use serenity::all::{
-    Channel, ChannelId, ChannelType, CreateCommand, CreateInteractionResponse,
+    ChannelId, CreateCommand, CreateInteractionResponse,
     UserId,
     CreateInteractionResponseMessage, GatewayIntents, GuildId, Interaction, Ready,
 };
@@ -73,16 +74,7 @@ struct Handler {
     feeder_paused: Arc<AtomicBool>,
 }
 
-async fn configured_channel_kind(ctx: &Context, channel_id: ChannelId) -> Option<ChannelType> {
-    match channel_id.to_channel(ctx).await {
-        Ok(Channel::Guild(channel)) => Some(channel.kind),
-        Ok(_) => None,
-        Err(error) => {
-            tracing::debug!(channel_id = %channel_id, error = ?error, "failed to resolve configured channel");
-            None
-        }
-    }
-}
+
 
 fn register_commands(ytdlp_available: bool) -> Vec<CreateCommand> {
     let mut cmds = vec![
@@ -894,7 +886,18 @@ impl EventHandler for Handler {
                 "ctrl_pause_toggle" => {
                     if priority_playing {
                         let current = self.feeder_paused.load(Ordering::Relaxed);
-                        self.feeder_paused.store(!current, Ordering::Relaxed);
+                        let new_paused = !current;
+                        self.feeder_paused.store(new_paused, Ordering::Relaxed);
+                        // P1: Update button visual to reflect pause/play state
+                        let msg_id = {
+                            let lock = self.controls_message_id.lock().unwrap_or_else(|e| e.into_inner());
+                            *lock
+                        };
+                        if let Some(mid) = msg_id {
+                            let buttons = build_controls_buttons(new_paused);
+                            let edit = EditMessage::new().components(vec![buttons]);
+                            let _ = self.text_channel_id.edit_message(&ctx, mid, edit).await;
+                        }
                         if current { "▶ Resumed" } else { "⏸ Paused" }
                     } else if let Some(token) = &access_token {
                         let handle_clone = {
@@ -1068,6 +1071,23 @@ impl Handler {
         access_token: String,
         refresh_token: String,
     ) {
+        // P1: Cancel any active YouTube/file feeder before starting Spotify session
+        {
+            let token = {
+                let lock = self.feeder_cancel.lock().unwrap_or_else(|e: std::sync::PoisonError<_>| e.into_inner());
+                lock.clone()
+            };
+            if let Some(t) = token { t.cancel(); }
+        }
+        {
+            let mut lock = self.priority_queue.lock().unwrap_or_else(|e| e.into_inner());
+            lock.clear();
+        }
+        {
+            let mut lock = self.active_priority_item.lock().unwrap_or_else(|e| e.into_inner());
+            *lock = None;
+        }
+
         let config = self.config.clone();
         let bridge = self.bridge.clone();
         let presence_tx = self.presence_tx.clone();
@@ -1297,11 +1317,6 @@ impl Handler {
 
         let title = queue_item.source.display_title().to_string();
 
-        let has_spotify = {
-            let lock = self.active_session.lock().unwrap_or_else(|e| e.into_inner());
-            lock.is_some()
-        };
-
         let is_priority_playing = {
             let lock = self.active_priority_item.lock().unwrap_or_else(|e| e.into_inner());
             lock.is_some()
@@ -1377,6 +1392,19 @@ impl Handler {
             }
         }
 
+        // P0: Pause Spotify before feeding YouTube/file audio to the bridge
+        let spirc_cmd_tx_for_drain = {
+            let lock = self.spirc_cmd_tx.lock().unwrap_or_else(|e| e.into_inner());
+            lock.clone()
+        };
+        if let Some(ref tx) = spirc_cmd_tx_for_drain {
+            let _ = tx.send(SpircCommand::Pause);
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        }
+        self.bridge.clear();
+
+        let spirc_resume_tx = spirc_cmd_tx_for_drain;
+
         tokio::spawn(async move {
             loop {
                 let item = {
@@ -1426,6 +1454,11 @@ impl Handler {
                     break;
                 }
             }
+
+            // P0: Resume Spotify after priority queue drains
+            if let Some(ref tx) = spirc_resume_tx {
+                let _ = tx.send(SpircCommand::Play);
+            }
         });
     }
 
@@ -1444,6 +1477,24 @@ impl Handler {
                 t.cancel();
             }
             self.bridge.clear();
+            // Check if more items exist; if so, start the next one
+            let has_more = {
+                let lock = self.priority_queue.lock().unwrap_or_else(|e| e.into_inner());
+                !lock.snapshot().is_empty()
+            };
+            if has_more {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                self.trigger_priority_queue_drain().await;
+            } else {
+                // No more items — resume Spotify if session exists
+                let spirc_tx = {
+                    let lock = self.spirc_cmd_tx.lock().unwrap_or_else(|e| e.into_inner());
+                    lock.clone()
+                };
+                if let Some(ref tx) = spirc_tx {
+                    let _ = tx.send(SpircCommand::Play);
+                }
+            }
             "⏭ Skipped.".to_string()
         } else {
             let access_token = {
@@ -1480,6 +1531,15 @@ impl Handler {
         }
 
         self.bridge.clear();
+
+        // Resume Spotify if a session exists
+        let spirc_tx = {
+            let lock = self.spirc_cmd_tx.lock().unwrap_or_else(|e| e.into_inner());
+            lock.clone()
+        };
+        if let Some(ref tx) = spirc_tx {
+            let _ = tx.send(SpircCommand::Play);
+        }
 
         "⏹ Stopped. Priority queue cleared.".to_string()
     }

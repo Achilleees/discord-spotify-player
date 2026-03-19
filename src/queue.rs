@@ -11,11 +11,13 @@ pub enum MediaSource {
         title: String,
         channel: String,
         thumbnail_url: Option<String>,
+        #[allow(dead_code)]
         duration_secs: u64,
     },
     File {
         filename: String,
         attachment_url: String,
+        #[allow(dead_code)]
         content_type: Option<String>,
     },
 }
@@ -47,6 +49,7 @@ impl MediaSource {
 pub struct QueueItem {
     pub source: MediaSource,
     pub queued_by: String,
+    #[allow(dead_code)]
     pub queued_by_id: u64,
 }
 
@@ -72,9 +75,6 @@ impl PriorityQueue {
         self.items.len()
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.items.is_empty()
-    }
 
     pub fn clear(&mut self) {
         self.items.clear();

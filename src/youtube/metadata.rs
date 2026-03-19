@@ -24,6 +24,7 @@ pub enum YoutubeError {
     #[error("Live streams aren't supported.")]
     LiveStream,
     #[error("Download failed: {0}")]
+    #[allow(dead_code)]
     DownloadFailed(String),
     #[error("Unsupported file type. Accepted: mp3, flac, ogg, wav, m4a, aac, opus")]
     InvalidFileType,
