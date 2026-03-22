@@ -1,6 +1,7 @@
 use super::presence::run_presence_loop;
 use super::voice::{SimpleBridgeReader, TrackErrorHandler, CHANNELS, SAMPLE_RATE};
 use crate::audio::generate_join_sound;
+use crate::audio::dj::DJAnnouncer;
 use crate::audio_bridge::AudioBridge;
 use crate::config::Config;
 use crate::oauth::SpotifyOAuth;
@@ -72,6 +73,8 @@ struct Handler {
     active_priority_item: Arc<Mutex<Option<QueueItem>>>,
     feeder_cancel: Arc<Mutex<Option<CancellationToken>>>,
     feeder_paused: Arc<AtomicBool>,
+    dj: Arc<DJAnnouncer>,
+    announce_enabled: Arc<AtomicBool>,
 }
 
 
@@ -110,6 +113,8 @@ fn register_commands(ytdlp_available: bool) -> Vec<CreateCommand> {
             .description("Stop playback and clear the priority queue"),
         CreateCommand::new("np")
             .description("Show what's currently playing"),
+        CreateCommand::new("announce")
+            .description("Toggle DJ track announcements on/off"),
     ];
 
     if ytdlp_available {
@@ -162,17 +167,22 @@ async fn play_join_sound_then_bridge(
     prebuffer_samples: usize,
     prebuffer_wait: std::time::Duration,
     track_handle_store: Arc<Mutex<Option<TrackHandle>>>,
+    dj: Arc<DJAnnouncer>,
 ) {
-    let join_samples = generate_join_sound();
-    let stereo_f32: Vec<f32> = join_samples
-        .iter()
-        .flat_map(|&s| {
-            let f = s as f32 / i16::MAX as f32;
-            [f, f]
-        })
-        .collect();
+    // Use DJ greeting if available, fall back to beep
+    let (stereo_f32, duration_secs) = if let Some(clip) = dj.join_clip() {
+        let dur = clip.len() as f64 / (44100.0 * 2.0);
+        let scaled: Vec<f32> = clip.iter().map(|s| s * 0.18).collect();
+        (scaled, dur)
+    } else {
+        let join_samples = generate_join_sound();
+        let stereo: Vec<f32> = join_samples.iter()
+            .flat_map(|&s| { let f = s as f32 / i16::MAX as f32; [f, f] })
+            .collect();
+        let dur = join_samples.len() as f64 / 44100.0;
+        (stereo, dur)
+    };
     let bytes: Vec<u8> = stereo_f32.iter().flat_map(|s| s.to_le_bytes()).collect();
-    let duration_secs = join_samples.len() as f64 / 44100.0;
 
     {
         let mut call = call_lock.lock().await;
@@ -471,6 +481,7 @@ async fn priority_queue_manager(
     active_priority_item: Arc<Mutex<Option<QueueItem>>>,
     feeder_cancel: Arc<Mutex<Option<CancellationToken>>>,
     feeder_paused: Arc<AtomicBool>,
+    dj: Arc<DJAnnouncer>,
     controls_message_id: Arc<Mutex<Option<MessageId>>>,
     now_playing_message_id: Arc<Mutex<Option<MessageId>>>,
 ) {
@@ -511,6 +522,15 @@ async fn priority_queue_manager(
                 &controls_message_id, &now_playing_message_id,
             ).await;
 
+            // DJ announcement before track
+            if dj.is_enabled() {
+                let title = item.source.display_title().to_string();
+                let subtitle = item.source.display_subtitle().to_string();
+                let queued_by = item.queued_by.clone();
+                if let Some(clip) = dj.track_announce_clip(&title, &subtitle, &queued_by).await {
+                    bridge.push_overlay(&clip);
+                }
+            }
             // Create cancel token
             let token = CancellationToken::new();
             {
@@ -569,6 +589,9 @@ async fn run_presence_loop_with_track(
     text_channel_id: ChannelId,
     controls_message_id: Arc<Mutex<Option<MessageId>>>,
     now_playing_message_id: Arc<Mutex<Option<MessageId>>>,
+    dj: Arc<DJAnnouncer>,
+    announce_enabled: Arc<AtomicBool>,
+    bridge: Arc<AudioBridge>,
 ) {
     let (fwd_tx, fwd_rx) = mpsc::unbounded_channel::<PresenceUpdate>();
     let ctx_presence = ctx.clone();
@@ -675,6 +698,27 @@ async fn run_presence_loop_with_track(
 
                 last_meta = Some(meta);
                 last_spotify_name = spotify_name;
+
+                // DJ announcement AFTER embed (non-blocking, only if enabled)
+                if announce_enabled.load(Ordering::Relaxed) {
+                let dj_title = title.clone();
+                let dj_artist = artist.clone();
+                let dj_ref = dj.clone();
+                let bridge_ref = bridge.clone();
+                tokio::spawn(async move {
+                    let _ = std::fs::write("/opt/openclaw/services/spotibot/debug_reached.txt",
+                        format!("reached: {} - {}", dj_title, dj_artist));
+                    match dj_ref.track_announce_clip(&dj_title, &dj_artist, "").await {
+                        Some(clip) => {
+                            tracing::info!(title = %dj_title, artist = %dj_artist, samples = clip.len(), "DJ overlay pushed");
+                            bridge_ref.push_overlay(&clip);
+                        }
+                        None => {
+                            tracing::warn!(title = %dj_title, artist = %dj_artist, "DJ clip failed");
+                        }
+                    }
+                });
+                } // end announce_enabled check
             }
         } else if matches!(update, PresenceUpdate::Idle) {
             last_track_key = None;
@@ -746,6 +790,9 @@ impl EventHandler for Handler {
         });
 
         let mut presence_rx = self.presence_rx.lock().unwrap_or_else(|e| e.into_inner());
+        let has_rx = presence_rx.is_some();
+        let _ = std::fs::write("/opt/openclaw/services/spotibot/debug_ready.txt", format!("ready fired, has_rx={}", has_rx));
+        tracing::info!("DJ DEBUG: ready fired, has_rx={}", has_rx);
         if let Some(rx) = presence_rx.take() {
             let ctx_presence = ctx.clone();
             let track_handle_store = self.track_handle.clone();
@@ -753,10 +800,15 @@ impl EventHandler for Handler {
             let text_channel_id = self.text_channel_id;
             let controls_id = self.controls_message_id.clone();
             let np_id = self.now_playing_message_id.clone();
+            let dj_presence = self.dj.clone();
+            let bridge_presence = self.bridge.clone();
+            let announce_presence = self.announce_enabled.clone();
             tokio::spawn(async move {
                 run_presence_loop_with_track(
                     ctx_presence, rx, track_handle_store, active_session,
                     text_channel_id, controls_id, np_id,
+                    dj_presence, announce_presence,
+                    bridge_presence,
                 ).await;
             });
         }
@@ -1014,6 +1066,7 @@ impl EventHandler for Handler {
             "skip" => self.handle_skip().await,
             "stop" => self.handle_stop().await,
             "np" => self.handle_np().await,
+            "announce" => self.handle_announce().await,
             _ => return,
         };
 
@@ -1053,11 +1106,17 @@ impl Handler {
         match manager.join(self.guild_id, target_channel).await {
             Ok(call) => {
                 tracing::info!(channel = %target_channel, "joined voice channel for login");
+                // Self-deafen so users know we're not listening
+                let bot_id = ctx.cache.current_user().id;
+                let _ = self.guild_id.edit_member(&ctx, bot_id,
+                    serenity::builder::EditMember::new().deafen(true)).await;
+                tracing::info!("self-deafened");
                 let bridge = self.bridge.clone();
                 let prebuffer_samples = self.prebuffer_samples;
                 let prebuffer_wait = self.prebuffer_wait;
                 let track_handle_store = self.track_handle.clone();
-                tokio::spawn(play_join_sound_then_bridge(call, bridge, prebuffer_samples, prebuffer_wait, track_handle_store));
+                let dj_join = self.dj.clone();
+                tokio::spawn(play_join_sound_then_bridge(call, bridge, prebuffer_samples, prebuffer_wait, track_handle_store, dj_join));
             }
             Err(e) => tracing::warn!(error = ?e, "failed to join voice channel on login"),
         }
@@ -1149,6 +1208,7 @@ impl Handler {
             active_priority_item,
             feeder_cancel,
             feeder_paused,
+            self.dj.clone(),
             controls_message_id,
             now_playing_message_id,
         ));
@@ -1382,7 +1442,8 @@ impl Handler {
                             let prebuffer_samples = self.prebuffer_samples;
                             let prebuffer_wait = self.prebuffer_wait;
                             let track_handle_store = self.track_handle.clone();
-                            tokio::spawn(play_join_sound_then_bridge(call, bridge_clone, prebuffer_samples, prebuffer_wait, track_handle_store));
+                            let dj_join2 = self.dj.clone();
+                            tokio::spawn(play_join_sound_then_bridge(call, bridge_clone, prebuffer_samples, prebuffer_wait, track_handle_store, dj_join2));
                             // Wait for join sound + bridge setup
                             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                         }
@@ -1404,6 +1465,7 @@ impl Handler {
         self.bridge.clear();
 
         let spirc_resume_tx = spirc_cmd_tx_for_drain;
+        let dj_for_drain = self.dj.clone();
 
         tokio::spawn(async move {
             loop {
@@ -1426,6 +1488,15 @@ impl Handler {
                     &controls_message_id, &now_playing_message_id,
                 ).await;
 
+                // DJ announcement before track
+                if dj_for_drain.is_enabled() {
+                    let title = item.source.display_title().to_string();
+                    let subtitle = item.source.display_subtitle().to_string();
+                    let queued_by = item.queued_by.clone();
+                    if let Some(clip) = dj_for_drain.track_announce_clip(&title, &subtitle, &queued_by).await {
+                        bridge.push_overlay(&clip);
+                    }
+                }
                 let token = CancellationToken::new();
                 {
                     let mut lock = feeder_cancel.lock().unwrap_or_else(|e: std::sync::PoisonError<_>| e.into_inner());
@@ -1560,6 +1631,17 @@ impl Handler {
             lock.as_ref().map(|s| format!("Spotify session: {}", s.spotify_name))
         };
         spotify_name.unwrap_or_else(|| "Nothing is currently playing.".to_string())
+    }
+
+    async fn handle_announce(&self) -> String {
+        let current = self.announce_enabled.load(Ordering::Relaxed);
+        let new_val = !current;
+        self.announce_enabled.store(new_val, Ordering::Relaxed);
+        if new_val {
+            "🎙️ DJ track announcements **enabled**. Spotibot will announce each track.".to_string()
+        } else {
+            "🔇 DJ track announcements **disabled**. Greetings still active.".to_string()
+        }
     }
 
     async fn handle_login(
@@ -1825,6 +1907,7 @@ impl DiscordBot {
         let active_session: Arc<Mutex<Option<ActiveSession>>> = Arc::new(Mutex::new(None));
         let track_handle: Arc<Mutex<Option<TrackHandle>>> = Arc::new(Mutex::new(None));
 
+        let dj = Arc::new(DJAnnouncer::new());
         let handler = Handler {
             guild_id: GuildId::new(config.discord_guild_id),
             channel_id: ChannelId::new(config.discord_channel_id),
@@ -1850,6 +1933,8 @@ impl DiscordBot {
             active_priority_item: Arc::new(Mutex::new(None)),
             feeder_cancel: Arc::new(Mutex::new(None)),
             feeder_paused: Arc::new(AtomicBool::new(false)),
+            dj,
+            announce_enabled: Arc::new(AtomicBool::new(false)),
         };
 
         let token = config.discord_token.clone();

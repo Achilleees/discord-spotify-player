@@ -12,6 +12,8 @@ fn max_samples(buffer_seconds: usize) -> usize {
 /// Keeps Spotify's native 44.1kHz f32 samples; Songbird handles resampling to 48kHz.
 pub struct AudioBridge {
     buffer: Mutex<VecDeque<f32>>,
+    overlay: Mutex<VecDeque<f32>>,
+    overlay_duck_volume: std::sync::atomic::AtomicU32,  // f32 bits, music volume during overlay
     max_samples: usize,
     stats: BridgeStats,
 }
@@ -31,6 +33,8 @@ impl AudioBridge {
         let cap = max_samples(buffer_seconds);
         Arc::new(Self {
             buffer: Mutex::new(VecDeque::with_capacity(cap)),
+            overlay: Mutex::new(VecDeque::with_capacity(cap)),
+            overlay_duck_volume: std::sync::atomic::AtomicU32::new(f32::to_bits(1.0)),
             max_samples: cap,
             stats: BridgeStats::default(),
         })
@@ -136,7 +140,50 @@ impl AudioBridge {
                 .store(now_millis(), std::sync::atomic::Ordering::Relaxed);
         }
 
+        // Mix overlay (DJ clips) on top of music with volume ducking
+        {
+            let mut overlay = self.overlay.lock();
+            let overlay_available = overlay.len().min(output.len());
+            if overlay_available > 0 {
+                // Duck music volume during overlay
+                let duck_vol: f32 = 1.0;
+                self.overlay_duck_volume.store(f32::to_bits(duck_vol), std::sync::atomic::Ordering::Relaxed);
+                let (head, tail) = overlay.as_slices();
+                for i in 0..overlay_available {
+                    let ov_sample = if i < head.len() { head[i] } else { tail[i - head.len()] };
+                    output[i] = output[i] * duck_vol + ov_sample * 0.18;
+                }
+                overlay.drain(..overlay_available);
+                // If overlay just emptied, start fade back
+                if overlay.is_empty() {
+                    self.overlay_duck_volume.store(f32::to_bits(1.0), std::sync::atomic::Ordering::Relaxed);
+                }
+            } else {
+                // Smooth fade back to full volume
+                let current_vol = f32::from_bits(self.overlay_duck_volume.load(std::sync::atomic::Ordering::Relaxed));
+                if current_vol < 0.99 {
+                    let new_vol = (current_vol + 0.02).min(1.0);
+                    self.overlay_duck_volume.store(f32::to_bits(new_vol), std::sync::atomic::Ordering::Relaxed);
+                    for sample in output[..available].iter_mut() {
+                        *sample *= new_vol;
+                    }
+                }
+            }
+        }
+
         available
+    }
+
+    /// Push DJ/overlay samples that mix on top of music with volume ducking
+    pub fn push_overlay(&self, samples: &[f32]) {
+        let mut overlay = self.overlay.lock();
+        overlay.extend(samples.iter());
+        tracing::debug!(
+            target: "audio_stream",
+            samples = samples.len(),
+            duration_s = samples.len() as f64 / (44100.0 * 2.0),
+            "overlay samples pushed"
+        );
     }
 
     pub fn len(&self) -> usize {
@@ -175,6 +222,8 @@ impl AudioBridge {
     /// Clear the buffer (e.g., on pause/stop)
     pub fn clear(&self) {
         self.buffer.lock().clear();
+        self.overlay.lock().clear();
+        self.overlay_duck_volume.store(f32::to_bits(1.0), std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -183,6 +232,8 @@ impl Default for AudioBridge {
         let cap = max_samples(4);
         Self {
             buffer: Mutex::new(VecDeque::with_capacity(cap)),
+            overlay: Mutex::new(VecDeque::with_capacity(cap)),
+            overlay_duck_volume: std::sync::atomic::AtomicU32::new(f32::to_bits(1.0)),
             max_samples: cap,
             stats: BridgeStats::default(),
         }
