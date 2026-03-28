@@ -413,14 +413,16 @@ impl SpotifyPlayer {
                 end_of_track_tx.clone(),
             ));
 
-            let (spirc, spirc_task) = Spirc::new(
-                connect_config,
-                session.clone(),
-                credentials.clone(),
-                player,
-                mixer,
+            tracing::info!(device_id = %device_id, device_name = %device_name, "calling Spirc::new");
+            let (spirc, spirc_task) = tokio::time::timeout(
+                std::time::Duration::from_secs(15),
+                Spirc::new(connect_config, session.clone(), credentials.clone(), player, mixer),
             )
             .await
+            .map_err(|_| {
+                tracing::error!("Spirc::new timed out after 15s");
+                Box::<dyn std::error::Error + Send + Sync>::from("spirc connect timeout")
+            })?
             .map_err(|e| {
                 tracing::error!(error = ?e, "OAuth session connect failed");
                 e
@@ -433,26 +435,21 @@ impl SpotifyPlayer {
             tracing::info!("spotify connect active (oauth)");
             let session_start = std::time::Instant::now();
 
-            // Process spirc commands while waiting for spirc_task to complete
+            // Spawn spirc_task independently so it can't be dropped by the cmd_rx loop
+            let spirc_task_handle = tokio::spawn(spirc_task);
+
+            // Process spirc commands (pause/play from priority queue manager)
             if let Some(mut cmd_rx) = spirc_cmd_rx.take() {
-                tokio::pin!(spirc_task);
-                loop {
-                    tokio::select! {
-                        _ = &mut spirc_task => {
-                            break;
-                        }
-                        cmd = cmd_rx.recv() => {
-                            match cmd {
-                                Some(SpircCommand::Pause) => { let _ = spirc.pause(); }
-                                Some(SpircCommand::Play) => { let _ = spirc.play(); }
-                                None => { break; }
-                            }
-                        }
+                while let Some(cmd) = cmd_rx.recv().await {
+                    match cmd {
+                        SpircCommand::Pause => { let _ = spirc.pause(); }
+                        SpircCommand::Play  => { let _ = spirc.play();  }
                     }
                 }
-            } else {
-                spirc_task.await;
+                // cmd_rx closed — spirc_task continues running via handle
             }
+
+            let _ = spirc_task_handle.await;
 
             let _ = spirc.shutdown();
             drop(spirc);

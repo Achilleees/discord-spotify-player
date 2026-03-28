@@ -64,7 +64,10 @@ impl SpotifyOAuth {
             client_id,
             client_secret,
             redirect_uri: REDIRECT_URI.to_string(),
-            http: Client::new(),
+            http: Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .unwrap_or_default(),
         }
     }
 

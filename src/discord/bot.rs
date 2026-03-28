@@ -1043,8 +1043,16 @@ impl EventHandler for Handler {
             return;
         }
 
+        // Defer login immediately — OAuth + session startup takes >3s
+        if cmd.data.name.as_str() == "login" {
+            let _ = cmd.defer_ephemeral(&ctx).await;
+            let reply = self.handle_login(&user_id, user_id_u64, &username, code_arg.as_deref()).await;
+            let _ = cmd.edit_response(&ctx, serenity::builder::EditInteractionResponse::new().content(reply)).await;
+            return;
+        }
+
         let reply = match cmd.data.name.as_str() {
-            "login" => self.handle_login(&user_id, user_id_u64, &username, code_arg.as_deref()).await,
+            "login" => unreachable!(),
             "logout" => self.handle_logout(&user_id, user_id_u64).await,
             "forget" => self.handle_forget(&user_id).await,
             "who" => self.handle_who().await,
