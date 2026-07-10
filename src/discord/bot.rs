@@ -60,6 +60,8 @@ pub struct ActiveSession {
     pub spotify_name: String,
     pub discord_name: String,
     pub access_token: String,
+    /// Monotonic id of this spawn, so a task only clears the slot it owns.
+    pub generation: u64,
     /// The librespot session task.
     pub handle: JoinHandle<()>,
     /// The proactive token-refresh task that keeps `access_token` current.
@@ -90,6 +92,10 @@ struct Handler {
     /// Pending PKCE challenges keyed by Discord user, awaiting paste-back.
     pending_auth: Arc<Mutex<HashMap<u64, (PkceChallenge, Instant)>>>,
     active_session: Arc<Mutex<Option<ActiveSession>>>,
+    /// Serializes spawn_session so two concurrent logins can't orphan a task.
+    spawn_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Monotonic session-generation counter.
+    session_gen: Arc<std::sync::atomic::AtomicU64>,
     track_handle: Arc<Mutex<Option<TrackHandle>>>,
     ctx: Arc<Mutex<Option<Context>>>,
     controls_message_id: Arc<Mutex<Option<MessageId>>>,
@@ -1222,6 +1228,11 @@ impl Handler {
         refresh_token: String,
         expires_in: u64,
     ) {
+        // Serialize the whole spawn so two concurrent logins can't both take()
+        // the old session and then clobber each other's store, orphaning a task.
+        let _spawn_guard = self.spawn_lock.lock().await;
+        let generation = self.session_gen.fetch_add(1, Ordering::SeqCst);
+
         // P1: Cancel any active YouTube/file feeder before starting Spotify session
         {
             let token = {
@@ -1401,10 +1412,10 @@ impl Handler {
                     refresh_now.notify_one();
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                 }
-                // Clear the session only if it is still ours.
+                // Clear the session only if this exact spawn still owns the slot.
                 let mut lock = active_session_for_task.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(s) = lock.as_ref() {
-                    if s.discord_user_id == discord_user_id { *lock = None; }
+                    if s.generation == generation { *lock = None; }
                 }
             }
         });
@@ -1416,6 +1427,7 @@ impl Handler {
             spotify_name,
             discord_name,
             access_token: access_token_for_store,
+            generation,
             handle,
             refresh_handle,
         });
@@ -2080,6 +2092,8 @@ impl DiscordBot {
             oauth,
             pending_auth: Arc::new(Mutex::new(HashMap::new())),
             active_session,
+            spawn_lock: Arc::new(tokio::sync::Mutex::new(())),
+            session_gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             track_handle,
             ctx: Arc::new(Mutex::new(None)),
             controls_message_id: Arc::new(Mutex::new(None)),
