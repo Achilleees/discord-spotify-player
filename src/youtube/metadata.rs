@@ -82,9 +82,11 @@ pub async fn fetch_youtube_metadata(url: &str) -> Result<YoutubeMetadata, Youtub
         if stderr_lower.contains("unavailable") || stderr_lower.contains("private") || stderr_lower.contains("removed") {
             return Err(YoutubeError::Unavailable);
         }
-        // Show actual error to user for debugging
-        let short_err = stderr.lines().last().unwrap_or("Unknown error").trim();
-        return Err(YoutubeError::Network(short_err.to_string()));
+        // Log the raw stderr server-side; return a generic message so cookie
+        // paths / extractor internals aren't leaked to the requester.
+        return Err(YoutubeError::Network(
+            "couldn't fetch that link — check the URL and try again".to_string(),
+        ));
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);

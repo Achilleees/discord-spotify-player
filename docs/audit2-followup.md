@@ -21,57 +21,49 @@ source.
   API failure; credential decrypt-failure warning; removed hardcoded
   `/opt/openclaw` debug file writes.
 
-## Deferred — decide at release or fold into the nob port
+## Also fixed in a second burn-down pass
 
-Grouped; none are release-blocking, most are in the secondary YouTube path or
-are defense-in-depth. Some may already be resolved by the critical fixes above
-(noted).
+- Spurious `SpircCommand::Play` after a skip/stop cancel, on both drain paths
+  (bugs F4/F16).
+- `handle_logout` now takes `spawn_lock` (edge F11).
+- The restart budget resets after a >60s session (bugs F7/edge F15).
+- Credential DB 0600 on unix; legacy `.user_creds` dir deleted, not renamed
+  (security F8/F7).
+- Dead ducking machinery removed, overlay mix preserved; overlay push bounded
+  (bugs F15/comments F1, security F10).
+- yt-dlp stderr no longer leaked to the requester (security F5).
 
-### Priority-queue / feeder path
-- **Spurious `SpircCommand::Play` on the cancelled/empty-queue arm** (bugs F4,
-  edge F16): the `break` falls through to a Play send, resuming Spotify after a
-  skip when it shouldn't. Real UX bug; moderate control-flow fix.
+## Still deferred — decide at release or fold into the nob port
+
+None release-blocking; the riskier ones need live testing, the rest are cleaner
+in nob's module boundaries.
+
+### Priority-queue / feeder path (needs live audio testing)
 - **Concurrent `/play` drain race** (bugs F5, edge F9): two `/play` before
   `active_priority_item` is set both spawn drains into one bridge; the second
   overwrites `feeder_cancel`. Needs a synchronously-set guard flag.
 - **`/play` join path unreachable on a fresh boot** (bugs F6, edge F10):
-  `user_in_bot_voice_channel` is false when the bot is in no channel, so the
-  `!in_call` join branch can't run via `/play`. Gate `/play` on
-  user-in-a-channel (not user-in-bot-channel) and let it trigger the join.
+  `user_in_bot_voice_channel` is false when the bot is in no channel; gate
+  `/play` on user-in-a-channel so it can trigger the join.
 - **Feeder pacing on resume** (edge F6, bugs F9): the pause loop doesn't rebase
   `start`, so on resume it reads at full speed until the bridge drops overflow.
 - **Kokoro socket calls have no timeout** (edge F8): a wedged daemon freezes the
-  queue un-skippably; add socket timeouts and install the cancel token before
-  awaiting the announce clip.
+  queue; add socket timeouts and install the cancel token before awaiting.
+- `EndOfTrack` sends Idle + `bridge.clear()` every track, trimming tail audio
+  (edge F20) — entangled with the eot→queue coordination; verify with the queue.
 
-### Session timing (mostly resolved by the criticals — verify live)
-- `restarts` counter never resets on a stable run (bugs F7, edge F15): add a
-  reset after a stable interval, mirroring `reconnects=0`.
-- `handle_logout` doesn't take `spawn_lock` (edge F11): a logout in the spawn
-  window sees `None`, skips the abort, but still deactivates the DB row.
-
-### Crypto / storage hardening (defense-in-depth)
+### Crypto / storage hardening (defer to nob's storage rebuild)
 - Reject `V_PLAIN` rows when a key is set, and bind ciphertext to its owner via
   AAD = `discord_user_id` (security F3).
-- Stretch the KDF (currently a single `Sha256`), and enforce 0600 on the DB
-  file (security F8).
-- Securely delete (not rename) the legacy `.user_creds` dir after migration
-  (security F7).
+- Stretch the KDF (currently a single `Sha256`) (security F8 part).
 
 ### Misc lows
 - CSRF state skipped on a bare-code paste (security F4, edge F21) — PKCE
   verifier binding already mitigates; require state for defense-in-depth.
-- yt-dlp stderr leaked to the requester (security F5) — return a generic
-  message, log details server-side.
-- `pending_auth` TTL sweep (security F9); overlay buffer cap (security F10);
-  `--remote-components ejs:github` runs unpinned remote JS (security F11 —
-  operationally intended, confirm).
-- Ducking is dead code: `duck_vol` hardcoded 1.0, fade-back branch unreachable
-  (bugs F15, comments F1) — implement real ducking or remove the path + comments.
-- `EndOfTrack` sends Idle + `bridge.clear()` every track, trimming tail audio
-  (edge F20).
+- `pending_auth` TTL sweep (security F9); `--remote-components ejs:github` runs
+  unpinned remote JS (security F11 — operationally intended, confirm).
 - `/announce` toggle only gates the Spotify announcement, not priority-item ones
-  (bugs F12, edge F17).
+  (bugs F12, edge F17) — needs threading `announce_enabled` through the queue.
 - Hardcoded `/opt/openclaw/...` paths for cookies, DJ clips, Kokoro socket —
   should be config (structure lens). Reconcile with the nob port.
 - Comment accuracy nits (comments lens F3 dj.rs doc, etc.).
