@@ -33,40 +33,37 @@ source.
   (bugs F15/comments F1, security F10).
 - yt-dlp stderr no longer leaked to the requester (security F5).
 
-## Still deferred — decide at release or fold into the nob port
+## Also fixed on `fix/audit2-followup` (post-v0.5.0 tag)
 
-None release-blocking; the riskier ones need live testing, the rest are cleaner
-in nob's module boundaries.
+- Kokoro socket exchange bounded by a 20s timeout (edge F8).
+- `/play` reachable on a fresh boot — gated on user-in-a-channel when the bot
+  isn't in voice yet (bugs F6, edge F10).
+- Feeder rebases its pacing clock by the paused duration on resume (edge F6).
+- `/announce` toggle now gates priority-item announcements too (bugs F12).
+- `pending_auth` reaps expired entries on insert (security F9).
+- Priority queue capped at 500 with unit tests (security F2).
+- Corrected the `track_announce_clip` doc comment (comments F3).
 
-### Priority-queue / feeder path (needs live audio testing)
-- **Concurrent `/play` drain race** (bugs F5, edge F9): two `/play` before
-  `active_priority_item` is set both spawn drains into one bridge; the second
-  overwrites `feeder_cancel`. Needs a synchronously-set guard flag.
-- **`/play` join path unreachable on a fresh boot** (bugs F6, edge F10):
-  `user_in_bot_voice_channel` is false when the bot is in no channel; gate
-  `/play` on user-in-a-channel so it can trigger the join.
-- **Feeder pacing on resume** (edge F6, bugs F9): the pause loop doesn't rebase
-  `start`, so on resume it reads at full speed until the bridge drops overflow.
-- **Kokoro socket calls have no timeout** (edge F8): a wedged daemon freezes the
-  queue; add socket timeouts and install the cancel token before awaiting.
-- `EndOfTrack` sends Idle + `bridge.clear()` every track, trimming tail audio
-  (edge F20) — entangled with the eot→queue coordination; verify with the queue.
+## Still open — for nob's rebuild or an operational decision
 
-### Crypto / storage hardening (defer to nob's storage rebuild)
-- Reject `V_PLAIN` rows when a key is set, and bind ciphertext to its owner via
-  AAD = `discord_user_id` (security F3).
-- Stretch the KDF (currently a single `Sha256`) (security F8 part).
+None release-blocking.
 
-### Misc lows
-- CSRF state skipped on a bare-code paste (security F4, edge F21) — PKCE
-  verifier binding already mitigates; require state for defense-in-depth.
-- `pending_auth` TTL sweep (security F9); `--remote-components ejs:github` runs
-  unpinned remote JS (security F11 — operationally intended, confirm).
-- `/announce` toggle only gates the Spotify announcement, not priority-item ones
-  (bugs F12, edge F17) — needs threading `announce_enabled` through the queue.
-- Hardcoded `/opt/openclaw/...` paths for cookies, DJ clips, Kokoro socket —
-  should be config (structure lens). Reconcile with the nob port.
-- Comment accuracy nits (comments lens F3 dj.rs doc, etc.).
+- **Concurrent `/play` drain race + the two-drain-path design** (bugs F5, edge
+  F9): `trigger_priority_queue_drain` and the eot-driven `priority_queue_manager`
+  can both drain. A partial guard would give false confidence; nob's single
+  player-state machine fixes it holistically. **Defer to the port.**
+- **`EndOfTrack` sends Idle + `bridge.clear()` every track** (edge F20),
+  trimming tail audio — entangled with the eot→queue coordination above.
+- **Crypto**: reject `V_PLAIN` rows when a key is set + bind ciphertext to its
+  owner via AAD; stretch the KDF (security F3, F8). Defer to nob's storage
+  rebuild (spotibot stays sync-`Mutex<Connection>`; nob uses async `Db`).
+- **CSRF state on a bare-code paste** (security F4): PKCE verifier binding
+  already mitigates (an attacker's code is useless without our verifier);
+  requiring state would break the paste-just-the-code convenience. Accepted.
+- **`--remote-components ejs:github`** runs unpinned remote extractor JS
+  (security F11) — operationally intended; **needs your call** to pin/remove.
+- **Hardcoded `/opt/openclaw/...` paths** for cookies, DJ clips, Kokoro socket
+  (structure lens) — make them config during the nob port.
 
 ## Note for the nob port
 

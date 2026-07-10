@@ -120,9 +120,10 @@ impl DJAnnouncer {
         Some(self.transitions[idx].clone())
     }
 
-    /// Generate a track-specific announcement using Kokoro TTS.
-    /// Picks a random template, fills in track info, generates audio.
-    /// Returns None if generation fails (caller should fall back to transition_clip).
+    /// Generate a track-specific announcement using Kokoro TTS: pick a random
+    /// template, fill in track info, synthesize and decode the audio. On any
+    /// failure, falls back to a random pre-recorded transition clip, returning
+    /// None only when no transition clips are loaded either.
     pub async fn track_announce_clip(
         &self,
         title: &str,
