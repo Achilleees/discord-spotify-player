@@ -53,6 +53,9 @@ pub struct QueueItem {
     pub queued_by_id: u64,
 }
 
+/// Maximum queued items (matches nob's unified-queue cap).
+pub const MAX_QUEUE_LEN: usize = 500;
+
 /// Bot-managed priority queue for YouTube/file tracks.
 pub struct PriorityQueue {
     items: VecDeque<QueueItem>,
@@ -63,8 +66,14 @@ impl PriorityQueue {
         Self { items: VecDeque::new() }
     }
 
-    pub fn push(&mut self, item: QueueItem) {
+    /// Enqueue an item. Returns `false` (rejecting it) when the queue is full,
+    /// so an in-voice user can't grow it without bound.
+    pub fn push(&mut self, item: QueueItem) -> bool {
+        if self.items.len() >= MAX_QUEUE_LEN {
+            return false;
+        }
         self.items.push_back(item);
+        true
     }
 
     pub fn pop(&mut self) -> Option<QueueItem> {
@@ -82,5 +91,65 @@ impl PriorityQueue {
 
     pub fn snapshot(&self) -> Vec<QueueItem> {
         self.items.iter().cloned().collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn item(title: &str) -> QueueItem {
+        QueueItem {
+            source: MediaSource::YouTube {
+                url: "u".into(),
+                video_id: "v".into(),
+                title: title.into(),
+                channel: "c".into(),
+                thumbnail_url: None,
+                duration_secs: 0,
+            },
+            queued_by: "me".into(),
+            queued_by_id: 1,
+        }
+    }
+
+    #[test]
+    fn is_fifo() {
+        let mut q = PriorityQueue::new();
+        assert!(q.push(item("a")));
+        assert!(q.push(item("b")));
+        assert_eq!(q.len(), 2);
+        assert_eq!(q.pop().unwrap().source.display_title(), "a");
+        assert_eq!(q.pop().unwrap().source.display_title(), "b");
+        assert!(q.pop().is_none());
+    }
+
+    #[test]
+    fn clear_empties() {
+        let mut q = PriorityQueue::new();
+        q.push(item("a"));
+        q.clear();
+        assert_eq!(q.len(), 0);
+    }
+
+    #[test]
+    fn rejects_when_full() {
+        let mut q = PriorityQueue::new();
+        for i in 0..MAX_QUEUE_LEN {
+            assert!(q.push(item(&i.to_string())), "should accept up to the cap");
+        }
+        assert!(!q.push(item("overflow")), "rejects past the cap");
+        assert_eq!(q.len(), MAX_QUEUE_LEN);
+    }
+
+    #[test]
+    fn snapshot_preserves_order_without_draining() {
+        let mut q = PriorityQueue::new();
+        q.push(item("a"));
+        q.push(item("b"));
+        let snap = q.snapshot();
+        assert_eq!(snap.len(), 2);
+        assert_eq!(snap[0].source.display_title(), "a");
+        assert_eq!(q.len(), 2, "snapshot doesn't drain");
     }
 }

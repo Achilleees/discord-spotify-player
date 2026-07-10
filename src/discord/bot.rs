@@ -1710,18 +1710,18 @@ impl Handler {
             lock.is_some()
         };
 
-        let queue_len = {
+        let (accepted, queue_len) = {
             let mut lock = self.priority_queue.lock().unwrap_or_else(|e| e.into_inner());
-            lock.push(queue_item.clone());
-            lock.len()
+            let accepted = lock.push(queue_item.clone());
+            (accepted, lock.len())
         };
 
-        // Always play immediately if nothing is actively playing
-        // (even if a Spotify session exists but is idle/paused)
-        let reply = if is_priority_playing {
+        let reply = if !accepted {
+            format!("Queue is full ({} items) — try again once some have played.", queue_len)
+        } else if is_priority_playing {
             format!("✅ Added to queue: **{}** · Position #{}", title, queue_len)
         } else {
-            // Nothing actively playing — start immediately
+            // Nothing actively playing — start immediately.
             self.trigger_priority_queue_drain().await;
             format!("▶ Playing: **{}**", title)
         };
