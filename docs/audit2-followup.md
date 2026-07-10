@@ -56,24 +56,26 @@ source.
 - **Deployment paths are env-configurable** (structure lens): DJ clips/cache,
   Kokoro socket, YouTube tmp dir + cookies default to the VPS layout but can be
   overridden. Documented in `.env.example`.
+- **`TOKEN_ENC_KEY` stretched with PBKDF2-HMAC-SHA256** (600k iters, fixed salt;
+  security F8) — a weak key is now costly to brute-force from a stolen DB.
+  pbkdf2/hmac were already in the tree, so zero new compiled deps.
 
-## Still open — genuinely gated
+## Still open — genuinely gated (not by effort)
 
-None release-blocking. Each has a concrete blocker, not effort:
+None release-blocking. Every code-actionable finding is fixed; these three each
+have a concrete, non-effort blocker:
 
-- **KDF stretching** (security F8): `Sha256::digest(key)` → a stretching KDF
-  (argon2/pbkdf2) would harden a *weak* `TOKEN_ENC_KEY` against offline
-  brute-force of a stolen DB. The mitigation already in place is "use a long
-  random key" (now the `.env.example` guidance) + the 0600 DB file, which moots
-  it for a strong key. Adding argon2 is a dep + salt/param decision — **your
-  call** whether the weak-key case is worth it.
-- **CSRF state on a bare-code paste** (security F4): PKCE verifier binding
-  already mitigates (an attacker's code is useless without our verifier);
-  requiring state would break the paste-just-the-code convenience. Accepted.
-- **`--remote-components ejs:github`** runs unpinned remote extractor JS
-  (security F11) — operationally intended; **needs your call** to pin/remove.
-- **Presence flap on Spotify auto-advance** — the residual half of F20; verify
-  and tune with live audio.
+- **CSRF state on a bare-code paste** (security F4): **accepted.** PKCE verifier
+  binding already mitigates — an attacker's code is useless without our stored
+  verifier — and requiring state would break the paste-just-the-code UX. Fixing
+  it would make the product worse for a threat that's already covered.
+- **`--remote-components ejs:github`** (security F11): **your operational call.**
+  This is how yt-dlp handles YouTube's current signature challenges; pinning or
+  removing it could break YouTube extraction. Changing your extractor setup
+  unilaterally is riskier than leaving it.
+- **Presence flap on Spotify auto-advance** — the residual cosmetic half of F20
+  (bot status briefly Idle between auto-advanced tracks). Needs live audio to
+  verify and tune the presence/reader timing.
 
 ## Note for the nob port
 
