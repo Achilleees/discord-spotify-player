@@ -336,15 +336,15 @@ fn build_priority_history_embed(item: &QueueItem) -> CreateEmbed {
     embed
 }
 
-fn build_controls_embed(active_user: Option<&str>, waiting: bool) -> CreateEmbed {
+/// The idle controls card. Once a track is playing, the now-playing embed
+/// (which carries its own buttons) supersedes this, so there is no separate
+/// "is playing" state to render here.
+fn build_controls_embed(active_user: Option<&str>) -> CreateEmbed {
     match active_user {
-        Some(name) if waiting => CreateEmbed::new()
+        Some(name) => CreateEmbed::new()
             .color(0x1DB954u32)
             .title(format!("🎛️ {}", name))
             .description("*Play something to get started!*"),
-        Some(name) => CreateEmbed::new()
-            .color(0x1DB954u32)
-            .title(format!("🎛️ {} is playing", name)),
         None => CreateEmbed::new()
             .color(0x5865F2u32)
             .title("🎛️ Spotibot")
@@ -363,7 +363,7 @@ fn build_controls_buttons(is_paused: bool) -> CreateActionRow {
 }
 
 async fn post_controls(ctx: &Context, text_channel_id: ChannelId, active_user: Option<&str>) -> Option<MessageId> {
-    let embed = build_controls_embed(active_user, active_user.is_some());
+    let embed = build_controls_embed(active_user);
     let mut msg = CreateMessage::new().embed(embed);
     if active_user.is_some() {
         msg = msg.components(vec![build_controls_buttons(false)]);
@@ -422,13 +422,15 @@ fn is_valid_track_id(id: &str) -> bool {
     id.len() == 22 && id.bytes().all(|b| b.is_ascii_alphanumeric())
 }
 
-async fn spotify_playback_command(access_token: &str, method: &str, endpoint: &str) {
+/// Fire a Spotify Web API player command. Returns whether it succeeded so the
+/// caller can surface failures to the user.
+async fn spotify_playback_command(access_token: &str, method: &str, endpoint: &str) -> bool {
     let client = reqwest::Client::new();
     let url = format!("https://api.spotify.com/v1/me/player/{}", endpoint);
     let req = match method {
         "POST" => client.post(&url),
         "PUT" => client.put(&url),
-        _ => return,
+        _ => return false,
     };
     match req
         .header("Authorization", format!("Bearer {}", access_token))
@@ -436,8 +438,18 @@ async fn spotify_playback_command(access_token: &str, method: &str, endpoint: &s
         .send()
         .await
     {
-        Ok(r) => tracing::info!(status = r.status().as_u16(), endpoint, "spotify API call"),
-        Err(e) => tracing::warn!(error = ?e, endpoint, "spotify API call failed"),
+        Ok(r) if r.status().is_success() => {
+            tracing::debug!(status = r.status().as_u16(), endpoint, "spotify API call ok");
+            true
+        }
+        Ok(r) => {
+            tracing::warn!(status = r.status().as_u16(), endpoint, "spotify API call failed");
+            false
+        }
+        Err(e) => {
+            tracing::warn!(error = ?e, endpoint, "spotify API request failed");
+            false
+        }
     }
 }
 
@@ -673,7 +685,13 @@ async fn run_presence_loop_with_track(
         }
 
         if let PresenceUpdate::Playing { title, artist, track_id, access_token } = &update {
-            let track_key = format!("{} — {}", title, artist);
+            // Dedup on the track id (stable across replays of the same title);
+            // fall back to title — artist only when the id is missing.
+            let track_key = if track_id.is_empty() {
+                format!("{} — {}", title, artist)
+            } else {
+                track_id.clone()
+            };
             if last_track_key.as_deref() != Some(&track_key) {
                 last_track_key = Some(track_key.clone());
 
@@ -757,7 +775,9 @@ async fn run_presence_loop_with_track(
                 });
                 } // end announce_enabled check
             }
-        } else if matches!(update, PresenceUpdate::Idle) {
+        } else if matches!(update, PresenceUpdate::Idle | PresenceUpdate::Paused) {
+            // Clear the dedup key on pause/stop so resuming the same track
+            // reposts the now-playing card instead of being swallowed.
             last_track_key = None;
         }
     }
@@ -773,10 +793,21 @@ async fn startup_controls(
     let builder = GetMessages::new().limit(20);
     if let Ok(messages) = text_channel_id.messages(ctx, builder).await {
         for msg in &messages {
-            if msg.author.id == bot_id && !msg.embeds.is_empty() {
-                if msg.embeds.iter().any(|e| e.title.as_deref() == Some("🎛️ Spotibot")) {
-                    let _ = text_channel_id.delete_message(ctx, msg.id).await;
-                }
+            if msg.author.id != bot_id {
+                continue;
+            }
+            // A stale control/now-playing message is any of ours that still
+            // carries buttons, or whose embed is one of our control cards
+            // (idle "🎛️ Spotibot" or an active "🎛️ {name}"). Matching on the
+            // buttons catches the merged now-playing card too, whose title is
+            // the track name rather than a "🎛️" string.
+            let has_buttons = !msg.components.is_empty();
+            let is_control_card = msg
+                .embeds
+                .iter()
+                .any(|e| e.title.as_deref().is_some_and(|t| t.starts_with("🎛️")));
+            if has_buttons || is_control_card {
+                let _ = text_channel_id.delete_message(ctx, msg.id).await;
             }
         }
     }
@@ -818,13 +849,19 @@ impl EventHandler for Handler {
         }
         let _ = self.ready_tx.send(Ok(())).await;
 
-        let ctx_for_controls = ctx.clone();
-        let text_channel_id = self.text_channel_id;
-        let bot_id = ready.user.id;
-        let controls_id = self.controls_message_id.clone();
-        tokio::spawn(async move {
-            startup_controls(&ctx_for_controls, text_channel_id, bot_id, &controls_id).await;
-        });
+        // First-ready-only work. Discord re-fires ready() after every gateway
+        // resume/reconnect; reposting controls then would orphan the live
+        // controls message and clobber controls_message_id mid-playback.
+        let first_ready = !self.auto_start_attempted.swap(true, Ordering::SeqCst);
+        if first_ready {
+            let ctx_for_controls = ctx.clone();
+            let text_channel_id = self.text_channel_id;
+            let bot_id = ready.user.id;
+            let controls_id = self.controls_message_id.clone();
+            tokio::spawn(async move {
+                startup_controls(&ctx_for_controls, text_channel_id, bot_id, &controls_id).await;
+            });
+        }
 
         let rx_taken = {
             let mut presence_rx = self.presence_rx.lock().unwrap_or_else(|e| e.into_inner());
@@ -852,8 +889,8 @@ impl EventHandler for Handler {
 
         // Auto-start: replay the stored active user's session through the same
         // machinery /login uses (voice join, controls, priority queue, refresh
-        // loop). Guarded so gateway reconnects can't spawn a second session.
-        if !self.auto_start_attempted.swap(true, Ordering::SeqCst) {
+        // loop). Runs only on the first ready (see `first_ready` above).
+        if first_ready {
             self.auto_start_stored_session().await;
         }
     }
@@ -895,13 +932,14 @@ impl EventHandler for Handler {
             if has_session {
                 tracing::info!("voice channel empty — auto-logout triggered");
 
-                {
+                let owner = {
                     let mut lock = self.active_session.lock().unwrap_or_else(|e| e.into_inner());
-                    if let Some(session) = lock.take() {
+                    lock.take().map(|session| {
                         session.abort();
                         tracing::info!(user = session.discord_user_id, "auto-aborted session (empty channel)");
-                    }
-                }
+                        session.discord_user_id
+                    })
+                };
 
                 // Cancel any active feeder
                 {
@@ -930,10 +968,9 @@ impl EventHandler for Handler {
                     tracing::info!("bot left voice channel (channel empty)");
                 }
 
-                for user in self.user_store.list() {
-                    if user.active {
-                        let _ = self.user_store.deactivate(&user.discord_user_id);
-                    }
+                // Deactivate only the session owner, not every stored user.
+                if let Some(owner) = owner {
+                    let _ = self.user_store.deactivate(&owner.to_string());
                 }
             }
         }
@@ -956,12 +993,30 @@ impl EventHandler for Handler {
                 lock.is_some()
             };
 
-            let _reply_content = match custom_id {
+            // Control buttons require sharing the bot's voice channel. The
+            // queue-hint button is read-only info, so it stays open.
+            let is_control = matches!(custom_id, "ctrl_prev" | "ctrl_next" | "ctrl_pause_toggle");
+            if is_control && !self.user_in_bot_voice_channel(&ctx, component.user.id) {
+                let response = CreateInteractionResponse::Message(
+                    CreateInteractionResponseMessage::new()
+                        .content("You must be in the bot's voice channel to control playback.")
+                        .ephemeral(true),
+                );
+                let _ = component.create_response(&ctx, response).await;
+                return;
+            }
+
+            let reply_content = match custom_id {
                 "ctrl_prev" => {
                     if let Some(token) = &access_token {
-                        spotify_playback_command(token, "POST", "previous").await;
+                        if spotify_playback_command(token, "POST", "previous").await {
+                            "⏮ Previous"
+                        } else {
+                            "⚠ Spotify didn't accept that — try again."
+                        }
+                    } else {
+                        "No active session"
                     }
-                    "⏮ Previous"
                 }
                 "ctrl_next" => {
                     if priority_playing {
@@ -973,8 +1028,11 @@ impl EventHandler for Handler {
                         self.bridge.clear();
                         "⏭ Skipped"
                     } else if let Some(token) = &access_token {
-                        spotify_playback_command(token, "POST", "next").await;
-                        "⏭ Skipped"
+                        if spotify_playback_command(token, "POST", "next").await {
+                            "⏭ Skipped"
+                        } else {
+                            "⚠ Spotify didn't accept that — try again."
+                        }
                     } else {
                         "No active session"
                     }
@@ -1007,13 +1065,14 @@ impl EventHandler for Handler {
                         } else {
                             false
                         };
-                        if is_paused {
-                            spotify_playback_command(token, "PUT", "play").await;
-                            "▶ Resumed"
+                        let ok = if is_paused {
+                            spotify_playback_command(token, "PUT", "play").await
                         } else {
-                            spotify_playback_command(token, "PUT", "pause").await;
-                            "⏸ Paused"
-                        }
+                            spotify_playback_command(token, "PUT", "pause").await
+                        };
+                        if !ok { "⚠ Spotify didn't accept that — try again." }
+                        else if is_paused { "▶ Resumed" }
+                        else { "⏸ Paused" }
                     } else {
                         "No active session"
                     }
@@ -1050,9 +1109,14 @@ impl EventHandler for Handler {
             };
 
             if custom_id != "ctrl_queue_hint" {
-                let response = CreateInteractionResponse::Acknowledge;
+                // Ephemeral reply: only the clicker sees the outcome, no channel spam.
+                let response = CreateInteractionResponse::Message(
+                    CreateInteractionResponseMessage::new()
+                        .content(reply_content)
+                        .ephemeral(true),
+                );
                 if let Err(e) = component.create_response(&ctx, response).await {
-                    tracing::warn!(error = ?e, "failed to ack button interaction");
+                    tracing::warn!(error = ?e, "failed to respond to button interaction");
                 }
             }
             return;
@@ -1080,9 +1144,18 @@ impl EventHandler for Handler {
         let user_id = cmd.user.id.to_string();
         let user_id_u64 = cmd.user.id.get();
         let username = cmd.user.global_name.clone().unwrap_or_else(|| cmd.user.name.clone());
+        let in_voice = self.user_in_bot_voice_channel(&ctx, cmd.user.id);
 
         // Handle /play separately (deferred response)
         if cmd.data.name.as_str() == "play" {
+            if !in_voice {
+                let _ = cmd.create_response(&ctx, CreateInteractionResponse::Message(
+                    CreateInteractionResponseMessage::new()
+                        .content("You must be in the bot's voice channel to queue playback.")
+                        .ephemeral(true),
+                )).await;
+                return;
+            }
             self.handle_play(&cmd, &ctx).await;
             return;
         }
@@ -1090,8 +1163,19 @@ impl EventHandler for Handler {
         // Defer login immediately — OAuth + session startup takes >3s
         if cmd.data.name.as_str() == "login" {
             let _ = cmd.defer_ephemeral(&ctx).await;
-            let reply = self.handle_login(&user_id, user_id_u64, &username, code_arg.as_deref()).await;
+            let reply = self.handle_login(&user_id, user_id_u64, &username, code_arg.as_deref(), in_voice).await;
             let _ = cmd.edit_response(&ctx, serenity::builder::EditInteractionResponse::new().content(reply)).await;
+            return;
+        }
+
+        // Commands that drive playback require sharing the bot's voice channel.
+        let needs_voice = matches!(cmd.data.name.as_str(), "queue" | "skip" | "stop" | "announce");
+        if needs_voice && !in_voice {
+            let _ = cmd.create_response(&ctx, CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content("You must be in the bot's voice channel to control playback.")
+                    .ephemeral(true),
+            )).await;
             return;
         }
 
@@ -1133,6 +1217,27 @@ impl EventHandler for Handler {
 }
 
 impl Handler {
+    /// nob's control rule: a member may drive playback only while sharing the
+    /// bot's voice channel. False when the bot isn't in a channel, the user
+    /// isn't in one, or they differ.
+    fn user_in_bot_voice_channel(&self, ctx: &Context, user_id: UserId) -> bool {
+        let bot_id = ctx.cache.current_user().id;
+        match self.guild_id.to_guild_cached(ctx) {
+            Some(guild) => {
+                let bot_ch = guild.voice_states.get(&bot_id).and_then(|vs| vs.channel_id);
+                let user_ch = guild.voice_states.get(&user_id).and_then(|vs| vs.channel_id);
+                bot_ch.is_some() && bot_ch == user_ch
+            }
+            None => false,
+        }
+    }
+
+    /// The Discord user id of the current session owner, if any.
+    fn active_owner(&self) -> Option<u64> {
+        let lock = self.active_session.lock().unwrap_or_else(|e| e.into_inner());
+        lock.as_ref().map(|s| s.discord_user_id)
+    }
+
     async fn join_voice_for_user(&self, discord_user_id: u64) {
         let ctx = {
             let lock = self.ctx.lock().unwrap_or_else(|e| e.into_inner());
@@ -1163,6 +1268,18 @@ impl Handler {
                 let _ = self.guild_id.edit_member(&ctx, bot_id,
                     serenity::builder::EditMember::new().deafen(true)).await;
                 tracing::info!("self-deafened");
+                // On a stage channel the bot joins as a suppressed audience member;
+                // unsuppress so its audio is actually heard.
+                if let Ok(serenity::all::Channel::Guild(gc)) = target_channel.to_channel(&ctx).await {
+                    if gc.kind == serenity::all::ChannelType::Stage {
+                        let builder = serenity::builder::EditVoiceState::new().suppress(false);
+                        if let Err(e) = gc.edit_own_voice_state(&ctx, builder).await {
+                            tracing::warn!(error = ?e, "failed to unsuppress on stage channel");
+                        } else {
+                            tracing::info!("unsuppressed on stage channel");
+                        }
+                    }
+                }
                 let bridge = self.bridge.clone();
                 let prebuffer_samples = self.prebuffer_samples;
                 let prebuffer_wait = self.prebuffer_wait;
@@ -1797,7 +1914,16 @@ impl Handler {
         user_id_u64: u64,
         discord_username: &str,
         code_arg: Option<&str>,
+        in_voice: bool,
     ) -> String {
+        // Taking over an active session owned by someone else requires being in
+        // the bot's voice channel — you can't evict the current DJ from outside.
+        if let Some(owner) = self.active_owner() {
+            if owner != user_id_u64 && !in_voice {
+                return "Someone else is the active DJ. Join the bot's voice channel to take over.".to_string();
+            }
+        }
+
         // Paste-back of a redirect URL / code completes a pending PKCE auth.
         if let Some(raw) = code_arg {
             return self
@@ -1947,19 +2073,23 @@ impl Handler {
     }
 
     async fn handle_logout(&self, user_id: &str, user_id_u64: u64) -> String {
-        {
+        // Only the owner of the live session may tear it down. A bystander's
+        // /logout must not pause the DJ's audio or wipe the controls.
+        let owned_live_session = {
             let mut lock = self.active_session.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(session) = lock.as_ref() {
-                if session.discord_user_id == user_id_u64 {
+            match lock.as_ref() {
+                Some(session) if session.discord_user_id == user_id_u64 => {
                     session.abort();
                     *lock = None;
                     tracing::info!(user = %user_id, "active librespot session aborted");
+                    true
                 }
+                _ => false,
             }
-        }
-        let _ = self.presence_tx.send(PresenceUpdate::Idle);
+        };
 
-        {
+        if owned_live_session {
+            let _ = self.presence_tx.send(PresenceUpdate::Idle);
             let ctx = {
                 let lock = self.ctx.lock().unwrap_or_else(|e| e.into_inner());
                 lock.clone()
@@ -1971,6 +2101,7 @@ impl Handler {
 
         match self.user_store.deactivate(user_id) {
             Ok(true) => { tracing::info!(user = %user_id, "session deactivated"); "Session deactivated. Your credentials are kept — run `/login` to reactivate without re-authorizing.".to_string() }
+            Ok(false) if owned_live_session => "Session stopped.".to_string(),
             Ok(false) => "You don't have an active session.".to_string(),
             Err(e) => { tracing::error!("failed to deactivate session: {}", e); "Failed to deactivate session.".to_string() }
         }
