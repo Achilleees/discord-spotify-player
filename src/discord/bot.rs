@@ -75,6 +75,7 @@ struct Handler {
     feeder_paused: Arc<AtomicBool>,
     dj: Arc<DJAnnouncer>,
     announce_enabled: Arc<AtomicBool>,
+    auto_start_attempted: AtomicBool,
 }
 
 
@@ -791,11 +792,11 @@ impl EventHandler for Handler {
             startup_controls(&ctx_for_controls, text_channel_id, bot_id, &controls_id).await;
         });
 
-        let mut presence_rx = self.presence_rx.lock().unwrap_or_else(|e| e.into_inner());
-        let has_rx = presence_rx.is_some();
-        let _ = std::fs::write("/opt/openclaw/services/spotibot/debug_ready.txt", format!("ready fired, has_rx={}", has_rx));
-        tracing::info!("DJ DEBUG: ready fired, has_rx={}", has_rx);
-        if let Some(rx) = presence_rx.take() {
+        let rx_taken = {
+            let mut presence_rx = self.presence_rx.lock().unwrap_or_else(|e| e.into_inner());
+            presence_rx.take()
+        };
+        if let Some(rx) = rx_taken {
             let ctx_presence = ctx.clone();
             let track_handle_store = self.track_handle.clone();
             let active_session = self.active_session.clone();
@@ -813,6 +814,13 @@ impl EventHandler for Handler {
                     bridge_presence,
                 ).await;
             });
+        }
+
+        // Auto-start: replay the stored active user's session through the same
+        // machinery /login uses (voice join, controls, priority queue, refresh
+        // loop). Guarded so gateway reconnects can't spawn a second session.
+        if !self.auto_start_attempted.swap(true, Ordering::SeqCst) {
+            self.auto_start_stored_session().await;
         }
     }
 
@@ -1130,6 +1138,53 @@ impl Handler {
             }
             Err(e) => tracing::warn!(error = ?e, "failed to join voice channel on login"),
         }
+    }
+
+    /// Restart the stored active user's Spotify session on boot, through the
+    /// exact same path /login uses. Skips when OAuth is unconfigured, no user
+    /// is marked active, or the stored record is unusable.
+    async fn auto_start_stored_session(&self) {
+        let Some(oauth) = self.oauth.clone() else {
+            tracing::info!("auto-start skipped: OAuth not configured");
+            return;
+        };
+        let Some(user) = self.user_store.list().into_iter().find(|u| u.active) else {
+            tracing::info!("auto-start skipped: no stored active user");
+            return;
+        };
+        let Ok(discord_user_id) = user.discord_user_id.parse::<u64>() else {
+            tracing::warn!(user = %user.discord_user_id, "auto-start skipped: unparseable discord user id");
+            return;
+        };
+
+        tracing::info!(spotify = %user.spotify_username, "auto-starting stored session");
+        println!("Auto-starting Spotify session for {}...", user.spotify_username);
+
+        let (access_token, refresh_token) =
+            match oauth.refresh_access_token(&user.refresh_token).await {
+                Ok(t) => {
+                    let mut updated = user.clone();
+                    updated.access_token = t.access_token.clone();
+                    if let Some(rt) = t.refresh_token.clone() {
+                        updated.refresh_token = rt;
+                    }
+                    let _ = self.user_store.save(&updated);
+                    (t.access_token, updated.refresh_token)
+                }
+                Err(e) => {
+                    tracing::warn!(error = ?e, "auto-start token refresh failed; using stored token");
+                    (user.access_token.clone(), user.refresh_token.clone())
+                }
+            };
+
+        self.spawn_session(
+            discord_user_id,
+            user.spotify_username.clone(),
+            user.spotify_username,
+            access_token,
+            refresh_token,
+        )
+        .await;
     }
 
     async fn spawn_session(
@@ -1890,7 +1945,6 @@ fn unix_timestamp_str() -> String {
 pub struct DiscordBot {
     client: Client,
     ready_rx: mpsc::Receiver<ReadySignal>,
-    active_session: Arc<Mutex<Option<ActiveSession>>>,
 }
 
 impl DiscordBot {
@@ -1914,7 +1968,7 @@ impl DiscordBot {
         let prebuffer_wait =
             std::time::Duration::from_secs_f32((config.prebuffer_seconds + 0.5).clamp(0.0, 5.0));
 
-        let active_session: Arc<Mutex<Option<ActiveSession>>> = Arc::new(Mutex::new(None));
+        let active_session = Arc::new(Mutex::new(None::<ActiveSession>));
         let track_handle: Arc<Mutex<Option<TrackHandle>>> = Arc::new(Mutex::new(None));
 
         let dj = Arc::new(DJAnnouncer::new());
@@ -1931,7 +1985,7 @@ impl DiscordBot {
             prebuffer_wait,
             user_store,
             oauth,
-            active_session: active_session.clone(),
+            active_session,
             track_handle,
             ctx: Arc::new(Mutex::new(None)),
             controls_message_id: Arc::new(Mutex::new(None)),
@@ -1945,6 +1999,7 @@ impl DiscordBot {
             feeder_paused: Arc::new(AtomicBool::new(false)),
             dj,
             announce_enabled: Arc::new(AtomicBool::new(false)),
+            auto_start_attempted: AtomicBool::new(false),
         };
 
         let token = config.discord_token.clone();
@@ -1953,18 +2008,17 @@ impl DiscordBot {
             .register_songbird()
             .await?;
 
-        Ok(Self { client, ready_rx, active_session })
+        Ok(Self { client, ready_rx })
     }
 
     pub async fn start_background(
         mut self,
-    ) -> Result<(mpsc::Receiver<ReadySignal>, Arc<Mutex<Option<ActiveSession>>>), Box<dyn std::error::Error + Send + Sync>> {
-        let active_session = self.active_session.clone();
+    ) -> Result<mpsc::Receiver<ReadySignal>, Box<dyn std::error::Error + Send + Sync>> {
         tokio::spawn(async move {
             if let Err(e) = self.client.start().await {
                 tracing::error!(error = ?e, "discord client error");
             }
         });
-        Ok((self.ready_rx, active_session))
+        Ok(self.ready_rx)
     }
 }

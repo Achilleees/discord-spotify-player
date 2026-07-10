@@ -16,7 +16,6 @@ use discord::DiscordBot;
 use discord::bot::{check_ytdlp_available, check_ffmpeg_available};
 use oauth::SpotifyOAuth;
 use presence::PresenceUpdate;
-use spotify::SpotifyPlayer;
 use users::UserStore;
 use std::io;
 use std::sync::Arc;
@@ -80,18 +79,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let _ = std::fs::create_dir_all("/tmp/spotibot-youtube");
     }
 
-    // Build OAuth handler if credentials are configured
+    // OAuth is the only session path since discovery/mDNS was removed in v0.5.
     let oauth: Option<Arc<SpotifyOAuth>> = match (
         config.spotify_client_id.clone(),
         config.spotify_client_secret.clone(),
     ) {
         (Some(id), Some(secret)) => {
-            tracing::info!("Spotify OAuth enabled (client_id: {})", &id[..8.min(id.len())]);
+            tracing::info!(client_id_prefix = &id[..8.min(id.len())], "spotify oauth enabled");
             Some(Arc::new(SpotifyOAuth::new(id, secret)))
         }
         _ => {
-            tracing::info!("Spotify OAuth not configured (SPOTIFY_CLIENT_ID/SECRET not set)");
-            None
+            println!("Spotify OAuth is not configured — set SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET in .env.");
+            println!("Spotify playback requires /login; discovery mode was removed in v0.5.");
+            return Err(io::Error::other(
+                "missing SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET",
+            )
+            .into());
         }
     };
 
@@ -135,7 +138,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     )
     .await?;
 
-    let (mut ready_rx, active_session) = discord_bot.start_background().await?;
+    let mut ready_rx = discord_bot.start_background().await?;
 
     tracing::info!("waiting for discord connection");
     match ready_rx.recv().await {
@@ -148,86 +151,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let _ = presence_tx.send(PresenceUpdate::Idle);
 
-    // Auto-start: if any user has stored credentials marked active, start their session.
-    let active_users: Vec<_> = user_store.list().into_iter().filter(|u| u.active).collect();
-    if !active_users.is_empty() {
-        if let Some(oauth_client) = &oauth {
-            if let Some(user) = active_users.into_iter().next() {
-                tracing::info!(
-                    spotify = %user.spotify_username,
-                    "auto-starting OAuth session for stored active user"
-                );
-                println!(
-                    "Auto-starting Spotify session for {}...",
-                    user.spotify_username
-                );
-
-                let token = match oauth_client.refresh_access_token(&user.refresh_token).await {
-                    Ok(t) => {
-                        let mut updated = user.clone();
-                        updated.access_token = t.access_token.clone();
-                        if let Some(rt) = t.refresh_token.clone() {
-                            updated.refresh_token = rt;
-                        }
-                        let _ = user_store.save(&updated);
-                        t.access_token
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            error = ?e,
-                            "failed to refresh token for auto-start; falling back to stored token"
-                        );
-                        user.access_token.clone()
-                    }
-                };
-
-                let config_for_task = config.clone();
-                let bridge_for_task = bridge.clone();
-                let presence_tx_for_task = presence_tx.clone();
-                let discord_user_id = user
-                    .discord_user_id
-                    .parse::<u64>()
-                    .unwrap_or(0);
-                let spotify_name = user.spotify_username.clone();
-                let access_token_for_session = token.clone();
-
-                let handle = tokio::spawn(async move {
-                    match SpotifyPlayer::run_with_token(
-                        &config_for_task,
-                        bridge_for_task,
-                        presence_tx_for_task,
-                        token,
-                        None,
-                        None,
-                    )
-                    .await
-                    {
-                        Ok(()) => tracing::info!("auto-start session ended cleanly"),
-                        Err(e) => tracing::warn!(error = ?e, "auto-start session ended with error"),
-                    }
-                });
-
-                {
-                    let mut lock = active_session.lock().unwrap_or_else(|e| e.into_inner());
-                    *lock = Some(discord::ActiveSession {
-                        discord_user_id,
-                        spotify_name,
-                        discord_name: "Auto-start".to_string(),
-                        access_token: access_token_for_session,
-                        handle,
-                    });
-                }
-
-                std::future::pending::<()>().await;
-            }
-        } else {
-            tracing::warn!("stored active users found but OAuth not configured — falling back to discovery");
-            SpotifyPlayer::run_discovery(&config, bridge, presence_tx).await?;
-        }
-    } else {
-        println!("No stored OAuth sessions. Waiting for Spotify Connect pairing (discovery mode)...");
-        SpotifyPlayer::run_discovery(&config, bridge, presence_tx).await?;
-    }
+    // The bot owns everything from here: auto-start of a stored session runs
+    // inside the ready() handler, sessions start via /login. Park forever.
+    println!("Ready. Use /login in Discord to start a Spotify session.");
+    std::future::pending::<()>().await;
 
     Ok(())
 }

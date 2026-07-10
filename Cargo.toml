@@ -12,13 +12,11 @@ serenity = { version = "0.12", default-features = false, features = ["client", "
 songbird = { version = "0.6", features = ["serenity", "gateway", "driver", "rustls"] }
 symphonia = { version = "0.5", default-features = false, features = ["pcm"] }
 
-# Spotify Connect
-librespot = { version = "0.8" }
+# Spotify Connect (OAuth-only — discovery/mDNS was removed in v0.5)
 librespot-core = "0.8"
 librespot-connect = "0.8"
 librespot-metadata = "0.8"
 librespot-playback = "0.8"
-librespot-discovery = "0.8"
 
 # HTTP client for OAuth
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
