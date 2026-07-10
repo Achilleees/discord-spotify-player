@@ -93,7 +93,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     };
 
-    let user_store = Arc::new(UserStore::new());
+    let db_path = std::env::var("SPOTIBOT_DB").unwrap_or_else(|_| "spotibot.db".to_string());
+    let user_store = Arc::new(
+        UserStore::open(&db_path, config.token_enc_key.as_deref())
+            .map_err(|e| io::Error::other(format!("failed to open credential store: {e}")))?,
+    );
 
     let bridge = AudioBridge::new(config.audio_buffer_seconds);
     tracing::debug!("audio bridge initialized");

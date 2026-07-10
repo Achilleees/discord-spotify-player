@@ -12,8 +12,12 @@ releases/
 credentials.json
 .spotify_cache/
 
-# Per-user OAuth tokens (plaintext until the SQLite migration)
+# Per-user OAuth tokens: legacy JSON dir + the SQLite credential store
 .user_creds/
+.user_creds.migrated/
+spotibot.db
+spotibot.db-shm
+spotibot.db-wal
 
 # IDE
 .idea/

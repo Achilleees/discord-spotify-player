@@ -31,6 +31,9 @@ chacha20poly1305 = "0.10"  # credential-at-rest encryption (already compiled via
 dotenvy = "0.15"
 dialoguer = "0.11"
 
+# Credential storage (same schema/version as nob)
+rusqlite = { version = "0.32", features = ["bundled"] }
+
 # Utilities
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

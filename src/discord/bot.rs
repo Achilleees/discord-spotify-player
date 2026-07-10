@@ -1836,10 +1836,10 @@ impl Handler {
         };
         let creds = UserCredentials {
             discord_user_id: user_id.to_string(),
+            discord_name: discord_username.to_string(),
             spotify_username: display_name.clone(),
             access_token: token.access_token.clone(),
             refresh_token,
-            paired_at: unix_timestamp_str(),
             active: true,
         };
         if let Err(e) = self.user_store.save(&creds) {
@@ -1957,12 +1957,6 @@ impl Handler {
             }
         }
     }
-}
-
-fn unix_timestamp_str() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let secs = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    format!("unix:{}", secs)
 }
 
 pub struct DiscordBot {

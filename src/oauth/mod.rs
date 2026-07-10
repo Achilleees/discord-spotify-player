@@ -34,6 +34,7 @@ pub struct PkceChallenge {
 }
 
 /// Parsed contents of a pasted redirect URL (or a bare code).
+#[derive(Debug)]
 pub struct RedirectParams {
     pub code: String,
     pub state: Option<String>,
