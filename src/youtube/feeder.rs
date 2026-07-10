@@ -46,6 +46,9 @@ async fn download_youtube(url: &str, token: &CancellationToken) -> Result<std::p
     if std::path::Path::new(cookies_path).exists() {
         args.extend(["--cookies".to_string(), cookies_path.to_string()]);
     }
+    // `--` terminates option parsing so a URL starting with `-` can't be read
+    // as a yt-dlp flag.
+    args.push("--".to_string());
     args.push(url.to_string());
     let mut child = Command::new("yt-dlp")
         .args(&args)

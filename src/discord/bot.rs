@@ -645,6 +645,7 @@ async fn run_presence_loop_with_track(
     dj: Arc<DJAnnouncer>,
     announce_enabled: Arc<AtomicBool>,
     bridge: Arc<AudioBridge>,
+    active_priority_item: Arc<Mutex<Option<QueueItem>>>,
 ) {
     let (fwd_tx, fwd_rx) = mpsc::unbounded_channel::<PresenceUpdate>();
     let ctx_presence = ctx.clone();
@@ -661,11 +662,20 @@ async fn run_presence_loop_with_track(
         let _ = fwd_tx.send(update.clone());
 
         {
+            // The bridge-reader track is shared with priority (YouTube/file)
+            // playback. Only pause it on Spotify pause/idle when no priority
+            // item is active — otherwise we'd starve the feeder's audio.
+            let priority_active = {
+                let lock = active_priority_item.lock().unwrap_or_else(|e| e.into_inner());
+                lock.is_some()
+            };
             let lock = track_handle_store.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(handle) = lock.as_ref() {
                 match &update {
                     PresenceUpdate::Playing { .. } => { let _ = handle.play(); }
-                    PresenceUpdate::Paused | PresenceUpdate::Idle => { let _ = handle.pause(); }
+                    PresenceUpdate::Paused | PresenceUpdate::Idle => {
+                        if !priority_active { let _ = handle.pause(); }
+                    }
                 }
             }
         }
@@ -879,12 +889,13 @@ impl EventHandler for Handler {
             let dj_presence = self.dj.clone();
             let bridge_presence = self.bridge.clone();
             let announce_presence = self.announce_enabled.clone();
+            let priority_item = self.active_priority_item.clone();
             tokio::spawn(async move {
                 run_presence_loop_with_track(
                     ctx_presence, rx, track_handle_store, active_session,
                     text_channel_id, controls_id, np_id,
                     dj_presence, announce_presence,
-                    bridge_presence,
+                    bridge_presence, priority_item,
                 ).await;
             });
         }

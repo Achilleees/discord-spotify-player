@@ -63,6 +63,8 @@ pub async fn fetch_youtube_metadata(url: &str) -> Result<YoutubeMetadata, Youtub
     if std::path::Path::new(cookies_path).exists() {
         args.extend(["--cookies", cookies_path]);
     }
+    // `--` terminates option parsing so a `-`-leading URL can't be a flag.
+    args.push("--");
     args.push(url);
     let output = tokio::process::Command::new("yt-dlp")
         .args(&args)
