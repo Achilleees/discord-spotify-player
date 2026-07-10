@@ -1,5 +1,5 @@
 use rand::RngExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use tracing;
 
@@ -221,7 +221,7 @@ fn load_clips_from_dir(dir: &str) -> Vec<Vec<f32>> {
     clips
 }
 
-fn decode_mp3_to_f32_stereo(path: &PathBuf) -> Result<Vec<f32>, String> {
+fn decode_mp3_to_f32_stereo(path: &Path) -> Result<Vec<f32>, String> {
     let output = Command::new("ffmpeg")
         .args(["-i", path.to_str().unwrap_or(""), "-f", "f32le", "-acodec", "pcm_f32le",
                "-ac", &CHANNELS.to_string(), "-ar", &SAMPLE_RATE.to_string(), "-v", "quiet", "-"])

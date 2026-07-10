@@ -20,3 +20,29 @@ pub fn generate_join_sound() -> Vec<i16> {
 
     samples
 }
+
+#[cfg(test)]
+mod tests {
+    use super::generate_join_sound;
+
+    #[test]
+    fn join_sound_has_expected_length() {
+        // 0.3s at 44100 Hz mono.
+        assert_eq!(generate_join_sound().len(), (44100.0 * 0.3) as usize);
+    }
+
+    #[test]
+    fn join_sound_starts_at_zero_and_stays_in_range() {
+        let s = generate_join_sound();
+        assert_eq!(s[0], 0, "a sine starts at zero");
+        assert!(s.iter().all(|&v| v.unsigned_abs() <= 16000), "within amplitude");
+    }
+
+    #[test]
+    fn join_sound_fades_out() {
+        let s = generate_join_sound();
+        let peak_tail = s[s.len() - 100..].iter().map(|v| v.unsigned_abs()).max().unwrap();
+        let peak_mid = s[s.len() / 2 - 50..s.len() / 2 + 50].iter().map(|v| v.unsigned_abs()).max().unwrap();
+        assert!(peak_tail < peak_mid, "tail {peak_tail} should be quieter than mid {peak_mid}");
+    }
+}

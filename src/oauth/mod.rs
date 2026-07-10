@@ -300,4 +300,21 @@ mod tests {
         assert!(parse_redirect("nope").is_err());
         assert!(parse_redirect("").is_err());
     }
+
+    #[test]
+    fn pct_encode_leaves_unreserved_and_escapes_the_rest() {
+        assert_eq!(pct_encode("aZ0-_.~"), "aZ0-_.~");
+        assert_eq!(pct_encode("a b/c:d"), "a%20b%2Fc%3Ad");
+    }
+
+    #[test]
+    fn auth_url_carries_challenge_and_state() {
+        let oauth = SpotifyOAuth::new("client123".to_string());
+        let pkce = new_pkce();
+        let url = oauth.auth_url(&pkce);
+        assert!(url.contains("code_challenge_method=S256"));
+        assert!(url.contains(&format!("code_challenge={}", pkce.challenge)));
+        assert!(url.contains(&format!("state={}", pkce.state)));
+        assert!(url.contains("client_id=client123"));
+    }
 }

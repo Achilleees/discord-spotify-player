@@ -520,6 +520,9 @@ async fn post_priority_history(
 
 // --- Priority queue manager ---
 
+// Wide orchestration fn wiring together the queue, bridge, and UI state. The
+// nob port folds these into its actions/panel layer; kept flat here.
+#[allow(clippy::too_many_arguments)]
 async fn priority_queue_manager(
     mut end_of_track_rx: mpsc::UnboundedReceiver<()>,
     priority_queue: Arc<Mutex<PriorityQueue>>,
@@ -630,6 +633,7 @@ async fn priority_queue_manager(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_presence_loop_with_track(
     ctx: Context,
     mut rx: mpsc::UnboundedReceiver<PresenceUpdate>,
@@ -2259,5 +2263,66 @@ impl DiscordBot {
             }
         });
         Ok(self.ready_rx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_valid_track_id, parse_track_id_from_url};
+
+    const ID: &str = "4cOdK2wGLETKBW3PvgPWqT"; // 22 base62 chars
+
+    #[test]
+    fn parses_plain_url() {
+        assert_eq!(
+            parse_track_id_from_url(&format!("https://open.spotify.com/track/{ID}")).as_deref(),
+            Some(ID)
+        );
+    }
+
+    #[test]
+    fn parses_url_with_si_query() {
+        assert_eq!(
+            parse_track_id_from_url(&format!("https://open.spotify.com/track/{ID}?si=abc123")).as_deref(),
+            Some(ID)
+        );
+    }
+
+    #[test]
+    fn parses_locale_prefixed_url() {
+        assert_eq!(
+            parse_track_id_from_url(&format!("https://open.spotify.com/intl-fr/track/{ID}")).as_deref(),
+            Some(ID)
+        );
+    }
+
+    #[test]
+    fn parses_uri() {
+        assert_eq!(
+            parse_track_id_from_url(&format!("spotify:track:{ID}")).as_deref(),
+            Some(ID)
+        );
+    }
+
+    #[test]
+    fn rejects_query_param_injection() {
+        // A crafted id with an extra param must not survive validation, or it
+        // would ride into the authenticated queue POST's query string.
+        assert!(parse_track_id_from_url(&format!("spotify:track:{ID}&device_id=x")).is_none());
+        assert!(parse_track_id_from_url("spotify:track:abc&foo=bar").is_none());
+    }
+
+    #[test]
+    fn rejects_wrong_length_and_nonalnum() {
+        assert!(!is_valid_track_id("too-short"));
+        assert!(!is_valid_track_id(&"x".repeat(23)));
+        assert!(!is_valid_track_id("4cOdK2wGLETKBW3PvgPWq!")); // 22 chars, bad byte
+        assert!(is_valid_track_id(ID));
+    }
+
+    #[test]
+    fn rejects_unrelated_input() {
+        assert!(parse_track_id_from_url("https://youtube.com/watch?v=abc").is_none());
+        assert!(parse_track_id_from_url("just some text").is_none());
     }
 }

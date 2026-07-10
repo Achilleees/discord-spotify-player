@@ -248,3 +248,69 @@ fn now_millis() -> u64 {
         .unwrap_or_default()
         .as_millis() as u64
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn push_pull_roundtrips_values() {
+        let b = AudioBridge::new(1);
+        b.push_samples(&[1.0, 2.0, 3.0, 4.0]);
+        let mut out = [0.0f32; 4];
+        assert_eq!(b.pull_samples(&mut out), 4);
+        assert_eq!(out, [1.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn pull_drains_only_whole_stereo_frames() {
+        let b = AudioBridge::new(1);
+        b.push_samples(&[1.0, 2.0, 3.0, 4.0]);
+        let mut out = [0.0f32; 3]; // odd request
+        assert_eq!(b.pull_samples(&mut out), 2, "odd request drains an even count");
+        assert_eq!(&out[..2], &[1.0, 2.0]);
+        assert_eq!(b.len(), 2, "one whole frame left behind");
+    }
+
+    #[test]
+    fn push_drops_odd_tail_to_stay_frame_aligned() {
+        let b = AudioBridge::new(1);
+        b.push_samples(&[1.0, 2.0, 3.0]); // odd
+        assert_eq!(b.len(), 2, "odd tail dropped to preserve L/R alignment");
+    }
+
+    #[test]
+    fn survives_ring_wraparound() {
+        let b = AudioBridge::new(1);
+        // Push then fully drain many times so the internal ring wraps and the
+        // head/tail split-copy path in pull_samples is exercised.
+        let mut expected = 0.0f32;
+        let mut next = 0.0f32;
+        for _ in 0..1000 {
+            let chunk: Vec<f32> = (0..100).map(|_| { let v = next; next += 1.0; v }).collect();
+            b.push_samples(&chunk);
+            let mut out = [0.0f32; 100];
+            let n = b.pull_samples(&mut out);
+            for &v in &out[..n] {
+                assert_eq!(v, expected);
+                expected += 1.0;
+            }
+        }
+    }
+
+    #[test]
+    fn drops_when_full_and_counts_them() {
+        let b = AudioBridge::new(1); // cap = 44100 * 2 * 1
+        b.push_samples(&vec![0.5f32; 100_000]);
+        assert_eq!(b.len(), 88_200);
+        assert!(b.stats_snapshot().total_dropped >= (100_000 - 88_200));
+    }
+
+    #[test]
+    fn clear_empties_the_buffer() {
+        let b = AudioBridge::new(1);
+        b.push_samples(&[1.0, 2.0]);
+        b.clear();
+        assert_eq!(b.len(), 0);
+    }
+}

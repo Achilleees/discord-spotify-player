@@ -64,3 +64,33 @@ pub async fn run_presence_loop(ctx: Context, mut rx: mpsc::UnboundedReceiver<Pre
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::truncate_status;
+
+    #[test]
+    fn short_text_is_unchanged() {
+        assert_eq!(truncate_status("hi", 96), "hi");
+    }
+
+    #[test]
+    fn text_at_limit_is_unchanged() {
+        let s = "x".repeat(96);
+        assert_eq!(truncate_status(&s, 96), s);
+    }
+
+    #[test]
+    fn long_text_is_truncated_with_ellipsis() {
+        let out = truncate_status(&"x".repeat(200), 96);
+        assert!(out.ends_with("..."));
+        assert!(out.chars().count() <= 96, "got {} chars", out.chars().count());
+    }
+
+    #[test]
+    fn truncation_is_char_safe_on_multibyte() {
+        // Must not panic or split a multibyte char mid-way.
+        let out = truncate_status(&"🎵".repeat(200), 96);
+        assert!(out.ends_with("..."));
+    }
+}

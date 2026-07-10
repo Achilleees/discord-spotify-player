@@ -124,3 +124,29 @@ impl std::fmt::Display for ConfigError {
 }
 
 impl std::error::Error for ConfigError {}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_id;
+
+    #[test]
+    fn accepts_valid_snowflake() {
+        assert_eq!(parse_id("X", "428011920184967168").unwrap(), 428011920184967168);
+    }
+
+    #[test]
+    fn rejects_zero() {
+        assert!(parse_id("X", "0").is_err());
+    }
+
+    #[test]
+    fn rejects_non_numeric() {
+        assert!(parse_id("X", "not-a-number").is_err());
+        assert!(parse_id("X", "").is_err());
+    }
+
+    #[test]
+    fn trims_whitespace() {
+        assert_eq!(parse_id("X", "  123  ").unwrap(), 123);
+    }
+}

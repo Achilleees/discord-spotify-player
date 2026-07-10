@@ -258,3 +258,57 @@ impl Sink for DiscordSink {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::Biquad;
+
+    const SR: f32 = 44_100.0;
+
+    #[test]
+    fn fresh_biquad_is_identity() {
+        let mut b = Biquad::new();
+        for &x in &[0.0, 0.5, -0.3, 1.0] {
+            assert_eq!(b.process(x), x);
+        }
+    }
+
+    #[test]
+    fn zero_gain_shelf_is_identity() {
+        let mut b = Biquad::new();
+        b.set_low_shelf(SR, 80.0, 0.0);
+        for &x in &[0.1, 0.9, -0.4] {
+            assert!((b.process(x) - x).abs() < 1e-6);
+        }
+    }
+
+    /// A low shelf boosts DC toward 10^(gain/20). Feeding a constant and
+    /// letting it settle exercises the hand-transcribed RBJ coefficients — a
+    /// blown-up filter would diverge instead of settling near the target.
+    #[test]
+    fn low_shelf_dc_gain_matches_theory() {
+        let gain_db = 6.0;
+        let mut b = Biquad::new();
+        b.set_low_shelf(SR, 200.0, gain_db);
+        let mut y = 0.0;
+        for _ in 0..20_000 {
+            y = b.process(1.0);
+        }
+        let expected = 10f32.powf(gain_db / 20.0);
+        assert!((y - expected).abs() < 0.05, "settled at {y}, expected ~{expected}");
+    }
+
+    #[test]
+    fn high_shelf_is_stable_and_bounded() {
+        let mut b = Biquad::new();
+        b.set_high_shelf(SR, 8000.0, 6.0);
+        let mut max = 0.0f32;
+        for i in 0..20_000 {
+            // A unit-amplitude sine at 12 kHz.
+            let x = (2.0 * std::f32::consts::PI * 12_000.0 * i as f32 / SR).sin();
+            max = max.max(b.process(x).abs());
+        }
+        // 6 dB boost ≈ 2x; a diverging filter would blow well past this.
+        assert!(max < 4.0, "high-shelf output peaked at {max}");
+    }
+}
