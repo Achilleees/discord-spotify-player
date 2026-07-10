@@ -3,7 +3,6 @@ use std::path::PathBuf;
 use std::process::Command;
 use tracing;
 
-const KOKORO_SCRIPT: &str = "/opt/openclaw/services/spotibot/kokoro-dj.py";
 const DJ_CLIPS_DIR: &str = "/opt/openclaw/services/spotibot/dj-clips";
 const DJ_CACHE_DIR: &str = "/opt/openclaw/services/spotibot/dj-cache";
 const SAMPLE_RATE: u32 = 44_100;
@@ -188,33 +187,6 @@ impl DJAnnouncer {
             }
         }
     }
-}
-
-fn generate_clip_sync(text: &str) -> Result<Vec<f32>, String> {
-    let hash = simple_hash(text);
-    let mp3_path = PathBuf::from(format!("{}/dj-{:016x}.mp3", DJ_CACHE_DIR, hash));
-
-    // Check cache first
-    if mp3_path.exists() {
-        tracing::debug!(path = %mp3_path.display(), "using cached DJ clip");
-        return decode_mp3_to_f32_stereo(&mp3_path);
-    }
-
-    let output = Command::new("python3")
-        .args([KOKORO_SCRIPT, text, mp3_path.to_str().unwrap_or("/tmp/dj.mp3")])
-        .output()
-        .map_err(|e| format!("kokoro exec failed: {}", e))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("kokoro failed: {}", stderr));
-    }
-
-    if !mp3_path.exists() {
-        return Err("kokoro produced no output".to_string());
-    }
-
-    decode_mp3_to_f32_stereo(&mp3_path)
 }
 
 fn load_clips_from_dir(dir: &str) -> Vec<Vec<f32>> {

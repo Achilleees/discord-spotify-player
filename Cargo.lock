@@ -787,6 +787,7 @@ name = "discord-spotify-player"
 version = "0.5.0-pre"
 dependencies = [
  "base64",
+ "chacha20poly1305",
  "dialoguer",
  "dotenvy",
  "futures-util",
@@ -801,6 +802,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serenity",
+ "sha2",
  "songbird",
  "symphonia",
  "thiserror 1.0.69",

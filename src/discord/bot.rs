@@ -4,7 +4,7 @@ use crate::audio::generate_join_sound;
 use crate::audio::dj::DJAnnouncer;
 use crate::audio_bridge::AudioBridge;
 use crate::config::Config;
-use crate::oauth::SpotifyOAuth;
+use crate::oauth::{new_pkce, parse_redirect, PkceChallenge, SpotifyOAuth};
 use crate::presence::PresenceUpdate;
 use crate::queue::{PriorityQueue, QueueItem, MediaSource};
 use crate::spotify::metadata::{fetch_track_metadata, TrackMetadata};
@@ -30,10 +30,12 @@ use songbird::events::{Event, TrackEvent};
 use songbird::input::{Input, RawAdapter};
 use songbird::tracks::TrackHandle;
 use songbird::SerenityInit;
+use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -60,7 +62,9 @@ struct Handler {
     prebuffer_samples: usize,
     prebuffer_wait: std::time::Duration,
     user_store: Arc<UserStore>,
-    oauth: Option<Arc<SpotifyOAuth>>,
+    oauth: Arc<SpotifyOAuth>,
+    /// Pending PKCE challenges keyed by Discord user, awaiting paste-back.
+    pending_auth: Arc<Mutex<HashMap<u64, (PkceChallenge, Instant)>>>,
     active_session: Arc<Mutex<Option<ActiveSession>>>,
     track_handle: Arc<Mutex<Option<TrackHandle>>>,
     ctx: Arc<Mutex<Option<Context>>>,
@@ -1144,10 +1148,7 @@ impl Handler {
     /// exact same path /login uses. Skips when OAuth is unconfigured, no user
     /// is marked active, or the stored record is unusable.
     async fn auto_start_stored_session(&self) {
-        let Some(oauth) = self.oauth.clone() else {
-            tracing::info!("auto-start skipped: OAuth not configured");
-            return;
-        };
+        let oauth = self.oauth.clone();
         let Some(user) = self.user_store.list().into_iter().find(|u| u.active) else {
             tracing::info!("auto-start skipped: no stored active user");
             return;
@@ -1295,11 +1296,7 @@ impl Handler {
                 }
                 tracing::info!(user = discord_user_id, "attempting token refresh and reconnect in 2s");
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                let oauth_ref = match &oauth_for_task {
-                    Some(o) => o.clone(),
-                    None => { tracing::warn!(user = discord_user_id, "no OAuth client"); break; }
-                };
-                match oauth_ref.refresh_access_token(&refresh_token).await {
+                match oauth_for_task.refresh_access_token(&refresh_token).await {
                     Ok(new_token) => {
                         tracing::info!(user = discord_user_id, "token refreshed, reconnecting");
                         if let Some(rt) = new_token.refresh_token.clone() { refresh_token = rt; }
@@ -1716,118 +1713,149 @@ impl Handler {
         discord_username: &str,
         code_arg: Option<&str>,
     ) -> String {
-        if let Some(existing) = self.user_store.load(user_id) {
-            if code_arg.is_none() {
-                let oauth = match &self.oauth {
-                    Some(o) => o.clone(),
-                    None => {
-                        let mut creds = existing.clone();
-                        creds.active = true;
-                        match self.user_store.save(&creds) {
-                            Ok(()) => return format!("Session reactivated as **{}**!", creds.spotify_username),
-                            Err(e) => { tracing::error!("failed to reactivate session: {}", e); return "Failed to reactivate session. Please try again.".to_string(); }
-                        }
-                    }
-                };
-
-                if existing.active {
-                    match oauth.refresh_access_token(&existing.refresh_token).await {
-                        Ok(new_token) => {
-                            let mut creds = existing.clone();
-                            creds.access_token = new_token.access_token.clone();
-                            if let Some(rt) = new_token.refresh_token { creds.refresh_token = rt; }
-                            let _ = self.user_store.save(&creds);
-                            self.spawn_session(user_id_u64, existing.spotify_username.clone(), discord_username.to_string(), new_token.access_token, creds.refresh_token.clone()).await;
-                            return format!("Session restarted for **{}**!", existing.spotify_username);
-                        }
-                        Err(e) => {
-                            tracing::warn!("token refresh failed for reactivation: {}", e);
-                            return format!("Already logged in as **{}** but couldn't refresh the token. Use `/logout` then `/login` to re-authorize.", existing.spotify_username);
-                        }
-                    }
-                } else {
-                    match oauth.refresh_access_token(&existing.refresh_token).await {
-                        Ok(new_token) => {
-                            let mut creds = existing.clone();
-                            creds.active = true;
-                            creds.access_token = new_token.access_token.clone();
-                            if let Some(rt) = new_token.refresh_token { creds.refresh_token = rt; }
-                            match self.user_store.save(&creds) {
-                                Ok(()) => {
-                                    self.spawn_session(user_id_u64, existing.spotify_username.clone(), discord_username.to_string(), new_token.access_token, creds.refresh_token.clone()).await;
-                                    tracing::info!(user = %user_id, spotify = %existing.spotify_username, "session reactivated");
-                                    return format!("Session reactivated as **{}**!", existing.spotify_username);
-                                }
-                                Err(e) => { tracing::error!("failed to save reactivated session: {}", e); return "Failed to save session. Please try again.".to_string(); }
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!("token refresh failed during reactivation: {}", e);
-                            return "Couldn't refresh your Spotify token. Please run `/login` to re-authorize.".to_string();
-                        }
-                    }
-                }
-            }
+        // Paste-back of a redirect URL / code completes a pending PKCE auth.
+        if let Some(raw) = code_arg {
+            return self
+                .complete_login(user_id, user_id_u64, discord_username, raw)
+                .await;
         }
 
-        let oauth = match &self.oauth {
-            Some(o) => o.clone(),
-            None => return "OAuth not configured. Set SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET in .env.".to_string(),
+        // No code, but stored creds exist: quick re-login by refreshing.
+        if let Some(existing) = self.user_store.load(user_id) {
+            return self
+                .reactivate_login(user_id, user_id_u64, discord_username, existing)
+                .await;
+        }
+
+        // Fresh login: issue a PKCE challenge and the authorize URL.
+        let pkce = new_pkce();
+        let url = self.oauth.auth_url(&pkce);
+        {
+            let mut pending = self.pending_auth.lock().unwrap_or_else(|e| e.into_inner());
+            pending.insert(user_id_u64, (pkce, Instant::now()));
+        }
+        format!(
+            "Connect your Spotify account:\n\n<{url}>\n\nClick the link and authorize. \
+             Your browser will then try to open a page that fails to load \
+             (connection refused) — that's expected. Copy that full URL from the \
+             address bar and run `/login code:<that URL>` to finish."
+        )
+    }
+
+    /// Quick re-login for a user who already authorized once: refresh their
+    /// token and (re)start the session without a new browser round-trip.
+    async fn reactivate_login(
+        &self,
+        user_id: &str,
+        user_id_u64: u64,
+        discord_username: &str,
+        existing: UserCredentials,
+    ) -> String {
+        match self.oauth.refresh_access_token(&existing.refresh_token).await {
+            Ok(new_token) => {
+                let mut creds = existing.clone();
+                creds.active = true;
+                creds.access_token = new_token.access_token.clone();
+                if let Some(rt) = new_token.refresh_token {
+                    creds.refresh_token = rt;
+                }
+                if let Err(e) = self.user_store.save(&creds) {
+                    tracing::error!(error = %e, "failed to save reactivated session");
+                    return "Failed to save session. Please try again.".to_string();
+                }
+                self.spawn_session(
+                    user_id_u64,
+                    existing.spotify_username.clone(),
+                    discord_username.to_string(),
+                    new_token.access_token,
+                    creds.refresh_token.clone(),
+                )
+                .await;
+                tracing::info!(user = %user_id, spotify = %existing.spotify_username, "session reactivated");
+                format!("Session (re)started for **{}**!", existing.spotify_username)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "token refresh failed on reactivation");
+                format!(
+                    "Couldn't refresh your Spotify token for **{}**. Run `/forget` then `/login` to re-authorize.",
+                    existing.spotify_username
+                )
+            }
+        }
+    }
+
+    /// Complete a login by exchanging the pasted authorization code, using the
+    /// PKCE verifier stashed when `/login` was first invoked.
+    async fn complete_login(
+        &self,
+        user_id: &str,
+        user_id_u64: u64,
+        discord_username: &str,
+        raw: &str,
+    ) -> String {
+        let params = match parse_redirect(raw) {
+            Ok(p) => p,
+            Err(e) => return format!("Couldn't read that redirect: {e}. Paste the full URL from your browser."),
         };
 
-        match code_arg {
-            None => {
-                let state = generate_state();
-                let url = oauth.auth_url(&state);
-                format!("Connect your Spotify account:
-
-<{}>
-
-Click the link, authorize, then copy the full URL your browser tried to navigate to (it will fail with connection refused — that's expected). Run `/login code:<that URL>` to complete.", url)
-            }
-            Some(raw) => {
-                let code = match SpotifyOAuth::extract_code(raw) {
-                    Some(c) => c,
-                    None => return "Couldn't extract a code from that input. Please paste the full redirect URL from your browser.".to_string(),
-                };
-
-                match oauth.exchange_code(&code).await {
-                    Ok(token) => {
-                        let refresh_token = match token.refresh_token {
-                            Some(rt) => rt,
-                            None => return "Spotify didn't return a refresh token. Please try again.".to_string(),
-                        };
-
-                        let display_name = match oauth.get_user_profile(&token.access_token).await {
-                            Ok(name) => name,
-                            Err(e) => { tracing::warn!("failed to fetch Spotify profile: {}", e); "Unknown".to_string() }
-                        };
-
-                        let creds = UserCredentials {
-                            discord_user_id: user_id.to_string(),
-                            spotify_username: display_name.clone(),
-                            access_token: token.access_token.clone(),
-                            refresh_token,
-                            paired_at: unix_timestamp_str(),
-                            active: true,
-                        };
-
-                        match self.user_store.save(&creds) {
-                            Ok(()) => {
-                                tracing::info!(user = %user_id, spotify = %display_name, "OAuth login successful");
-                                self.spawn_session(user_id_u64, display_name.clone(), discord_username.to_string(), token.access_token, creds.refresh_token.clone()).await;
-                                format!("Logged in as **{}**! Spotify session started.", display_name)
-                            }
-                            Err(e) => { tracing::error!("failed to save credentials: {}", e); "Failed to save credentials. Please try again.".to_string() }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("OAuth code exchange failed: {}", e);
-                        "Failed to exchange code with Spotify. The code may have expired — run `/login` to start over.".to_string()
-                    }
-                }
+        let pending = {
+            let mut lock = self.pending_auth.lock().unwrap_or_else(|e| e.into_inner());
+            lock.remove(&user_id_u64)
+        };
+        let (pkce, started) = match pending {
+            Some(p) => p,
+            None => return "No pending login — run `/login` first to get an authorize link.".to_string(),
+        };
+        if started.elapsed() > std::time::Duration::from_secs(600) {
+            return "That login link expired. Run `/login` again.".to_string();
+        }
+        // Validate the CSRF state when the redirect carried one.
+        if let Some(returned) = params.state.as_deref() {
+            if returned != pkce.state {
+                tracing::warn!(user = %user_id, "OAuth state mismatch");
+                return "Login state mismatch — for safety, run `/login` again.".to_string();
             }
         }
+
+        let token = match self.oauth.exchange_code(&params.code, &pkce.verifier).await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!(error = %e, "oauth code exchange failed");
+                return "Failed to exchange the code with Spotify. Run `/login` to start over.".to_string();
+            }
+        };
+        let Some(refresh_token) = token.refresh_token.clone() else {
+            return "Spotify didn't return a refresh token. Run `/login` again.".to_string();
+        };
+        let display_name = match self.oauth.get_user_profile(&token.access_token).await {
+            Ok(name) => name,
+            Err(e) => {
+                tracing::warn!(error = %e, "profile fetch failed");
+                "Unknown".to_string()
+            }
+        };
+        let creds = UserCredentials {
+            discord_user_id: user_id.to_string(),
+            spotify_username: display_name.clone(),
+            access_token: token.access_token.clone(),
+            refresh_token,
+            paired_at: unix_timestamp_str(),
+            active: true,
+        };
+        if let Err(e) = self.user_store.save(&creds) {
+            tracing::error!(error = %e, "failed to save credentials");
+            return "Failed to save credentials. Please try again.".to_string();
+        }
+        tracing::info!(user = %user_id, spotify = %display_name, "oauth login successful");
+        self.spawn_session(
+            user_id_u64,
+            display_name.clone(),
+            discord_username.to_string(),
+            token.access_token,
+            creds.refresh_token.clone(),
+        )
+        .await;
+        format!("Logged in as **{display_name}**! Spotify session started.")
     }
 
     async fn handle_logout(&self, user_id: &str, user_id_u64: u64) -> String {
@@ -1931,11 +1959,6 @@ Click the link, authorize, then copy the full URL your browser tried to navigate
     }
 }
 
-fn generate_state() -> String {
-    use rand::distr::SampleString;
-    rand::distr::Alphanumeric.sample_string(&mut rand::rng(), 16)
-}
-
 fn unix_timestamp_str() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let secs = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
@@ -1954,7 +1977,7 @@ impl DiscordBot {
         presence_rx: mpsc::UnboundedReceiver<PresenceUpdate>,
         presence_tx: mpsc::UnboundedSender<PresenceUpdate>,
         user_store: Arc<UserStore>,
-        oauth: Option<Arc<SpotifyOAuth>>,
+        oauth: Arc<SpotifyOAuth>,
         ytdlp_available: bool,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let intents = GatewayIntents::GUILDS
@@ -1985,6 +2008,7 @@ impl DiscordBot {
             prebuffer_wait,
             user_store,
             oauth,
+            pending_auth: Arc::new(Mutex::new(HashMap::new())),
             active_session,
             track_handle,
             ctx: Arc::new(Mutex::new(None)),

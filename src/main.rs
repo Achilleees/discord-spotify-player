@@ -79,22 +79,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let _ = std::fs::create_dir_all("/tmp/spotibot-youtube");
     }
 
-    // OAuth is the only session path since discovery/mDNS was removed in v0.5.
-    let oauth: Option<Arc<SpotifyOAuth>> = match (
-        config.spotify_client_id.clone(),
-        config.spotify_client_secret.clone(),
-    ) {
-        (Some(id), Some(secret)) => {
+    // OAuth (Authorization Code + PKCE) is the only session path since
+    // discovery/mDNS was removed in v0.5. PKCE needs the client id only.
+    let oauth: Arc<SpotifyOAuth> = match config.spotify_client_id.clone() {
+        Some(id) => {
             tracing::info!(client_id_prefix = &id[..8.min(id.len())], "spotify oauth enabled");
-            Some(Arc::new(SpotifyOAuth::new(id, secret)))
+            Arc::new(SpotifyOAuth::new(id))
         }
-        _ => {
-            println!("Spotify OAuth is not configured — set SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET in .env.");
+        None => {
+            println!("Spotify OAuth is not configured — set SPOTIFY_CLIENT_ID in .env.");
             println!("Spotify playback requires /login; discovery mode was removed in v0.5.");
-            return Err(io::Error::other(
-                "missing SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET",
-            )
-            .into());
+            return Err(io::Error::other("missing SPOTIFY_CLIENT_ID").into());
         }
     };
 

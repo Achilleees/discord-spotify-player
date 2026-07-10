@@ -14,7 +14,9 @@ pub struct Config {
     pub bass_boost_db: f32,
     pub treble_boost_db: f32,
     pub spotify_client_id: Option<String>,
-    pub spotify_client_secret: Option<String>,
+    /// Base64 or hex 32-byte key for encrypting stored OAuth tokens at rest.
+    /// When absent, tokens are stored unencrypted (with a startup warning).
+    pub token_enc_key: Option<String>,
 }
 
 impl Config {
@@ -61,7 +63,7 @@ impl Config {
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty());
 
-        let spotify_client_secret = env::var("SPOTIFY_CLIENT_SECRET")
+        let token_enc_key = env::var("TOKEN_ENC_KEY")
             .ok()
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty());
@@ -95,7 +97,7 @@ impl Config {
             bass_boost_db,
             treble_boost_db,
             spotify_client_id,
-            spotify_client_secret,
+            token_enc_key,
         })
     }
 }
