@@ -37,17 +37,41 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 use tokio::sync::mpsc;
+use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 type ReadySignal = Result<(), String>;
+
+/// Refresh the access token this many seconds before it expires.
+const TOKEN_REFRESH_MARGIN_SECS: u64 = 300;
+/// Floor on the proactive-refresh wait, so a short-lived token can't spin.
+const TOKEN_REFRESH_MIN_WAIT_SECS: u64 = 30;
+/// Backoff after a failed proactive refresh before retrying.
+const TOKEN_REFRESH_RETRY_SECS: u64 = 30;
+/// Give up the librespot reconnect loop after this many consecutive returns
+/// without a healthy session, so a permanently-down Spotify can't hot-loop.
+const MAX_SESSION_RESTARTS: u32 = 10;
+/// Fallback token lifetime when the real `expires_in` is unknown.
+const DEFAULT_TOKEN_LIFETIME_SECS: u64 = 3600;
 
 pub struct ActiveSession {
     pub discord_user_id: u64,
     pub spotify_name: String,
     pub discord_name: String,
     pub access_token: String,
+    /// The librespot session task.
     pub handle: JoinHandle<()>,
+    /// The proactive token-refresh task that keeps `access_token` current.
+    pub refresh_handle: JoinHandle<()>,
+}
+
+impl ActiveSession {
+    /// Abort both the librespot session and its refresher.
+    fn abort(&self) {
+        self.handle.abort();
+        self.refresh_handle.abort();
+    }
 }
 
 struct Handler {
@@ -868,7 +892,7 @@ impl EventHandler for Handler {
                 {
                     let mut lock = self.active_session.lock().unwrap_or_else(|e| e.into_inner());
                     if let Some(session) = lock.take() {
-                        session.handle.abort();
+                        session.abort();
                         tracing::info!(user = session.discord_user_id, "auto-aborted session (empty channel)");
                     }
                 }
@@ -1161,7 +1185,7 @@ impl Handler {
         tracing::info!(spotify = %user.spotify_username, "auto-starting stored session");
         println!("Auto-starting Spotify session for {}...", user.spotify_username);
 
-        let (access_token, refresh_token) =
+        let (access_token, refresh_token, expires_in) =
             match oauth.refresh_access_token(&user.refresh_token).await {
                 Ok(t) => {
                     let mut updated = user.clone();
@@ -1170,11 +1194,11 @@ impl Handler {
                         updated.refresh_token = rt;
                     }
                     let _ = self.user_store.save(&updated);
-                    (t.access_token, updated.refresh_token)
+                    (t.access_token, updated.refresh_token, t.expires_in)
                 }
                 Err(e) => {
                     tracing::warn!(error = ?e, "auto-start token refresh failed; using stored token");
-                    (user.access_token.clone(), user.refresh_token.clone())
+                    (user.access_token.clone(), user.refresh_token.clone(), 0)
                 }
             };
 
@@ -1184,6 +1208,7 @@ impl Handler {
             user.spotify_username,
             access_token,
             refresh_token,
+            expires_in,
         )
         .await;
     }
@@ -1195,6 +1220,7 @@ impl Handler {
         discord_name: String,
         access_token: String,
         refresh_token: String,
+        expires_in: u64,
     ) {
         // P1: Cancel any active YouTube/file feeder before starting Spotify session
         {
@@ -1220,15 +1246,24 @@ impl Handler {
         let oauth_for_task = self.oauth.clone();
         let user_store_for_task = self.user_store.clone();
         let user_id_str = discord_user_id.to_string();
-        let mut refresh_token = refresh_token;
-        let mut access_token = access_token;
+
+        // Shared, single-owner token state. The refresher below is the only
+        // writer of the refresh token; the librespot task only reads the
+        // current access token and signals the refresher when its session dies.
+        let token_state = Arc::new(Mutex::new((access_token.clone(), refresh_token)));
+        let refresh_now = Arc::new(Notify::new());
 
         {
             let mut lock = active_session.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(old) = lock.take() {
                 tracing::info!(old_user = old.discord_user_id, "aborting existing librespot session");
-                old.handle.abort();
+                old.abort();
             }
+        }
+        // Exactly one user stays active:true, so auto-start can't resurrect a
+        // displaced user after a restart.
+        if let Err(e) = self.user_store.set_active_exclusive(&user_id_str) {
+            tracing::warn!(error = %e, "failed to set exclusive active user");
         }
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         self.join_voice_for_user(discord_user_id).await;
@@ -1279,72 +1314,110 @@ impl Handler {
             now_playing_message_id,
         ));
 
-        let active_session_for_task = active_session.clone();
-        let spotify_name_clone = spotify_name.clone();
-        let access_token_for_store = access_token.clone();
-        let handle = tokio::spawn(async move {
-            tracing::info!(user = discord_user_id, "librespot OAuth session starting");
-            let mut spirc_rx = Some(spirc_rx);
-            loop {
-                match SpotifyPlayer::run_with_token(
-                    &config, bridge.clone(), presence_tx.clone(), access_token.clone(),
-                    Some(eot_tx.clone()),
-                    spirc_rx.take(),
-                ).await {
-                    Ok(()) => tracing::info!(user = discord_user_id, "librespot session ended cleanly"),
-                    Err(e) => tracing::warn!(user = discord_user_id, error = ?e, "librespot session ended with error"),
-                }
-                tracing::info!(user = discord_user_id, "attempting token refresh and reconnect in 2s");
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                match oauth_for_task.refresh_access_token(&refresh_token).await {
-                    Ok(new_token) => {
-                        tracing::info!(user = discord_user_id, "token refreshed, reconnecting");
-                        if let Some(rt) = new_token.refresh_token.clone() { refresh_token = rt; }
-                        access_token = new_token.access_token;
-                        if let Some(mut creds) = user_store_for_task.load(&user_id_str) {
-                            creds.access_token = access_token.clone();
-                            creds.refresh_token = refresh_token.clone();
-                            let _ = user_store_for_task.save(&creds);
+        // Proactive refresher: the sole owner of the refresh cycle. Wakes on a
+        // timer (expires_in − margin) or when the librespot task signals its
+        // session died, refreshes, and publishes the new access token to the
+        // shared state, the DB, and the live ActiveSession.
+        let refresh_handle = tokio::spawn({
+            let oauth = oauth_for_task.clone();
+            let user_store = user_store_for_task.clone();
+            let active_session = active_session.clone();
+            let token_state = token_state.clone();
+            let refresh_now = refresh_now.clone();
+            let user_id_str = user_id_str.clone();
+            async move {
+                let mut lifetime = if expires_in == 0 { DEFAULT_TOKEN_LIFETIME_SECS } else { expires_in };
+                loop {
+                    let wait = lifetime
+                        .saturating_sub(TOKEN_REFRESH_MARGIN_SECS)
+                        .max(TOKEN_REFRESH_MIN_WAIT_SECS);
+                    tokio::select! {
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(wait)) => {}
+                        _ = refresh_now.notified() => {
+                            tracing::debug!(user = discord_user_id, "early token refresh requested");
                         }
-                        {
-                            let mut lock = active_session_for_task.lock().unwrap_or_else(|e| e.into_inner());
-                            if let Some(s) = lock.as_mut() {
-                                if s.discord_user_id == discord_user_id {
-                                    s.access_token = access_token.clone();
+                    }
+                    let current_refresh = { token_state.lock().unwrap_or_else(|e| e.into_inner()).1.clone() };
+                    match oauth.refresh_access_token(&current_refresh).await {
+                        Ok(tok) => {
+                            let new_refresh = tok.refresh_token.clone().unwrap_or(current_refresh);
+                            {
+                                let mut s = token_state.lock().unwrap_or_else(|e| e.into_inner());
+                                s.0 = tok.access_token.clone();
+                                s.1 = new_refresh.clone();
+                            }
+                            if let Some(mut creds) = user_store.load(&user_id_str) {
+                                creds.access_token = tok.access_token.clone();
+                                creds.refresh_token = new_refresh;
+                                let _ = user_store.save(&creds);
+                            }
+                            {
+                                let mut lock = active_session.lock().unwrap_or_else(|e| e.into_inner());
+                                if let Some(s) = lock.as_mut() {
+                                    if s.discord_user_id == discord_user_id {
+                                        s.access_token = tok.access_token.clone();
+                                    }
                                 }
                             }
+                            lifetime = if tok.expires_in == 0 { DEFAULT_TOKEN_LIFETIME_SECS } else { tok.expires_in };
+                            tracing::info!(user = discord_user_id, lifetime, "access token refreshed");
+                        }
+                        Err(e) => {
+                            tracing::warn!(user = discord_user_id, error = ?e, "token refresh failed; retrying");
+                            // Wait out the retry window on the next loop.
+                            lifetime = TOKEN_REFRESH_RETRY_SECS + TOKEN_REFRESH_MARGIN_SECS;
                         }
                     }
-                    Err(e) => {
-                        tracing::warn!(user = discord_user_id, error = ?e, "token refresh failed");
-                        break;
-                    }
-                }
-                // spirc_rx is consumed on first call; subsequent reconnect loops pass None
-                // This is handled by the Option<> in run_with_token
-                // We need a fresh spirc_rx for each reconnect iteration — but since it was moved
-                // into the first call, subsequent calls get None. The spirc command listener
-                // from the first call dies when Spirc drops. This means pause/play commands
-                // won't work after reconnect. Acceptable for v1.
-                #[allow(unused_assignments)]
-                {
-                    // spirc_rx was moved into the first iteration; subsequent calls get None
-                    // The priority queue manager's spirc_cmd_tx will error on send, which is graceful
                 }
             }
-            let mut lock = active_session_for_task.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(s) = lock.as_ref() {
-                if s.discord_user_id == discord_user_id { *lock = None; }
+        });
+
+        let active_session_for_task = active_session.clone();
+        let spotify_name_clone = spotify_name.clone();
+        let handle = tokio::spawn({
+            let token_state = token_state.clone();
+            let refresh_now = refresh_now.clone();
+            async move {
+                tracing::info!(user = discord_user_id, "librespot OAuth session starting");
+                let mut spirc_rx = Some(spirc_rx);
+                let mut restarts: u32 = 0;
+                loop {
+                    let access_token = { token_state.lock().unwrap_or_else(|e| e.into_inner()).0.clone() };
+                    match SpotifyPlayer::run_with_token(
+                        &config, bridge.clone(), presence_tx.clone(), access_token,
+                        Some(eot_tx.clone()),
+                        spirc_rx.take(),
+                    ).await {
+                        Ok(()) => tracing::info!(user = discord_user_id, "librespot session ended cleanly"),
+                        Err(e) => tracing::warn!(user = discord_user_id, error = ?e, "librespot session ended with error"),
+                    }
+                    restarts += 1;
+                    if restarts >= MAX_SESSION_RESTARTS {
+                        tracing::warn!(user = discord_user_id, "librespot session gave up after repeated failures");
+                        break;
+                    }
+                    // Ask the refresher to rotate the token (in case the death was
+                    // an auth failure), then retry with whatever it publishes.
+                    refresh_now.notify_one();
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                }
+                // Clear the session only if it is still ours.
+                let mut lock = active_session_for_task.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(s) = lock.as_ref() {
+                    if s.discord_user_id == discord_user_id { *lock = None; }
+                }
             }
         });
 
         let mut lock = active_session.lock().unwrap_or_else(|e| e.into_inner());
+        let access_token_for_store = { token_state.lock().unwrap_or_else(|e| e.into_inner()).0.clone() };
         *lock = Some(ActiveSession {
             discord_user_id,
             spotify_name,
             discord_name,
             access_token: access_token_for_store,
             handle,
+            refresh_handle,
         });
         tracing::info!(user = discord_user_id, spotify = %spotify_name_clone, "librespot session spawned");
     }
@@ -1753,6 +1826,7 @@ impl Handler {
     ) -> String {
         match self.oauth.refresh_access_token(&existing.refresh_token).await {
             Ok(new_token) => {
+                let expires_in = new_token.expires_in;
                 let mut creds = existing.clone();
                 creds.active = true;
                 creds.access_token = new_token.access_token.clone();
@@ -1769,6 +1843,7 @@ impl Handler {
                     discord_username.to_string(),
                     new_token.access_token,
                     creds.refresh_token.clone(),
+                    expires_in,
                 )
                 .await;
                 tracing::info!(user = %user_id, spotify = %existing.spotify_username, "session reactivated");
@@ -1853,6 +1928,7 @@ impl Handler {
             discord_username.to_string(),
             token.access_token,
             creds.refresh_token.clone(),
+            token.expires_in,
         )
         .await;
         format!("Logged in as **{display_name}**! Spotify session started.")
@@ -1863,7 +1939,7 @@ impl Handler {
             let mut lock = self.active_session.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(session) = lock.as_ref() {
                 if session.discord_user_id == user_id_u64 {
-                    session.handle.abort();
+                    session.abort();
                     *lock = None;
                     tracing::info!(user = %user_id, "active librespot session aborted");
                 }
