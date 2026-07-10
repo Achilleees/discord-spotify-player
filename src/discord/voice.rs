@@ -42,7 +42,9 @@ pub struct SimpleBridgeReader {
     bridge: Arc<AudioBridge>,
     pos: u64,
     scratch: Vec<f32>,
+    #[allow(dead_code)]
     prebuffer_samples: usize,
+    #[allow(dead_code)]
     prebuffer_wait: std::time::Duration,
     prebuffer_done: bool,
 }

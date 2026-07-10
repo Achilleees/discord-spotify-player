@@ -860,7 +860,7 @@ dependencies = [
 
 [[package]]
 name = "discord-spotify-player"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "base64",
  "dialoguer",
@@ -881,10 +881,13 @@ dependencies = [
  "serenity",
  "songbird",
  "symphonia",
+ "thiserror 1.0.69",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
  "url",
+ "uuid",
  "vergen",
  "vergen-gitcl",
 ]
@@ -5094,6 +5097,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "pin-project-lite",
  "tokio",
 ]

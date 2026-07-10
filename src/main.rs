@@ -4,13 +4,16 @@ mod config;
 mod discord;
 mod oauth;
 mod presence;
+mod queue;
 mod setup;
 mod spotify;
 mod users;
+mod youtube;
 
 use audio_bridge::AudioBridge;
 use config::Config;
 use discord::DiscordBot;
+use discord::bot::{check_ytdlp_available, check_ffmpeg_available};
 use oauth::SpotifyOAuth;
 use presence::PresenceUpdate;
 use spotify::SpotifyPlayer;
@@ -65,6 +68,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     println!("Discord Spotify Player v{}", env!("CARGO_PKG_VERSION"));
     tracing::info!("configuration loaded");
 
+    // Check yt-dlp and ffmpeg availability
+    let ytdlp_ok = check_ytdlp_available();
+    let ffmpeg_ok = check_ffmpeg_available();
+    if !ytdlp_ok { tracing::warn!("yt-dlp not found in PATH — /play command disabled"); }
+    if !ffmpeg_ok { tracing::warn!("ffmpeg not found in PATH — /play command disabled"); }
+    let ytdlp_available = ytdlp_ok && ffmpeg_ok;
+    if ytdlp_available {
+        tracing::info!("yt-dlp and ffmpeg available — YouTube/file playback enabled");
+        // Ensure tmp directory exists
+        let _ = std::fs::create_dir_all("/tmp/spotibot-youtube");
+    }
+
     // Build OAuth handler if credentials are configured
     let oauth: Option<Arc<SpotifyOAuth>> = match (
         config.spotify_client_id.clone(),
@@ -116,6 +131,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         presence_tx.clone(),
         user_store.clone(),
         oauth.clone(),
+        ytdlp_available,
     )
     .await?;
 
@@ -148,7 +164,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
                 let token = match oauth_client.refresh_access_token(&user.refresh_token).await {
                     Ok(t) => {
-                        // Persist the refreshed token
                         let mut updated = user.clone();
                         updated.access_token = t.access_token.clone();
                         if let Some(rt) = t.refresh_token.clone() {
@@ -182,6 +197,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         bridge_for_task,
                         presence_tx_for_task,
                         token,
+                        None,
+                        None,
                     )
                     .await
                     {
@@ -199,9 +216,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         access_token: access_token_for_session,
                         handle,
                     });
-                } // lock dropped here
+                }
 
-                // Park main task — the bot runs indefinitely
                 std::future::pending::<()>().await;
             }
         } else {
