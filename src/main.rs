@@ -75,8 +75,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let ytdlp_available = ytdlp_ok && ffmpeg_ok;
     if ytdlp_available {
         tracing::info!("yt-dlp and ffmpeg available — YouTube/file playback enabled");
-        // Ensure tmp directory exists
-        let _ = std::fs::create_dir_all("/tmp/spotibot-youtube");
+        // Ensure the YouTube scratch dir exists
+        let _ = std::fs::create_dir_all(youtube::tmp_dir());
     }
 
     // OAuth (Authorization Code + PKCE) is the only session path since

@@ -1,15 +1,17 @@
 //! Token-blob encryption for the credential store.
 //!
-//! Blobs are self-describing: a leading version byte selects the scheme, so a
-//! store can move between plaintext and encrypted without a schema change and
-//! old rows keep decoding after a key is introduced.
+//! Blobs are self-describing: a leading version byte selects the scheme. The
+//! ciphertext is bound to its owner via AEAD associated data (the caller passes
+//! the row's `discord_user_id`), so a DB-write attacker can't swap one user's
+//! ciphertext into another's row. When a key is configured, plaintext blobs are
+//! rejected (no silent downgrade).
 
-use chacha20poly1305::aead::Aead;
+use chacha20poly1305::aead::{Aead, Payload};
 use chacha20poly1305::{KeyInit, XChaCha20Poly1305, XNonce};
 use sha2::{Digest, Sha256};
 
 const V_PLAIN: u8 = 0x00;
-const V_XCHACHA: u8 = 0x01;
+const V_XCHACHA_AAD: u8 = 0x02; // XChaCha20-Poly1305 with owner-bound AAD
 const NONCE_LEN: usize = 24;
 
 pub enum TokenCipher {
@@ -37,8 +39,8 @@ impl TokenCipher {
         matches!(self, TokenCipher::Encrypted(_))
     }
 
-    /// Seal plaintext into a versioned blob for storage.
-    pub fn seal(&self, plaintext: &[u8]) -> Vec<u8> {
+    /// Seal plaintext into a versioned blob, binding it to `aad` (the owner id).
+    pub fn seal(&self, plaintext: &[u8], aad: &[u8]) -> Vec<u8> {
         match self {
             TokenCipher::Plain => {
                 let mut out = Vec::with_capacity(1 + plaintext.len());
@@ -51,10 +53,10 @@ impl TokenCipher {
                 let nonce = XNonce::from_slice(&nonce_bytes);
                 // In-memory AEAD of a few hundred bytes does not fail.
                 let ct = cipher
-                    .encrypt(nonce, plaintext)
+                    .encrypt(nonce, Payload { msg: plaintext, aad })
                     .expect("xchacha20poly1305 encrypt");
                 let mut out = Vec::with_capacity(1 + NONCE_LEN + ct.len());
-                out.push(V_XCHACHA);
+                out.push(V_XCHACHA_AAD);
                 out.extend_from_slice(&nonce_bytes);
                 out.extend_from_slice(&ct);
                 out
@@ -62,13 +64,18 @@ impl TokenCipher {
         }
     }
 
-    /// Open a stored blob. Dispatches on the version byte, so plaintext rows
-    /// decode regardless of whether a key is configured. Returns None on a
-    /// truncated blob, a bad tag, or an encrypted row with no/ wrong key.
-    pub fn open(&self, blob: &[u8]) -> Option<Vec<u8>> {
+    /// Open a stored blob, verifying it was sealed for this `aad` (owner id).
+    /// Returns None on a truncated blob, a bad tag, an AAD mismatch, an
+    /// encrypted row with no/wrong key, or a plaintext row when a key IS set
+    /// (a downgrade attempt).
+    pub fn open(&self, blob: &[u8], aad: &[u8]) -> Option<Vec<u8>> {
         match blob.split_first() {
-            Some((&V_PLAIN, rest)) => Some(rest.to_vec()),
-            Some((&V_XCHACHA, rest)) => {
+            Some((&V_PLAIN, rest)) => match self {
+                // A plaintext row is only legitimate when no key is configured.
+                TokenCipher::Plain => Some(rest.to_vec()),
+                TokenCipher::Encrypted(_) => None,
+            },
+            Some((&V_XCHACHA_AAD, rest)) => {
                 let cipher = match self {
                     TokenCipher::Encrypted(c) => c,
                     TokenCipher::Plain => return None,
@@ -77,7 +84,9 @@ impl TokenCipher {
                     return None;
                 }
                 let (nonce_bytes, ct) = rest.split_at(NONCE_LEN);
-                cipher.decrypt(XNonce::from_slice(nonce_bytes), ct).ok()
+                cipher
+                    .decrypt(XNonce::from_slice(nonce_bytes), Payload { msg: ct, aad })
+                    .ok()
             }
             _ => None,
         }
@@ -88,42 +97,54 @@ impl TokenCipher {
 mod tests {
     use super::*;
 
+    const AAD: &[u8] = b"discord-user-123";
+
     #[test]
     fn plaintext_roundtrip() {
         let c = TokenCipher::new(None);
-        let blob = c.seal(b"hello tokens");
+        let blob = c.seal(b"hello tokens", AAD);
         assert_eq!(blob[0], V_PLAIN);
-        assert_eq!(c.open(&blob).as_deref(), Some(&b"hello tokens"[..]));
+        assert_eq!(c.open(&blob, AAD).as_deref(), Some(&b"hello tokens"[..]));
     }
 
     #[test]
     fn encrypted_roundtrip() {
         let c = TokenCipher::new(Some("a-long-random-key"));
-        let blob = c.seal(b"secret tokens");
-        assert_eq!(blob[0], V_XCHACHA);
-        assert_ne!(&blob[1..], b"secret tokens");
-        assert_eq!(c.open(&blob).as_deref(), Some(&b"secret tokens"[..]));
+        let blob = c.seal(b"secret tokens", AAD);
+        assert_eq!(blob[0], V_XCHACHA_AAD);
+        assert!(!blob.windows(6).any(|w| w == b"secret"));
+        assert_eq!(c.open(&blob, AAD).as_deref(), Some(&b"secret tokens"[..]));
     }
 
     #[test]
     fn encrypted_blob_needs_the_right_key() {
         let good = TokenCipher::new(Some("key-one"));
-        let blob = good.seal(b"secret");
+        let blob = good.seal(b"secret", AAD);
         let wrong = TokenCipher::new(Some("key-two"));
-        assert!(wrong.open(&blob).is_none());
+        assert!(wrong.open(&blob, AAD).is_none());
     }
 
     #[test]
-    fn encrypted_store_still_reads_legacy_plaintext_rows() {
-        // A row written before a key existed must survive key introduction.
-        let legacy = TokenCipher::new(None).seal(b"old tokens");
+    fn ciphertext_is_bound_to_its_owner() {
+        // A blob sealed for one user must not open under another's id — this is
+        // what stops a DB-write attacker row-swapping ciphertext between users.
+        let c = TokenCipher::new(Some("k"));
+        let blob = c.seal(b"secret", b"user-A");
+        assert!(c.open(&blob, b"user-B").is_none());
+        assert_eq!(c.open(&blob, b"user-A").as_deref(), Some(&b"secret"[..]));
+    }
+
+    #[test]
+    fn encrypted_store_rejects_plaintext_downgrade() {
+        // With a key set, a forged V_PLAIN row must not be accepted.
+        let plain_blob = TokenCipher::new(None).seal(b"forged", AAD);
         let with_key = TokenCipher::new(Some("new-key"));
-        assert_eq!(with_key.open(&legacy).as_deref(), Some(&b"old tokens"[..]));
+        assert!(with_key.open(&plain_blob, AAD).is_none());
     }
 
     #[test]
     fn nonce_is_random_per_seal() {
         let c = TokenCipher::new(Some("k"));
-        assert_ne!(c.seal(b"x"), c.seal(b"x"));
+        assert_ne!(c.seal(b"x", AAD), c.seal(b"x", AAD));
     }
 }

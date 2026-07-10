@@ -11,8 +11,6 @@ const SAMPLE_RATE: u64 = 44_100;
 const CHANNELS: u64 = 2;
 const READ_CHUNK_BYTES: usize = 8192;
 
-const TMP_DIR: &str = "/tmp/spotibot-youtube";
-
 #[derive(Debug)]
 pub enum FeederError {
     Cancelled,
@@ -33,18 +31,18 @@ impl std::fmt::Display for FeederError {
 }
 
 fn ensure_tmp_dir() -> std::io::Result<()> {
-    std::fs::create_dir_all(TMP_DIR)
+    std::fs::create_dir_all(crate::youtube::tmp_dir())
 }
 
 async fn download_youtube(url: &str, token: &CancellationToken) -> Result<std::path::PathBuf, FeederError> {
     ensure_tmp_dir().map_err(FeederError::Io)?;
     let id = Uuid::new_v4().to_string();
-    let output_template = format!("{}/yt-{}.%(ext)s", TMP_DIR, id);
+    let output_template = format!("{}/yt-{}.%(ext)s", crate::youtube::tmp_dir(), id);
 
-    let cookies_path = "/opt/openclaw/services/spotibot/youtube-cookies.txt";
+    let cookies_path = crate::youtube::cookies_path();
     let mut args = vec!["-f".to_string(), "bestaudio*".to_string(), "--no-playlist".to_string(), "--no-part".to_string(), "--remote-components".to_string(), "ejs:github".to_string(), "-o".to_string(), output_template.clone()];
-    if std::path::Path::new(cookies_path).exists() {
-        args.extend(["--cookies".to_string(), cookies_path.to_string()]);
+    if std::path::Path::new(&cookies_path).exists() {
+        args.extend(["--cookies".to_string(), cookies_path.clone()]);
     }
     // `--` terminates option parsing so a URL starting with `-` can't be read
     // as a yt-dlp flag.
@@ -76,7 +74,7 @@ async fn download_youtube(url: &str, token: &CancellationToken) -> Result<std::p
 async fn download_attachment(url: &str, ext: &str, token: &CancellationToken) -> Result<std::path::PathBuf, FeederError> {
     ensure_tmp_dir().map_err(FeederError::Io)?;
     let id = Uuid::new_v4().to_string();
-    let path = std::path::PathBuf::from(format!("{}/file-{}.{}", TMP_DIR, id, ext));
+    let path = std::path::PathBuf::from(format!("{}/file-{}.{}", crate::youtube::tmp_dir(), id, ext));
 
     let client = reqwest::Client::new();
     let download_fut = async {
@@ -98,7 +96,8 @@ async fn download_attachment(url: &str, ext: &str, token: &CancellationToken) ->
 }
 
 fn find_downloaded_file(prefix: &str) -> Result<std::path::PathBuf, FeederError> {
-    let dir = std::path::Path::new(TMP_DIR);
+    let tmp = crate::youtube::tmp_dir();
+    let dir = std::path::Path::new(&tmp);
     for entry in std::fs::read_dir(dir).map_err(FeederError::Io)? {
         let entry = entry.map_err(FeederError::Io)?;
         let name = entry.file_name();

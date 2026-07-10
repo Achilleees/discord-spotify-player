@@ -98,12 +98,12 @@ impl UserStore {
     ) -> Option<UserCredentials> {
         let blob = auth_blob?;
         // Distinguish a decrypt failure (wrong/rotated TOKEN_ENC_KEY, corrupt
-        // blob) from a genuinely absent row — otherwise it looks like the user
-        // was never logged in.
-        let plain = match self.cipher.open(&blob) {
+        // blob, AAD/owner mismatch) from a genuinely absent row — otherwise it
+        // looks like the user was never logged in.
+        let plain = match self.cipher.open(&blob, discord_user_id.as_bytes()) {
             Some(p) => p,
             None => {
-                tracing::warn!(user = %discord_user_id, "failed to decrypt stored credentials (wrong TOKEN_ENC_KEY or corrupt row)");
+                tracing::warn!(user = %discord_user_id, "failed to decrypt stored credentials (wrong TOKEN_ENC_KEY, corrupt, or owner mismatch)");
                 return None;
             }
         };
@@ -147,6 +147,7 @@ impl UserStore {
                 refresh_token: creds.refresh_token.clone(),
             })
             .expect("AuthBlob serializes"),
+            creds.discord_user_id.as_bytes(),
         );
         let conn = self.lock();
         conn.execute(

@@ -3,8 +3,16 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use tracing;
 
-const DJ_CLIPS_DIR: &str = "/opt/openclaw/services/spotibot/dj-clips";
-const DJ_CACHE_DIR: &str = "/opt/openclaw/services/spotibot/dj-cache";
+const DEFAULT_DJ_CLIPS_DIR: &str = "/opt/openclaw/services/spotibot/dj-clips";
+const DEFAULT_DJ_CACHE_DIR: &str = "/opt/openclaw/services/spotibot/dj-cache";
+
+/// DJ clip / cache directories, overridable via env (defaults are the VPS layout).
+fn dj_clips_dir() -> String {
+    std::env::var("DJ_CLIPS_DIR").unwrap_or_else(|_| DEFAULT_DJ_CLIPS_DIR.to_string())
+}
+fn dj_cache_dir() -> String {
+    std::env::var("DJ_CACHE_DIR").unwrap_or_else(|_| DEFAULT_DJ_CACHE_DIR.to_string())
+}
 const SAMPLE_RATE: u32 = 44_100;
 const CHANNELS: u32 = 2;
 
@@ -91,9 +99,10 @@ pub struct DJAnnouncer {
 
 impl DJAnnouncer {
     pub fn new() -> Self {
-        let _ = std::fs::create_dir_all(DJ_CACHE_DIR);
-        let greetings = load_clips_from_dir(&format!("{}/greetings", DJ_CLIPS_DIR));
-        let transitions = load_clips_from_dir(&format!("{}/transitions", DJ_CLIPS_DIR));
+        let clips_dir = dj_clips_dir();
+        let _ = std::fs::create_dir_all(dj_cache_dir());
+        let greetings = load_clips_from_dir(&format!("{}/greetings", clips_dir));
+        let transitions = load_clips_from_dir(&format!("{}/transitions", clips_dir));
 
         tracing::info!(
             greetings = greetings.len(),
@@ -147,7 +156,7 @@ impl DJAnnouncer {
 
         // Check cache first
         let hash = simple_hash(&text);
-        let mp3_path = format!("{}/dj-{:016x}.mp3", DJ_CACHE_DIR, hash);
+        let mp3_path = format!("{}/dj-{:016x}.mp3", dj_cache_dir(), hash);
 
         if !std::path::Path::new(&mp3_path).exists() {
             // Generate with Kokoro via Unix socket daemon (fast, model pre-loaded)
@@ -249,15 +258,20 @@ fn simple_hash(text: &str) -> u64 {
 }
 
 
-const KOKORO_SOCKET: &str = "/opt/openclaw/services/spotibot/kokoro.sock";
+#[cfg(unix)]
+const DEFAULT_KOKORO_SOCKET: &str = "/opt/openclaw/services/spotibot/kokoro.sock";
+
+/// Kokoro TTS unix-socket path, overridable via env (default is the VPS layout).
+#[cfg(unix)]
+fn kokoro_socket() -> String {
+    std::env::var("KOKORO_SOCKET").unwrap_or_else(|_| DEFAULT_KOKORO_SOCKET.to_string())
+}
 
 /// Kokoro TTS is reached over a Unix domain socket, which only exists on the
 /// Linux deployment. On other platforms DJ announcements are unavailable.
 #[cfg(not(unix))]
 async fn kokoro_socket_generate(_text: &str, _output_path: &str) -> Result<(), String> {
-    Err(format!(
-        "DJ announcements require the Kokoro unix socket ({KOKORO_SOCKET}), unavailable on this platform"
-    ))
+    Err("DJ announcements require the Kokoro unix socket, unavailable on this platform".to_string())
 }
 
 #[cfg(unix)]
@@ -268,7 +282,7 @@ async fn kokoro_socket_generate(text: &str, output_path: &str) -> Result<(), Str
     // Bound the whole exchange so a wedged Kokoro daemon can't freeze the
     // announcement (and, upstream, the queue) indefinitely.
     let exchange = async {
-        let mut stream = UnixStream::connect(KOKORO_SOCKET)
+        let mut stream = UnixStream::connect(kokoro_socket())
             .await
             .map_err(|e| format!("socket connect failed: {}", e))?;
 

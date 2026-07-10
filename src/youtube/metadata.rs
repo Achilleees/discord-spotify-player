@@ -58,10 +58,10 @@ struct YtDlpJson {
 
 /// Run `yt-dlp --dump-json <url>` and parse the result (metadata only, no download).
 pub async fn fetch_youtube_metadata(url: &str) -> Result<YoutubeMetadata, YoutubeError> {
-    let cookies_path = "/opt/openclaw/services/spotibot/youtube-cookies.txt";
+    let cookies_path = crate::youtube::cookies_path();
     let mut args = vec!["--dump-json", "--no-playlist", "--flat-playlist", "--remote-components", "ejs:github"];
-    if std::path::Path::new(cookies_path).exists() {
-        args.extend(["--cookies", cookies_path]);
+    if std::path::Path::new(&cookies_path).exists() {
+        args.extend(["--cookies", &cookies_path]);
     }
     // `--` terminates option parsing so a `-`-leading URL can't be a flag.
     args.push("--");
