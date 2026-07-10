@@ -280,7 +280,16 @@ fn simple_hash(text: &str) -> u64 {
 
 const KOKORO_SOCKET: &str = "/opt/openclaw/services/spotibot/kokoro.sock";
 
+/// Kokoro TTS is reached over a Unix domain socket, which only exists on the
+/// Linux deployment. On other platforms DJ announcements are unavailable.
+#[cfg(not(unix))]
+async fn kokoro_socket_generate(_text: &str, _output_path: &str) -> Result<(), String> {
+    Err(format!(
+        "DJ announcements require the Kokoro unix socket ({KOKORO_SOCKET}), unavailable on this platform"
+    ))
+}
 
+#[cfg(unix)]
 async fn kokoro_socket_generate(text: &str, output_path: &str) -> Result<(), String> {
     use tokio::net::UnixStream;
     use tokio::io::{AsyncWriteExt, AsyncReadExt};
