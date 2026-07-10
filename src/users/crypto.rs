@@ -8,11 +8,21 @@
 
 use chacha20poly1305::aead::{Aead, Payload};
 use chacha20poly1305::{KeyInit, XChaCha20Poly1305, XNonce};
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
 
 const V_PLAIN: u8 = 0x00;
 const V_XCHACHA_AAD: u8 = 0x02; // XChaCha20-Poly1305 with owner-bound AAD
 const NONCE_LEN: usize = 24;
+/// Fixed application salt + iteration count for stretching TOKEN_ENC_KEY. A
+/// fixed salt is fine here: the "password" is the operator's env key, and the
+/// stretch is what slows an offline brute-force of a weak key from a stolen DB.
+const KDF_SALT: &[u8] = b"discord-spotify-player:token-enc:v1";
+// OWASP-recommended count for PBKDF2-HMAC-SHA256; lowered under test so the
+// unoptimized debug build stays fast (the derivation logic is identical).
+#[cfg(not(test))]
+const KDF_ITERATIONS: u32 = 600_000;
+#[cfg(test)]
+const KDF_ITERATIONS: u32 = 1_000;
 
 pub enum TokenCipher {
     Plain,
@@ -26,9 +36,12 @@ impl TokenCipher {
     pub fn new(key: Option<&str>) -> Self {
         match key {
             Some(k) if !k.is_empty() => {
-                let digest = Sha256::digest(k.as_bytes());
-                let cipher = XChaCha20Poly1305::new_from_slice(&digest)
-                    .expect("sha256 digest is always 32 bytes");
+                // Stretch the key with PBKDF2-HMAC-SHA256 so a weak env key is
+                // costly to brute-force from a stolen DB.
+                let mut derived = [0u8; 32];
+                pbkdf2::pbkdf2_hmac::<Sha256>(k.as_bytes(), KDF_SALT, KDF_ITERATIONS, &mut derived);
+                let cipher = XChaCha20Poly1305::new_from_slice(&derived)
+                    .expect("derived key is always 32 bytes");
                 TokenCipher::Encrypted(Box::new(cipher))
             }
             _ => TokenCipher::Plain,

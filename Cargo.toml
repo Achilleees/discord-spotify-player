@@ -26,6 +26,7 @@ base64 = "0.22"
 url = "2"
 sha2 = "0.10"            # PKCE code challenge (already compiled via songbird/DAVE)
 chacha20poly1305 = "0.10"  # credential-at-rest encryption (already compiled via songbird/DAVE)
+pbkdf2 = "0.12"          # key stretching for TOKEN_ENC_KEY (already in tree)
 
 # Configuration
 dotenvy = "0.15"

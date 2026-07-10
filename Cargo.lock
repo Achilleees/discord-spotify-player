@@ -809,6 +809,7 @@ dependencies = [
  "librespot-metadata",
  "librespot-playback",
  "parking_lot 0.12.5",
+ "pbkdf2",
  "rand 0.10.0",
  "reqwest",
  "rusqlite",
