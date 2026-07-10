@@ -146,7 +146,9 @@ impl AudioBridge {
         // Mix overlay (DJ clips) on top of music with volume ducking
         {
             let mut overlay = self.overlay.lock();
-            let overlay_available = overlay.len().min(output.len());
+            // Even (stereo-frame) count, matching the main-buffer drains, so an
+            // odd-length mix can't leave the overlay mid-frame and swap L/R.
+            let overlay_available = (overlay.len().min(output.len())) & !1;
             if overlay_available > 0 {
                 // Duck music volume during overlay
                 let duck_vol: f32 = 1.0;

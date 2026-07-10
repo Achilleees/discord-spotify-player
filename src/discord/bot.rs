@@ -765,8 +765,6 @@ async fn run_presence_loop_with_track(
                 let dj_ref = dj.clone();
                 let bridge_ref = bridge.clone();
                 tokio::spawn(async move {
-                    let _ = std::fs::write("/opt/openclaw/services/spotibot/debug_reached.txt",
-                        format!("reached: {} - {}", dj_title, dj_artist));
                     match dj_ref.track_announce_clip(&dj_title, &dj_artist, "").await {
                         Some(clip) => {
                             tracing::info!(title = %dj_title, artist = %dj_artist, samples = clip.len(), "DJ overlay pushed");
@@ -901,6 +899,12 @@ impl EventHandler for Handler {
 
     async fn voice_state_update(&self, ctx: Context, _old: Option<VoiceState>, new: VoiceState) {
         if new.guild_id != Some(self.guild_id) {
+            return;
+        }
+        // Ignore our own join/leave events. The bot joining an empty channel
+        // (e.g. auto-start on boot) would otherwise fire the empty-channel
+        // teardown below and immediately kill the session it just started.
+        if new.user_id == ctx.cache.current_user().id {
             return;
         }
 
@@ -1312,6 +1316,9 @@ impl Handler {
         tracing::info!(spotify = %user.spotify_username, "auto-starting stored session");
         println!("Auto-starting Spotify session for {}...", user.spotify_username);
 
+        // A refresh failure at boot means the stored credentials are stale or
+        // revoked; retrying with the expired token would just burn reconnect
+        // attempts, so skip auto-start and wait for a fresh /login.
         let (access_token, refresh_token, expires_in) =
             match oauth.refresh_access_token(&user.refresh_token).await {
                 Ok(t) => {
@@ -1324,8 +1331,8 @@ impl Handler {
                     (t.access_token, updated.refresh_token, t.expires_in)
                 }
                 Err(e) => {
-                    tracing::warn!(error = ?e, "auto-start token refresh failed; using stored token");
-                    (user.access_token.clone(), user.refresh_token.clone(), 0)
+                    tracing::warn!(error = ?e, "auto-start token refresh failed; skipping auto-start");
+                    return;
                 }
             };
 
@@ -1533,10 +1540,20 @@ impl Handler {
                     refresh_now.notify_one();
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                 }
-                // Clear the session only if this exact spawn still owns the slot.
-                let mut lock = active_session_for_task.lock().unwrap_or_else(|e| e.into_inner());
-                if let Some(s) = lock.as_ref() {
-                    if s.generation == generation { *lock = None; }
+                // Give-up path: clear the slot only if this exact spawn still
+                // owns it, and abort its refresher — dropping the ActiveSession
+                // would only detach the refresh task, leaving it rotating the
+                // token forever and racing a future /login.
+                let owned = {
+                    let mut lock = active_session_for_task.lock().unwrap_or_else(|e| e.into_inner());
+                    match lock.as_ref() {
+                        Some(s) if s.generation == generation => lock.take(),
+                        _ => None,
+                    }
+                };
+                if let Some(session) = owned {
+                    session.abort();
+                    let _ = presence_tx.send(PresenceUpdate::Idle);
                 }
             }
         });
@@ -1842,8 +1859,11 @@ impl Handler {
             };
             match access_token {
                 Some(token) => {
-                    spotify_playback_command(&token, "POST", "next").await;
-                    "⏭ Skipped.".to_string()
+                    if spotify_playback_command(&token, "POST", "next").await {
+                        "⏭ Skipped.".to_string()
+                    } else {
+                        "⚠ Spotify didn't accept the skip — try again.".to_string()
+                    }
                 }
                 None => "Nothing is playing.".to_string()
             }
@@ -2093,6 +2113,24 @@ impl Handler {
         };
 
         if owned_live_session {
+            // Also tear down any priority (YouTube/file) playback, mirroring the
+            // empty-channel path — otherwise a queued track keeps playing and
+            // posts a history embed after logout.
+            {
+                let token = {
+                    let lock = self.feeder_cancel.lock().unwrap_or_else(|e: std::sync::PoisonError<_>| e.into_inner());
+                    lock.clone()
+                };
+                if let Some(t) = token { t.cancel(); }
+            }
+            {
+                let mut lock = self.priority_queue.lock().unwrap_or_else(|e| e.into_inner());
+                lock.clear();
+            }
+            {
+                let mut lock = self.active_priority_item.lock().unwrap_or_else(|e| e.into_inner());
+                *lock = None;
+            }
             let _ = self.presence_tx.send(PresenceUpdate::Idle);
             let ctx = {
                 let lock = self.ctx.lock().unwrap_or_else(|e| e.into_inner());

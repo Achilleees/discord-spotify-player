@@ -32,6 +32,25 @@ fn extract_track_id(uri: &SpotifyUri) -> String {
     uri.to_id().unwrap_or_default()
 }
 
+/// Aborts the wrapped task when dropped. Dropping a bare `JoinHandle` only
+/// detaches the task; this guard ensures the event loop dies with its session.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Await a command from an optional receiver; parks forever when there is no
+/// receiver, so it can sit in a `select!` without firing.
+async fn recv_cmd(rx: &mut Option<mpsc::UnboundedReceiver<SpircCommand>>) -> Option<SpircCommand> {
+    match rx {
+        Some(r) => r.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
 pub struct SpotifyPlayer;
 
 impl SpotifyPlayer {
@@ -216,13 +235,9 @@ impl SpotifyPlayer {
 
         let credentials = Credentials::with_access_token(access_token.clone());
 
-        let mut event_loop_handle: Option<tokio::task::JoinHandle<()>> = None;
         let mut spirc_cmd_rx = spirc_cmd_rx;
 
         loop {
-            if let Some(h) = event_loop_handle.take() {
-                h.abort();
-            }
             bridge.clear();
             let session = Self::create_session(&cache, &device_id);
             let connect_config = Self::connect_config(&device_name);
@@ -247,7 +262,10 @@ impl SpotifyPlayer {
             });
             let rx = player.get_player_event_channel();
 
-            event_loop_handle = Some(Self::spawn_event_loop(
+            // Event loop is guarded so it is aborted when this future is
+            // dropped (logout/takeover) or when the loop reconnects, rather
+            // than detaching and pushing into the shared bridge as a ghost.
+            let _event_guard = AbortOnDrop(Self::spawn_event_loop(
                 rx,
                 session.clone(),
                 bridge_for_events,
@@ -278,21 +296,27 @@ impl SpotifyPlayer {
             tracing::info!("spotify connect active (oauth)");
             let session_start = std::time::Instant::now();
 
-            // Spawn spirc_task independently so it can't be dropped by the cmd_rx loop
-            let spirc_task_handle = tokio::spawn(spirc_task);
-
-            // Process spirc commands (pause/play from priority queue manager)
-            if let Some(mut cmd_rx) = spirc_cmd_rx.take() {
-                while let Some(cmd) = cmd_rx.recv().await {
-                    match cmd {
-                        SpircCommand::Pause => { let _ = spirc.pause(); }
-                        SpircCommand::Play  => { let _ = spirc.play();  }
+            // Run the spirc task inline (pinned, not detached) so it is
+            // cancelled with this future, and so its completion — the signal
+            // that the Connect session died — actually breaks us out to the
+            // reconnect path instead of parking forever on cmd_rx.recv().
+            tokio::pin!(spirc_task);
+            let mut cmd_rx = spirc_cmd_rx.take();
+            loop {
+                tokio::select! {
+                    _ = &mut spirc_task => {
+                        tracing::info!("spirc task ended (session closed)");
+                        break;
+                    }
+                    maybe_cmd = recv_cmd(&mut cmd_rx) => {
+                        match maybe_cmd {
+                            Some(SpircCommand::Pause) => { let _ = spirc.pause(); }
+                            Some(SpircCommand::Play)  => { let _ = spirc.play();  }
+                            None => cmd_rx = None, // all senders dropped; poll the task only
+                        }
                     }
                 }
-                // cmd_rx closed — spirc_task continues running via handle
             }
-
-            let _ = spirc_task_handle.await;
 
             let _ = spirc.shutdown();
             drop(spirc);

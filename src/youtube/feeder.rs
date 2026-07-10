@@ -78,6 +78,9 @@ async fn download_attachment(url: &str, ext: &str, token: &CancellationToken) ->
     let client = reqwest::Client::new();
     let download_fut = async {
         let resp = client.get(url).send().await.map_err(|e| FeederError::DownloadFailed(e.to_string()))?;
+        // Reject 4xx/5xx up front so an error body isn't written and decoded as
+        // (empty) audio, which would look like a successfully played track.
+        let resp = resp.error_for_status().map_err(|e| FeederError::DownloadFailed(e.to_string()))?;
         let bytes = resp.bytes().await.map_err(|e| FeederError::DownloadFailed(e.to_string()))?;
         tokio::fs::write(&path, &bytes).await.map_err(FeederError::Io)?;
         Ok::<_, FeederError>(())

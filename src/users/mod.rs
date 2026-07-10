@@ -95,7 +95,16 @@ impl UserStore {
         is_active: bool,
     ) -> Option<UserCredentials> {
         let blob = auth_blob?;
-        let plain = self.cipher.open(&blob)?;
+        // Distinguish a decrypt failure (wrong/rotated TOKEN_ENC_KEY, corrupt
+        // blob) from a genuinely absent row — otherwise it looks like the user
+        // was never logged in.
+        let plain = match self.cipher.open(&blob) {
+            Some(p) => p,
+            None => {
+                tracing::warn!(user = %discord_user_id, "failed to decrypt stored credentials (wrong TOKEN_ENC_KEY or corrupt row)");
+                return None;
+            }
+        };
         let tokens: AuthBlob = serde_json::from_slice(&plain).ok()?;
         Some(UserCredentials {
             discord_user_id,

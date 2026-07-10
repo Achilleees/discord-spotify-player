@@ -143,8 +143,6 @@ impl DJAnnouncer {
         };
 
         tracing::info!(text = %text, "generating DJ track announcement");
-        // Debug: write to file so we can verify this code path runs
-        let _ = std::fs::write("/opt/openclaw/services/spotibot/debug_announce.txt", format!("{} | {} | {}", title, artist, text));
 
         // Check cache first
         let hash = simple_hash(&text);
