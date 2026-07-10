@@ -134,6 +134,10 @@ async fn feed_pcm_to_bridge(
         .ok_or_else(|| FeederError::ConvertFailed("no stdout".to_string()))?;
 
     let mut buf = vec![0u8; READ_CHUNK_BYTES];
+    // Holds the 1-3 trailing bytes left when a pipe read doesn't land on an
+    // f32 boundary, so they prefix the next read instead of being dropped
+    // (which would permanently shift every later sample and swap L/R).
+    let mut carry: Vec<u8> = Vec::with_capacity(4);
     let mut frames_sent: u64 = 0;
     let start = Instant::now();
 
@@ -166,16 +170,22 @@ async fn feed_pcm_to_bridge(
             break;
         }
 
-        // Convert bytes to f32 samples
-        let samples: Vec<f32> = buf[..n]
+        // Prepend any carried remainder, split into whole f32s, carry the tail.
+        let mut bytes = Vec::with_capacity(carry.len() + n);
+        bytes.extend_from_slice(&carry);
+        bytes.extend_from_slice(&buf[..n]);
+        let usable = bytes.len() - (bytes.len() % 4);
+        let samples: Vec<f32> = bytes[..usable]
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
+        carry.clear();
+        carry.extend_from_slice(&bytes[usable..]);
 
         bridge.push_samples(&samples);
 
         // Real-time pacing (mirrors DiscordSink)
-        let samples_in_chunk = (n / 4) as u64;
+        let samples_in_chunk = samples.len() as u64;
         let frames_in_chunk = samples_in_chunk / CHANNELS;
         frames_sent = frames_sent.saturating_add(frames_in_chunk);
 
