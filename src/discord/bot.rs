@@ -1388,6 +1388,22 @@ impl Handler {
                 }
                 Err(e) => {
                     tracing::warn!(error = ?e, "auto-start token refresh failed; skipping auto-start");
+                    // Dead stored token (revoked, or minted by the pre-v0.5
+                    // client-secret flow). Deactivate it so every boot stops
+                    // retrying, and say so in the text channel — a silent
+                    // skip looks like the bot lost Spotify support entirely.
+                    let _ = self.user_store.deactivate(&user.discord_user_id);
+                    let ctx = {
+                        let lock = self.ctx.lock().unwrap_or_else(|e| e.into_inner());
+                        lock.clone()
+                    };
+                    if let Some(ctx) = ctx {
+                        let msg = CreateMessage::new().content(format!(
+                            "⚠️ Couldn't restore **{}**'s Spotify session (stored credentials expired). Run `/login` to reconnect.",
+                            user.spotify_username
+                        ));
+                        let _ = self.text_channel_id.send_message(&ctx, msg).await;
+                    }
                     return;
                 }
             };
@@ -2041,6 +2057,12 @@ impl Handler {
         }
 
         // Fresh login: issue a PKCE challenge and the authorize URL.
+        self.issue_login_url(user_id_u64)
+    }
+
+    /// Issue a fresh PKCE challenge for this user and return the authorize-URL
+    /// instructions. Replaces any prior pending challenge for the same user.
+    fn issue_login_url(&self, user_id_u64: u64) -> String {
         let pkce = new_pkce();
         let url = self.oauth.auth_url(&pkce);
         {
@@ -2090,13 +2112,23 @@ impl Handler {
                 )
                 .await;
                 tracing::info!(user = %user_id, spotify = %existing.spotify_username, "session reactivated");
-                format!("Session (re)started for **{}**!", existing.spotify_username)
+                format!(
+                    "Session (re)started for **{}**! Pick **{}** in Spotify's device list to play.",
+                    existing.spotify_username, self.config.device_name
+                )
             }
             Err(e) => {
-                tracing::warn!(error = %e, "token refresh failed on reactivation");
+                tracing::warn!(error = %e, "token refresh failed on reactivation; issuing fresh authorize URL");
+                // The stored refresh token is dead — revoked, or minted by the
+                // pre-v0.5 client-secret flow, which PKCE can't refresh.
+                // Deactivate it so auto-start stops retrying it, and go
+                // straight to a fresh authorization instead of dead-ending
+                // the user into a /forget + /login round-trip.
+                let _ = self.user_store.deactivate(user_id);
                 format!(
-                    "Couldn't refresh your Spotify token for **{}**. Run `/forget` then `/login` to re-authorize.",
-                    existing.spotify_username
+                    "Your stored Spotify session for **{}** can't be refreshed — let's re-authorize.\n\n{}",
+                    existing.spotify_username,
+                    self.issue_login_url(user_id_u64)
                 )
             }
         }
@@ -2174,7 +2206,12 @@ impl Handler {
             token.expires_in,
         )
         .await;
-        format!("Logged in as **{display_name}**! Spotify session started.")
+        format!(
+            "Logged in as **{display_name}**! Spotify session started.\n\
+             Open Spotify on any device, tap the Connect (devices) icon, and pick \
+             **{}** — it appears from anywhere, no shared network needed.",
+            self.config.device_name
+        )
     }
 
     async fn handle_logout(&self, user_id: &str, user_id_u64: u64) -> String {
