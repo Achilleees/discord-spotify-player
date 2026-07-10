@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use tracing;
 
-const DEFAULT_DJ_CLIPS_DIR: &str = "/opt/openclaw/services/spotibot/dj-clips";
-const DEFAULT_DJ_CACHE_DIR: &str = "/opt/openclaw/services/spotibot/dj-cache";
+const DEFAULT_DJ_CLIPS_DIR: &str = "/var/lib/spotibot/dj-clips";
+const DEFAULT_DJ_CACHE_DIR: &str = "/var/lib/spotibot/dj-cache";
 
 /// DJ clip / cache directories, overridable via env (defaults are the VPS layout).
 fn dj_clips_dir() -> String {
@@ -259,7 +259,7 @@ fn simple_hash(text: &str) -> u64 {
 
 
 #[cfg(unix)]
-const DEFAULT_KOKORO_SOCKET: &str = "/opt/openclaw/services/spotibot/kokoro.sock";
+const DEFAULT_KOKORO_SOCKET: &str = "/var/lib/spotibot/kokoro.sock";
 
 /// Kokoro TTS unix-socket path, overridable via env (default is the VPS layout).
 #[cfg(unix)]

@@ -89,7 +89,7 @@ nob-music's internal modules are laid out in nob's `ARCHITECTURE.md`. The mappin
 - **Stereo frame alignment.** The ring buffer must drop/drain on even (L/R)
   boundaries or the channels swap permanently. Tested in `audio_bridge`.
 - **Kokoro transport mismatch.** spotibot's `dj.rs` talks to Kokoro over a Unix
-  domain socket (`/opt/openclaw/.../kokoro.sock`), cfg-gated to Linux. nob's
+  domain socket (`/var/lib/spotibot/kokoro.sock`), cfg-gated to Linux. nob's
   design doc says HTTP REST on `:8880`. Pick one at port time and update nob's
   TASKS — they currently disagree.
 

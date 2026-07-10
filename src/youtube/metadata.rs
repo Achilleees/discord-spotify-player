@@ -15,7 +15,7 @@ pub struct YoutubeMetadata {
 pub enum YoutubeError {
     #[error("Couldn't find a video at that URL.")]
     NotFound,
-    #[error("This video is age-restricted and can't be played.")]
+    #[error("This video is age-restricted — the bot needs YouTube login cookies to play it (admin: set YOUTUBE_COOKIES).")]
     AgeRestricted,
     #[error("This video is unavailable.")]
     Unavailable,
@@ -52,8 +52,6 @@ struct YtDlpJson {
     webpage_url: Option<String>,
     #[serde(default)]
     is_live: Option<bool>,
-    #[serde(default)]
-    age_limit: Option<u32>,
 }
 
 /// Run `yt-dlp --dump-json <url>` and parse the result (metadata only, no download).
@@ -112,9 +110,10 @@ pub async fn fetch_youtube_metadata(url: &str) -> Result<YoutubeMetadata, Youtub
         return Err(YoutubeError::TooLong(max / 60));
     }
 
-    if raw.age_limit.unwrap_or(0) >= 18 {
-        return Err(YoutubeError::AgeRestricted);
-    }
+    // No age_limit check here: getting metadata JSON for an age-gated video
+    // already required authenticated (cookie) access — the anonymous case
+    // fails earlier via stderr. Rejecting on age_limit would block exactly
+    // the videos that configured cookies unlock.
 
     let channel = raw.channel
         .or(raw.uploader)

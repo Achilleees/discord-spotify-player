@@ -2,7 +2,7 @@ pub mod metadata;
 pub mod feeder;
 
 const DEFAULT_TMP_DIR: &str = "/tmp/spotibot-youtube";
-const DEFAULT_COOKIES: &str = "/opt/openclaw/services/spotibot/youtube-cookies.txt";
+const DEFAULT_COOKIES: &str = "/var/lib/spotibot/youtube-cookies.txt";
 
 /// Scratch dir for downloaded audio, overridable via env (default is the VPS layout).
 pub fn tmp_dir() -> String {

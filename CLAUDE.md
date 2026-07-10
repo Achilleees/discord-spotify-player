@@ -37,7 +37,9 @@ target/release/discord-spotify-player.exe --setup  # first-run wizard
 `DISCORD_CHANNEL_ID`, `SPOTIFY_CLIENT_ID`. Recommended: `TOKEN_ENC_KEY`
 (encrypts stored tokens), `TEXT_CHANNEL_ID`. Optional: `AUDIO_BUFFER_SECONDS`,
 `PREBUFFER_SECONDS`, `PREAMP_DB`, `BASS_BOOST_DB`, `TREBLE_BOOST_DB`,
-`DEVICE_NAME`, `DEVICE_ID`, `SPOTIBOT_DB`, `RUST_LOG`.
+`DEVICE_NAME`, `DEVICE_ID`, `SPOTIBOT_DB`, `RUST_LOG`, `YOUTUBE_COOKIES`,
+`YOUTUBE_TMP_DIR`, `DJ_CLIPS_DIR`, `DJ_CACHE_DIR`, `KOKORO_SOCKET` (path
+defaults target the VPS layout under `/var/lib/spotibot`).
 
 `--setup` runs the wizard; otherwise the app loads `.env` and errors if
 `SPOTIFY_CLIENT_ID` is missing (OAuth is the only session path).
