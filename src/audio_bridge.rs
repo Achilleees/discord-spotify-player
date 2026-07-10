@@ -118,8 +118,7 @@ impl AudioBridge {
             );
         }
 
-        // Copy via VecDeque's two contiguous slices, then drain.
-        // Avoids per-element pop_front and temporary Vec allocation.
+        // Copy out of the deque's two contiguous slices, then drain.
         {
             let (head, tail) = buffer.as_slices();
             if available <= head.len() {

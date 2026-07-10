@@ -1,96 +1,91 @@
-# Discord Spotify Player
+# Discord Spotify Player (spotibot)
 
-A personal Discord bot that makes your Spotify session available in a voice channel. It shows up in Spotify as a normal Spotify Connect device and plays whatever you pick in the Discord call so everyone can hear it.
+A personal Discord music bot. It runs a Spotify Connect device and streams its
+audio into a voice channel, and also plays YouTube/SoundCloud and uploaded
+files through the same pipeline. Per-user Spotify login happens from Discord;
+playback is controlled from Spotify clients or from buttons in Discord.
 
-## Stack (high-level)
-- Discord bot + voice: `serenity` and `songbird`.
-- Spotify Connect device + playback: `librespot`.
-- Runtime + logging: `tokio` and `tracing`.
+> This repo is the hardened reference for the music stack of
+> [never-off-beat](../never-off-beat) (nob). See `PORT.md`.
+
+## Stack
+
+- Discord gateway + voice: `serenity` 0.12, `songbird` 0.6 (native DAVE).
+- Spotify Connect + playback: `librespot` 0.8 (core/connect/playback/metadata).
+- YouTube/SoundCloud/files: `yt-dlp` + `ffmpeg` (external binaries).
+- Storage: SQLite (`rusqlite`, bundled). Runtime: `tokio`. Logs: `tracing`.
 
 ## What it does
-- Creates a Spotify Connect device with a friendly name.
-- Streams Spotify playback into a specific Discord voice channel.
-- Lets you control playback from any Spotify client (desktop, mobile, web).
-- Keeps a local Spotify Connect session so pairing is quick after the first time.
-- Uses a stable device ID to avoid duplicate devices in the Spotify list.
 
-## Current scope and limitations
-- Runs locally on your machine (there is no hosted service).
-- Connects one Discord bot to one server and one voice channel at a time.
-- No UI yet; configuration is via the CLI setup wizard or `.env`.
+- Per-user Spotify OAuth login via the `/login` slash command (Authorization
+  Code + PKCE — no client secret).
+- Streams the logged-in user's Spotify playback into one voice channel; the bot
+  follows the user into their channel.
+- A now-playing text channel: rich embeds with album art, plus prev/pause/next
+  buttons and a queue view.
+- `/queue`, `/play` (YouTube/SoundCloud/file), `/skip`, `/stop`, `/np`.
+- Optional DJ track announcements via a Kokoro TTS backend.
+- Auto-starts the last active user's session on boot; auto-leaves and
+  deactivates when the voice channel empties.
 
-## Roadmap
+## Slash commands
 
-Planned features (in progress):
+| Command | What it does | Needs voice channel |
+|---|---|---|
+| `/login [code]` | Start/re-activate a Spotify session; paste the redirect URL to finish first-time auth | to take over another user's session |
+| `/logout` | Stop and deactivate your session (credentials kept) | no |
+| `/forget` | Delete your stored credentials | no |
+| `/who` | Show the active DJ | no |
+| `/queue <url>` | Add a Spotify track to the queue | yes |
+| `/play <url>` | Queue a YouTube/SoundCloud/file track | yes |
+| `/skip` `/stop` | Skip / stop playback | yes |
+| `/np` | Now playing | no |
 
-| Feature | Branch | Status |
-|---------|--------|--------|
-| **Now Playing Channel** | `feat/now-playing-channel` | Planned |
-| **Setup Wizard** | `feat/setup-wizard` | Merged |
-| **YouTube Support** | `feat/youtube-support` | Planned |
+Playback control (buttons, `/queue`, `/play`, `/skip`, `/stop`) requires sharing
+the bot's voice channel.
 
-### Now Playing Channel
-A dedicated text channel that displays the current track with a rich embed (album art, track info, Spotify link). Includes sticky playback controls (play/pause/skip buttons) so you can control Spotify without switching apps.
+## Requirements
 
-### Setup Wizard
-Interactive first-run CLI that guides new users through configuration. Paste your Discord token, and it fetches your servers and channels automatically - no more manually copying IDs.
+- Spotify Premium (required for Spotify Connect playback).
+- A Discord bot with the `GUILD_MEMBERS` intent, and permission to join/speak in
+  a voice channel and to send/delete messages in the text channel.
+- A Spotify app (client id) with redirect URI `http://127.0.0.1:8766/callback`.
+- `yt-dlp` and `ffmpeg` on `PATH` for `/play` (optional; Spotify works without).
 
-### YouTube Support
-Play YouTube links or search YouTube directly from Discord. Audio routes through the same voice channel alongside Spotify.
+## Setup
 
-## What it does not do (yet)
-- No library browsing or search inside Discord (YouTube search planned).
-- No recording, downloads, or file storage of audio.
-- No multi-channel or multi-server routing.
+1. `cargo build --release`
+2. First run: `target/release/discord-spotify-player.exe --setup` (writes `.env`).
+3. Add `SPOTIFY_CLIENT_ID` and `TOKEN_ENC_KEY` to `.env` (see `.env.example`).
+4. Start: `target/release/discord-spotify-player.exe`
+5. In Discord, run `/login` and follow the link, then paste the redirect URL
+   back with `/login code:<url>`.
 
-## Requirements and expectations
-- Spotify Premium account (required for Spotify Connect playback).
-- A Discord bot account with permission to join and speak in a voice channel.
-- The machine running the bot should be on the same network as the Spotify client for discovery to be reliable.
+## Configuration
 
-## Configuration model (single server/channel)
-- Each user runs their own copy of the app and uses their own Discord bot token.
-- The bot joins only the server and channel specified by `DISCORD_GUILD_ID` and `DISCORD_CHANNEL_ID`.
-- To target a different server/channel, update those IDs and restart the app.
+See `.env.example`. Required: `DISCORD_TOKEN`, `DISCORD_GUILD_ID`,
+`DISCORD_CHANNEL_ID`, `SPOTIFY_CLIENT_ID`. Recommended: `TOKEN_ENC_KEY` (encrypts
+stored tokens at rest), `TEXT_CHANNEL_ID` (now-playing channel; defaults to the
+voice channel's text chat). Optional tuning: `AUDIO_BUFFER_SECONDS`,
+`PREBUFFER_SECONDS`, `PREAMP_DB`, `BASS_BOOST_DB`, `TREBLE_BOOST_DB`,
+`DEVICE_NAME`, `DEVICE_ID`, `RUST_LOG`, `SPOTIBOT_DB`.
 
-## Setup for your own server
-1. Create a Discord application and bot at the Discord Developer Portal.
-2. Build the app: `cargo build --release`
-3. Run the setup wizard once: `target\\release\\discord-spotify-player.exe --setup`
-4. Follow prompts to paste your token, choose a server, and choose a voice channel.
-5. Start normally: `target\\release\\discord-spotify-player.exe`
-6. Open Spotify on a device on the same network and select the new device in the Spotify Connect list.
+## Logging
 
-**Note:** The bot routes audio to exactly one voice channel (the one in `DISCORD_CHANNEL_ID`). To use a different server/channel, change those IDs and restart.
-
-## Compliance
-- Not affiliated with Spotify or Discord.
-- Intended for personal, non-commercial use; you are responsible for complying with Spotify's terms and applicable laws.
-- Avoid using Spotify logos or implying endorsement in your own distributions.
+`RUST_LOG` accepts a preset (`trace|debug|info|warn|error`, app-centric — keeps
+dependency logs quiet) or a raw `EnvFilter` string. Default is `warn`. Audio
+pipeline stats emit at `debug` on the `audio_stream` target every 5s.
 
 ## Privacy and data
-- Spotify Connect credentials are cached locally in `.spotify_cache/credentials.json` after pairing.
-- Environment variables live in `.env`; treat that file as sensitive.
-- Logs are written locally only.
 
-## Configuration inputs (high-level)
-- Discord token and IDs for the target server and voice channel.
-- A device name shown inside Spotify (default: `Discord Player`).
-- Optional stable device ID to keep the device list clean.
-- Audio buffer size (`AUDIO_BUFFER_SECONDS`, default 8) and prebuffer time (`PREBUFFER_SECONDS`, default 2.0).
-- Optional EQ: `PREAMP_DB`, `BASS_BOOST_DB`, `TREBLE_BOOST_DB` (all default 0.0).
-- Logging level via `RUST_LOG` (default `warn`). Simple values (`trace`, `debug`, `info`, `warn`, `error`) use app-centric presets that keep dependency logs quiet. Custom `RUST_LOG` filter strings are also accepted.
+- Per-user OAuth tokens are stored in a local SQLite DB (`spotibot.db`),
+  encrypted at rest when `TOKEN_ENC_KEY` is set. The DB and `.env` are local-only
+  and gitignored.
+- Not affiliated with Spotify or Discord. Personal, non-commercial use; you are
+  responsible for complying with Spotify's terms.
 
-## Logging and troubleshooting
-- By default logs stay at `warn` for all crates, so output is minimal.
-- Set `RUST_LOG=debug` for more detail or `RUST_LOG=trace` for full diagnostics. These still only increase verbosity for this app, not dependencies.
-- For full control pass a custom filter: `RUST_LOG="debug,librespot=info"`.
-- Audio pipeline stats are emitted at `debug` level every 5 seconds on the `audio_stream` target.
+## Development
 
-## Further reading
-- `docs/components.md` for a component overview.
-
-## Typical experience
-- You start the bot and it appears in the Spotify device list.
-- Selecting it redirects playback to the Discord voice channel.
-- Everyone in the call hears the Spotify audio.
+`cargo check` for fast feedback, `cargo test` (48 unit tests), `cargo clippy`.
+`.cargo/config.toml` carries a cmake fix required by native deps; the MSVC
+toolchain is required on Windows.

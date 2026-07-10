@@ -201,7 +201,7 @@ impl Sink for DiscordSink {
 
                 if self.dsp_enabled {
                     let gain = self.preamp_gain;
-                    // Process stereo frames (L/R pairs) to avoid per-sample branch.
+                    // Process in L/R frame pairs.
                     let frame_count = n / 2;
                     for i in 0..frame_count {
                         let li = i * 2;
@@ -214,7 +214,8 @@ impl Sink for DiscordSink {
                         self.scratch[li] = l.clamp(-1.0, 1.0);
                         self.scratch[li + 1] = r.clamp(-1.0, 1.0);
                     }
-                    // Handle trailing sample if odd count (shouldn't happen with stereo).
+                    // The decoder emits stereo, so n is even here.
+                    debug_assert!(n % 2 == 0, "expected interleaved stereo samples");
                     if n % 2 != 0 {
                         self.scratch[n - 1] = (samples[n - 1] as f32 * gain).clamp(-1.0, 1.0);
                     }
@@ -226,7 +227,8 @@ impl Sink for DiscordSink {
 
                 self.bridge.push_samples(&self.scratch[..n]);
 
-                // Pace Spotify decode to real-time to avoid rapid skipping.
+                // Pace the decode to real time: sleep/spin until this frame's
+                // playout deadline before returning to librespot.
                 let frames_out = (n / NUM_CHANNELS as usize) as u64;
                 let start = *self.start_instant.get_or_insert_with(|| {
                     self.frames_sent = 0;

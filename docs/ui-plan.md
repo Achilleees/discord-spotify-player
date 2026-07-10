@@ -1,11 +1,14 @@
 # Backburner UI Plan
 
-This is a future plan for a tray UI and first-run wizard. It is not implemented yet.
+A future desktop tray UI. The first-run setup wizard part is already
+implemented (`src/setup.rs`); only the tray window below remains hypothetical —
+and since spotibot is being folded into nob (VPS-deployed, controlled from
+Discord), a desktop UI is unlikely to ship. Kept as a design note.
 
 ## Goals
 - Provide a tray icon that toggles a small window while the app runs.
 - Expose real-time EQ controls (preamp, bass, treble) without restarting.
-- Guide first-time users through Discord bot setup and configuration.
+- ~~Guide first-time users through Discord bot setup~~ (done: `--setup` wizard).
 
 ## Hosting Model
 - Local per-user hosting only.
@@ -34,5 +37,6 @@ This is a future plan for a tray UI and first-run wizard. It is not implemented 
 - UI and runtime communicate via channels.
 
 ## Docs Updates (When Implemented)
-- README: add UI usage section and first-run instructions.
-- .env.example: add optional DISCORD_CLIENT_ID for invite URL generation.
+- README: add UI usage section.
+- Note: no `DISCORD_CLIENT_ID` env var is needed — the wizard derives the app id
+  via `http.get_current_application_info()`.

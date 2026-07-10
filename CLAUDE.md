@@ -1,95 +1,94 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with this repository.
+Guidance for Claude Code when working in this repository.
 
 ## What This Is
 
-A Rust application that creates a Spotify Connect device and streams its audio into a Discord voice channel. No text commands are required; control happens from Spotify clients. It runs locally with one bot per server/channel.
+A Rust Discord music bot (v0.5). It runs a per-user Spotify Connect session
+(librespot + OAuth PKCE) and also plays YouTube/SoundCloud/uploaded files, all
+streamed into one Discord voice channel. Control happens from Spotify clients,
+from Discord slash commands (`/login`, `/queue`, `/play`, `/skip`, `/stop`,
+`/who`, `/np`, `/announce`, `/logout`, `/forget`), and from now-playing buttons.
+
+This repo is the hardened reference for the music stack of `never-off-beat`
+(nob). **Read `PORT.md`** before large changes — it maps modules to nob and
+records the design decisions.
 
 ## Build and Run
 
-```bash
+```
 cargo build --release
-target/release/discord-spotify-player.exe
+target/release/discord-spotify-player.exe          # normal
+target/release/discord-spotify-player.exe --setup  # first-run wizard
 ```
 
-For first-time setup (or to reconfigure), run:
+`cargo check` for fast feedback, `cargo test` (48 unit tests), `cargo clippy`.
 
-```bash
-target/release/discord-spotify-player.exe --setup
-```
-
-Use `cargo check` for fast compile-error feedback without a full build. There are no tests yet.
-
-### Build Prerequisites
-
-- MSVC toolchain (Visual Studio C++ build tools), required by native deps (opus, cmake)
-- `.cargo/config.toml` sets `CMAKE_POLICY_VERSION_MINIMUM=3.5` to fix cmake builds
-- `vergen = "=9.0.6"` and `vergen-gitcl = "=1.0.5"` are pinned in build-dependencies to work around a librespot version conflict ([upstream issue](https://github.com/librespot-org/librespot/issues/1681))
+### Prerequisites
+- MSVC toolchain (native deps: opus, cmake). `.cargo/config.toml` (tracked)
+  sets `CMAKE_POLICY_VERSION_MINIMUM=3.5`.
+- `vergen = "=9.0.6"` / `vergen-gitcl = "=1.0.5"` pinned in build-deps
+  (librespot#1681).
+- `yt-dlp` + `ffmpeg` on `PATH` for `/play` (optional).
 
 ## Configuration
 
-Config is loaded from `.env` (see `.env.example`). Required keys are `DISCORD_TOKEN`, `DISCORD_GUILD_ID`, and `DISCORD_CHANNEL_ID`.
+`.env` (see `.env.example`). Required: `DISCORD_TOKEN`, `DISCORD_GUILD_ID`,
+`DISCORD_CHANNEL_ID`, `SPOTIFY_CLIENT_ID`. Recommended: `TOKEN_ENC_KEY`
+(encrypts stored tokens), `TEXT_CHANNEL_ID`. Optional: `AUDIO_BUFFER_SECONDS`,
+`PREBUFFER_SECONDS`, `PREAMP_DB`, `BASS_BOOST_DB`, `TREBLE_BOOST_DB`,
+`DEVICE_NAME`, `DEVICE_ID`, `SPOTIBOT_DB`, `RUST_LOG`.
 
-Startup behavior:
-- `--setup` runs the interactive setup wizard
-- without `--setup`, the app tries `.env` first
-- if `.env` is missing/invalid, setup wizard is launched automatically
+`--setup` runs the wizard; otherwise the app loads `.env` and errors if
+`SPOTIFY_CLIENT_ID` is missing (OAuth is the only session path).
 
-Logging is controlled by `RUST_LOG`:
-- simple values (`trace`, `debug`, `info`, `warn`, `error`) use app-centric presets (this crate at that level, dependencies at `warn`)
-- any other value is treated as a raw `EnvFilter` string
-- default (no `RUST_LOG`) is `warn` for all crates, so only `println!` app messages appear
+`RUST_LOG`: a preset (`trace|debug|info|warn|error`, app-centric) or a raw
+`EnvFilter`. Default `warn`.
 
 ## Architecture
 
-### Audio Pipeline (core data flow)
-
+### Audio pipeline
 ```
-Spotify (librespot decode) -> DiscordSink -> AudioBridge -> SimpleBridgeReader -> Songbird -> Discord voice
+Spotify / YouTube / files / DJ ─> AudioBridge ─> SimpleBridgeReader ─> Songbird ─> Discord
 ```
+- **DiscordSink** (`src/spotify/sink.rs`): librespot backend; DSP + real-time
+  pacing; pushes into the bridge. Hot path.
+- **AudioBridge** (`src/audio_bridge.rs`): `VecDeque<f32>` ring buffer, 44.1 kHz
+  stereo; drains/drops on even stereo frames.
+- **SimpleBridgeReader** (`src/discord/voice.rs`): Songbird source; prebuffers
+  per `PREBUFFER_SECONDS`.
+- Priority: DJ overlay > queue (YT/SC/files) > Spotify Connect baseline
+  (`src/queue.rs` + the priority-queue manager in `bot.rs`).
 
-- **DiscordSink** (`src/spotify/sink.rs`): librespot audio backend. Receives decoded f64 samples, converts to f32, applies optional DSP (preamp + biquad EQ in frame-based stereo pairs), paces output to real-time, and pushes into the bridge. This is the hot audio path; avoid allocations and heavy work.
-- **AudioBridge** (`src/audio_bridge.rs`): lock-based `VecDeque<f32>` ring buffer shared between producer (Spotify) and consumer (Discord). Drops samples when full. Uses bulk `as_slices()` copy on the consumer side. Audio stays at 44.1kHz stereo; Songbird handles resampling to 48kHz.
-- **SimpleBridgeReader** (`src/discord/voice.rs`): implements `Read + Seek + MediaSource` for Songbird. Pulls from the bridge, does prebuffering on first read, and sleeps when empty to pace Songbird.
+### Startup (`src/main.rs`)
+1. Init logging from `RUST_LOG`.
+2. Load config (or run wizard); build the OAuth client (requires
+   `SPOTIFY_CLIENT_ID`).
+3. Open the SQLite credential store (`spotibot.db`).
+4. Create `AudioBridge`; start the Discord bot; wait for ready.
+5. `ready()` (first time only) cleans stale controls and auto-starts the stored
+   active user's session; `main` then parks. New sessions start via `/login`.
 
-### Startup Sequence (`src/main.rs`)
+### Sessions (`src/discord/bot.rs`, `src/spotify/player.rs`)
+- `spawn_session` joins voice, posts controls, starts the priority-queue
+  manager, spawns the librespot task (`run_with_token`) and a proactive
+  token-refresher (single owner of the refresh cycle). One active DJ; takeover
+  requires being in the bot's voice channel.
 
-1. Initialize logging from `RUST_LOG`
-2. Load config from `.env`, or run setup wizard (`--setup` or missing/invalid config)
-3. Create `AudioBridge`
-4. Start Discord bot, join target voice channel, and wait for ready signal
-5. Run Spotify Connect discovery loop (blocks forever, reconnects on disconnect)
+### OAuth + storage
+- `src/oauth/mod.rs`: Authorization Code + PKCE, paste-back parsing, refresh.
+- `src/users/mod.rs` + `crypto.rs`: SQLite `spotify_credentials`, encrypted
+  `auth_blob` (XChaCha20-Poly1305).
 
-### Spotify Connect Session (`src/spotify/player.rs`)
+### Presence (`src/presence.rs`, `src/discord/presence.rs`)
+- Player events → `PresenceUpdate` (carries `track_id` + `access_token`) →
+  `run_presence_loop_with_track` → bot status + now-playing embeds.
 
-`SpotifyPlayer::run_discovery` is the main loop. It:
-- announces a Spotify Connect device via mDNS discovery
-- accepts credentials (from discovery or cache)
-- creates librespot `Session`, `Player`, and `Spirc` (Spotify Connect controller)
-- monitors `PlayerEvent`s to update Discord presence and clear audio buffer on pause/stop
-- auto-reconnects with exponential backoff (up to `MAX_CACHED_RECONNECTS`)
+## Key crate versions
+- serenity 0.12, songbird 0.6 (native DAVE — not the git fork).
+- librespot 0.8 (core/connect/playback/metadata; discovery removed).
+- rusqlite 0.32 (bundled), sha2 + chacha20poly1305 (free via songbird's DAVE).
 
-Device ID is resolved from `DEVICE_ID` env var -> cached file -> random generation to keep the Spotify device list clean.
-
-### Discord Presence (`src/presence.rs`, `src/discord/presence.rs`)
-
-`PresenceUpdate` flows from Spotify player events -> mpsc channel -> `run_presence_loop`. The bot custom status shows the current track or idle/paused state.
-
-## Key Crate Versions
-
-- `librespot 0.8` (includes keepalive fix for stable connections)
-- `serenity 0.12` + `songbird 0.5` (Discord gateway and voice)
-- audio format: 44.1kHz stereo f32 through the pipeline
-
-## Safety and Secrets
-
-- Never print or commit values from `.env` or `.spotify_cache/`
-- `.spotify_cache/credentials.json` contains Spotify auth tokens and must stay local-only
-- Prefer documenting settings in `.env.example`
-
-## Roadmap Branches
-
-- `feat/now-playing-channel`: planned, rich embeds and playback control buttons in a text channel
-- `feat/setup-wizard`: complete on branch, adds interactive CLI first-run config
-- `feat/youtube-support`: planned, YouTube audio via `yt-dlp` alongside Spotify
+## Safety and secrets
+- Never print or commit `.env`, `spotibot.db*`, `.user_creds*`, `.spotify_cache/`
+  (all gitignored). No user-specific identifiers in code or docs.

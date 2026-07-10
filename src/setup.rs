@@ -324,6 +324,17 @@ DISCORD_CHANNEL_ID={channel_id}
 # Device name shown in Spotify Connect
 DEVICE_NAME={device_name}
 
+# Spotify app client id (required for /login). Redirect URI:
+# http://127.0.0.1:8766/callback. PKCE flow — no client secret needed.
+# SPOTIFY_CLIENT_ID=
+
+# Encryption key for stored OAuth tokens (any long random string).
+# Unset = tokens stored unencrypted (startup warning).
+# TOKEN_ENC_KEY=
+
+# Optional: text channel for now-playing embeds (defaults to the voice channel)
+# TEXT_CHANNEL_ID=
+
 # Optional: stable device id to avoid duplicate devices (auto-generated if omitted)
 # DEVICE_ID=
 
@@ -333,7 +344,7 @@ DEVICE_NAME={device_name}
 # Prebuffer time before audio starts in seconds (0.0-8.0, default: 2.0)
 # PREBUFFER_SECONDS=2.0
 
-# Bass tuning (adjust to taste)
+# EQ / audio tuning (adjust to taste)
 # PREAMP_DB=0.0
 # BASS_BOOST_DB=0.0
 # TREBLE_BOOST_DB=0.0

@@ -1,29 +1,64 @@
 # Components Overview
 
-This document explains the main pieces of the app at a high level. It is intended for contributors; end users should start with README.md.
+High-level map of the app for contributors; end users start with README.md.
 
-## Discord Voice Path (Serenity + Songbird)
-- The bot logs in with your Discord bot token and connects to a single guild/channel.
-- Songbird joins the target voice channel and plays a raw PCM stream.
-- There are no text commands; the bot only handles voice.
-- Code lives in `src/discord/`: `bot.rs` (gateway handler + client), `voice.rs` (SimpleBridgeReader + track events), `presence.rs` (status text + presence loop).
+## Audio pipeline (the core data flow)
 
-## Spotify Connect Path (Librespot)
-- The app exposes a Spotify Connect device via discovery on the local network.
-- When you select the device, it pairs and starts a Spotify session.
-- Spotify playback is decoded and pushed into the audio bridge.
+```
+Spotify (librespot decode) ─┐
+YouTube/SoundCloud (yt-dlp) ─┼─> AudioBridge ─> SimpleBridgeReader ─> Songbird ─> Discord voice
+uploaded files ─────────────┘         ▲
+DJ TTS (Kokoro) ── overlay ───────────┘ (mixes on top with ducking)
+```
 
-## Audio Bridge and DSP
-- A shared in-memory buffer bridges Spotify (producer) to Discord (consumer).
-- Simple EQ controls exist today: preamp, bass boost, treble boost.
-- The EQ runs in the audio sink; avoid heavy work in this path.
+- **AudioBridge** (`src/audio_bridge.rs`): lock-based `VecDeque<f32>` ring buffer
+  shared between producers and the consumer. 44.1 kHz stereo f32; Songbird
+  resamples to 48 kHz. Drops on overflow; drains/drops on even stereo frames.
+- **DiscordSink** (`src/spotify/sink.rs`): librespot's audio backend. Applies
+  optional DSP (preamp + biquad low/high shelves) and paces output to real time,
+  then pushes into the bridge. Hot path — no allocations or heavy logging.
+- **SimpleBridgeReader** (`src/discord/voice.rs`): `Read + Seek + MediaSource`
+  for Songbird. Prebuffers on first read (honors `PREBUFFER_SECONDS`), then
+  pulls from the bridge.
+- **Priority model** (`src/queue.rs`, managed in `bot.rs`): DJ overlay > queue
+  items (YouTube/SoundCloud/files) interrupt > Spotify Connect baseline.
 
-## Config and Cache
-- Configuration is read from .env (see .env.example).
-- Spotify credentials are cached locally in .spotify_cache/credentials.json.
-- A stable device ID is used to avoid duplicate devices in Spotify.
+## Spotify path (librespot + OAuth)
 
-## Presence and Logs
-- The bot updates Discord presence with basic playback state (Unicode music notes for playing, plain text for idle/paused).
-- Presence logic lives in `src/discord/presence.rs`.
-- Logs use app-centric presets by default (app at `info`, deps at `warn`). Set `RUST_LOG` to `debug` or `trace` for more detail, or pass a custom filter string.
+- OAuth-only (Authorization Code + PKCE); mDNS discovery was removed in v0.5.
+- `src/oauth/mod.rs`: PKCE flow, `parse_redirect`, `new_pkce`, token refresh,
+  profile fetch. `src/spotify/player.rs`: `run_with_token` drives the Spirc
+  session lifecycle (15s `Spirc::new` timeout, reconnect loop, event → presence).
+- `src/spotify/metadata.rs`: Spotify Web API track metadata for embeds.
+- Sessions: one active DJ; a proactive refresher task keeps the token fresh.
+
+## Discord path (serenity + songbird)
+
+- `src/discord/bot.rs`: gateway handler, slash commands (`/login`, `/logout`,
+  `/forget`, `/who`, `/queue`, `/play`, `/skip`, `/stop`, `/np`, `/announce`),
+  button interactions, now-playing/controls embeds, priority-queue manager, the
+  voice-join + auto-leave logic, and `spawn_session`.
+- `src/discord/voice.rs`: bridge reader + Songbird track events.
+- `src/discord/presence.rs`: bot status text + presence loop.
+- Controlling playback requires sharing the bot's voice channel.
+
+## Storage and config
+
+- `src/users/mod.rs` + `crypto.rs`: per-user credentials in SQLite
+  (`spotify_credentials`), tokens in an encrypted `auth_blob`
+  (XChaCha20-Poly1305, key = sha256 of `TOKEN_ENC_KEY`; plaintext with a warning
+  if unset). Legacy `.user_creds/*.json` are imported once.
+- `src/config.rs`: `.env` config (validated: non-zero snowflakes, warns on bad
+  numbers). `src/setup.rs`: first-run CLI wizard.
+
+## DJ / YouTube
+
+- `src/audio/dj.rs`: Kokoro TTS client (Unix socket on Linux), announcement
+  templates, FNV-hash clip cache, mixer overlay with ducking.
+- `src/youtube/`: yt-dlp process management (feeder) + metadata.
+
+## Logging
+
+- Default `warn` for all crates. `RUST_LOG` preset (`trace|debug|info|warn|
+  error`) raises this app's level while keeping deps quiet, or pass a raw
+  `EnvFilter`. Audio diagnostics on the `audio_stream` target at `debug` (5s).
