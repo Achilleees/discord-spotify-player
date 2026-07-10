@@ -534,6 +534,7 @@ async fn priority_queue_manager(
     feeder_cancel: Arc<Mutex<Option<CancellationToken>>>,
     feeder_paused: Arc<AtomicBool>,
     dj: Arc<DJAnnouncer>,
+    announce_enabled: Arc<AtomicBool>,
     controls_message_id: Arc<Mutex<Option<MessageId>>>,
     now_playing_message_id: Arc<Mutex<Option<MessageId>>>,
 ) {
@@ -575,8 +576,8 @@ async fn priority_queue_manager(
                 &controls_message_id, &now_playing_message_id,
             ).await;
 
-            // DJ announcement before track
-            if dj.is_enabled() {
+            // DJ announcement before track (honors the /announce toggle)
+            if announce_enabled.load(Ordering::Relaxed) && dj.is_enabled() {
                 let title = item.source.display_title().to_string();
                 let subtitle = item.source.display_subtitle().to_string();
                 let queued_by = item.queued_by.clone();
@@ -1172,10 +1173,10 @@ impl EventHandler for Handler {
 
         // Handle /play separately (deferred response)
         if cmd.data.name.as_str() == "play" {
-            if !in_voice {
+            if !self.user_can_play(&ctx, cmd.user.id) {
                 let _ = cmd.create_response(&ctx, CreateInteractionResponse::Message(
                     CreateInteractionResponseMessage::new()
-                        .content("You must be in the bot's voice channel to queue playback.")
+                        .content("Join a voice channel first (or the bot's channel if it's already in one) to queue playback.")
                         .ephemeral(true),
                 )).await;
                 return;
@@ -1260,6 +1261,24 @@ impl Handler {
     fn active_owner(&self) -> Option<u64> {
         let lock = self.active_session.lock().unwrap_or_else(|e| e.into_inner());
         lock.as_ref().map(|s| s.discord_user_id)
+    }
+
+    /// Whether a user may queue via /play: if the bot is already in a channel,
+    /// they must share it (the control rule); if the bot is in no channel yet,
+    /// they only need to be in one so the bot can follow them in.
+    fn user_can_play(&self, ctx: &Context, user_id: UserId) -> bool {
+        let bot_id = ctx.cache.current_user().id;
+        match self.guild_id.to_guild_cached(ctx) {
+            Some(guild) => {
+                let bot_ch = guild.voice_states.get(&bot_id).and_then(|vs| vs.channel_id);
+                let user_ch = guild.voice_states.get(&user_id).and_then(|vs| vs.channel_id);
+                match bot_ch {
+                    Some(bc) => user_ch == Some(bc),
+                    None => user_ch.is_some(),
+                }
+            }
+            None => false,
+        }
     }
 
     async fn join_voice_for_user(&self, discord_user_id: u64) {
@@ -1465,6 +1484,7 @@ impl Handler {
             feeder_cancel,
             feeder_paused,
             self.dj.clone(),
+            self.announce_enabled.clone(),
             controls_message_id,
             now_playing_message_id,
         ));
@@ -1774,6 +1794,7 @@ impl Handler {
 
         let spirc_resume_tx = spirc_cmd_tx_for_drain;
         let dj_for_drain = self.dj.clone();
+        let announce_for_drain = self.announce_enabled.clone();
 
         tokio::spawn(async move {
             let mut cancelled = false;
@@ -1797,8 +1818,8 @@ impl Handler {
                     &controls_message_id, &now_playing_message_id,
                 ).await;
 
-                // DJ announcement before track
-                if dj_for_drain.is_enabled() {
+                // DJ announcement before track (honors the /announce toggle)
+                if announce_for_drain.load(Ordering::Relaxed) && dj_for_drain.is_enabled() {
                     let title = item.source.display_title().to_string();
                     let subtitle = item.source.display_subtitle().to_string();
                     let queued_by = item.queued_by.clone();
@@ -1994,6 +2015,9 @@ impl Handler {
         let url = self.oauth.auth_url(&pkce);
         {
             let mut pending = self.pending_auth.lock().unwrap_or_else(|e| e.into_inner());
+            // Reap challenges older than their 10-min validity so abandoned
+            // logins don't accumulate.
+            pending.retain(|_, (_, started)| started.elapsed() < std::time::Duration::from_secs(600));
             pending.insert(user_id_u64, (pkce, Instant::now()));
         }
         format!(

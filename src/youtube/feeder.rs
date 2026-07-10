@@ -139,16 +139,22 @@ async fn feed_pcm_to_bridge(
     // (which would permanently shift every later sample and swap L/R).
     let mut carry: Vec<u8> = Vec::with_capacity(4);
     let mut frames_sent: u64 = 0;
-    let start = Instant::now();
+    let mut start = Instant::now();
 
     loop {
-        // Handle pause
-        while paused.load(Ordering::Relaxed) {
-            if token.is_cancelled() {
-                let _ = child.kill().await;
-                return Err(FeederError::Cancelled);
+        // Handle pause. Rebase `start` by the paused duration so the real-time
+        // target (start + frames_sent/rate) doesn't fall into the past and make
+        // the reader rush at full speed on resume, overflowing the bridge.
+        if paused.load(Ordering::Relaxed) {
+            let pause_began = Instant::now();
+            while paused.load(Ordering::Relaxed) {
+                if token.is_cancelled() {
+                    let _ = child.kill().await;
+                    return Err(FeederError::Cancelled);
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
             }
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            start += pause_began.elapsed();
         }
 
         if token.is_cancelled() {

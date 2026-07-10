@@ -264,24 +264,33 @@ async fn kokoro_socket_generate(text: &str, output_path: &str) -> Result<(), Str
     use tokio::net::UnixStream;
     use tokio::io::{AsyncWriteExt, AsyncReadExt};
 
-    let mut stream = UnixStream::connect(KOKORO_SOCKET)
+    // Bound the whole exchange so a wedged Kokoro daemon can't freeze the
+    // announcement (and, upstream, the queue) indefinitely.
+    let exchange = async {
+        let mut stream = UnixStream::connect(KOKORO_SOCKET)
+            .await
+            .map_err(|e| format!("socket connect failed: {}", e))?;
+
+        let req = serde_json::json!({
+            "text": text,
+            "output": output_path
+        });
+        let msg = format!("{}\n", req.to_string());
+
+        stream.write_all(msg.as_bytes()).await
+            .map_err(|e| format!("socket write failed: {}", e))?;
+        stream.shutdown().await
+            .map_err(|e| format!("socket shutdown failed: {}", e))?;
+
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await
+            .map_err(|e| format!("socket read failed: {}", e))?;
+        Ok::<String, String>(response)
+    };
+
+    let response = tokio::time::timeout(std::time::Duration::from_secs(20), exchange)
         .await
-        .map_err(|e| format!("socket connect failed: {}", e))?;
-
-    let req = serde_json::json!({
-        "text": text,
-        "output": output_path
-    });
-    let msg = format!("{}\n", req.to_string());
-
-    stream.write_all(msg.as_bytes()).await
-        .map_err(|e| format!("socket write failed: {}", e))?;
-    stream.shutdown().await
-        .map_err(|e| format!("socket shutdown failed: {}", e))?;
-
-    let mut response = String::new();
-    stream.read_to_string(&mut response).await
-        .map_err(|e| format!("socket read failed: {}", e))?;
+        .map_err(|_| "kokoro socket timed out".to_string())??;
 
     let parsed: serde_json::Value = serde_json::from_str(response.trim())
         .map_err(|e| format!("bad response: {} (raw: {})", e, response))?;
