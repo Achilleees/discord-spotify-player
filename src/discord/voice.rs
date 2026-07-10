@@ -36,15 +36,14 @@ impl SongbirdEventHandler for TrackErrorHandler {
 /// Reads raw f32 PCM samples from the AudioBridge for Songbird consumption.
 /// Wraps in a RawAdapter which adds the SbirdRaw header that Songbird expects.
 ///
-/// The prebuffer mechanism blocks the initial read until a minimum number of
-/// samples have accumulated, smoothing out start/unpause audio stutters.
+/// On the first read, blocks until `prebuffer_samples` have accumulated (or
+/// `prebuffer_wait` elapses), so playback starts on a filled buffer instead of
+/// stuttering through the initial silence.
 pub struct SimpleBridgeReader {
     bridge: Arc<AudioBridge>,
     pos: u64,
     scratch: Vec<f32>,
-    #[allow(dead_code)]
     prebuffer_samples: usize,
-    #[allow(dead_code)]
     prebuffer_wait: std::time::Duration,
     prebuffer_done: bool,
 }
@@ -86,13 +85,21 @@ impl Read for SimpleBridgeReader {
             );
         }
 
-        // On first read, wait until at least one sample arrives (max 5s).
-        // This avoids pulling silence before librespot starts pushing, without
-        // accumulating a large buffer that causes catchup speed issues.
+        // A buffer too small to hold one f32 sample can't carry audio; return
+        // silence rather than Ok(0), which the Read contract treats as EOF.
+        if buf.len() < 4 {
+            buf.fill(0);
+            self.pos += buf.len() as u64;
+            return Ok(buf.len());
+        }
+
+        // First read: block until PREBUFFER_SECONDS' worth of samples have
+        // accumulated (or prebuffer_wait elapses), so playback starts on a
+        // filled buffer instead of stuttering through the opening silence.
         if !self.prebuffer_done {
             let start = std::time::Instant::now();
-            while self.bridge.len() == 0
-                && start.elapsed() < std::time::Duration::from_secs(5)
+            while self.bridge.len() < self.prebuffer_samples
+                && start.elapsed() < self.prebuffer_wait
             {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
@@ -124,8 +131,8 @@ impl Read for SimpleBridgeReader {
             );
         }
 
-        // samples_needed = buf.len() / 4, so every write fits.
         let bytes_written = samples_needed * 4;
+        debug_assert!(bytes_written <= buf.len());
         for (chunk, &sample) in buf[..bytes_written]
             .chunks_exact_mut(4)
             .zip(self.scratch[..samples_needed].iter())

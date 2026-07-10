@@ -204,6 +204,14 @@ pub async fn run_setup_wizard() -> Result<Config, SetupError> {
     println!();
     println!(".env written successfully!");
 
+    // dotenvy::dotenv() only fills vars that are currently unset, so a prior
+    // failed from_env in the same process would shadow the freshly-written
+    // values. Set them explicitly so the reload below sees the new config.
+    std::env::set_var("DISCORD_TOKEN", &token);
+    std::env::set_var("DISCORD_GUILD_ID", guild_id_u64.to_string());
+    std::env::set_var("DISCORD_CHANNEL_ID", channel_id_u64.to_string());
+    std::env::set_var("DEVICE_NAME", &device_name);
+
     // Step 8: Load config and return.
     let config =
         Config::from_env().map_err(|e| SetupError::Io(std::io::Error::other(e.to_string())))?;
@@ -273,10 +281,13 @@ fn write_env_file(
         let mut written_keys: std::collections::HashSet<&str> = std::collections::HashSet::new();
 
         for line in contents.lines() {
-            let trimmed = line.trim();
+            // Exact key match on the part left of '=', so a key that is a
+            // prefix of another (e.g. DISCORD_TOKEN vs DISCORD_TOKEN_ALT)
+            // can't be rewritten by mistake.
+            let line_key = line.split('=').next().map(str::trim);
             let mut matched = false;
             for &(key, value) in &wizard_keys {
-                if trimmed.starts_with(key) && trimmed[key.len()..].trim_start().starts_with('=') {
+                if line_key == Some(key) {
                     output_lines.push(format!("{key}={value}"));
                     written_keys.insert(key);
                     matched = true;

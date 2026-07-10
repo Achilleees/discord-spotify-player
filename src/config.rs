@@ -19,39 +19,41 @@ pub struct Config {
     pub token_enc_key: Option<String>,
 }
 
+/// Parse a numeric env var, warning (rather than silently defaulting) when a
+/// value is present but unparseable — so a typo is distinguishable from unset.
+fn env_num<T: std::str::FromStr>(key: &str) -> Option<T> {
+    let raw = env::var(key).ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    match trimmed.parse::<T>() {
+        Ok(v) => Some(v),
+        Err(_) => {
+            tracing::warn!(key, value = %trimmed, "invalid numeric config value; using default");
+            None
+        }
+    }
+}
+
+/// Parse a Discord snowflake id, rejecting zero (serenity's Id::new panics on 0).
+fn parse_id(key: &'static str, raw: &str) -> Result<u64, ConfigError> {
+    let id: u64 = raw.trim().parse().map_err(|_| ConfigError::Invalid(key))?;
+    if id == 0 {
+        return Err(ConfigError::Invalid(key));
+    }
+    Ok(id)
+}
+
 impl Config {
     pub fn from_env() -> Result<Self, ConfigError> {
         dotenvy::dotenv().ok();
 
-        let preamp_db = env::var("PREAMP_DB")
-            .ok()
-            .and_then(|value| value.trim().parse::<f32>().ok())
-            .map(|value| value.clamp(-12.0, 12.0))
-            .unwrap_or(0.0);
-
-        let bass_boost_db = env::var("BASS_BOOST_DB")
-            .ok()
-            .and_then(|value| value.trim().parse::<f32>().ok())
-            .map(|value| value.clamp(0.0, 12.0))
-            .unwrap_or(0.0);
-
-        let treble_boost_db = env::var("TREBLE_BOOST_DB")
-            .ok()
-            .and_then(|value| value.trim().parse::<f32>().ok())
-            .map(|value| value.clamp(-6.0, 6.0))
-            .unwrap_or(0.0);
-
-        let audio_buffer_seconds = env::var("AUDIO_BUFFER_SECONDS")
-            .ok()
-            .and_then(|value| value.trim().parse::<usize>().ok())
-            .map(|value| value.clamp(1, 12))
-            .unwrap_or(8);
-
-        let prebuffer_seconds = env::var("PREBUFFER_SECONDS")
-            .ok()
-            .and_then(|value| value.trim().parse::<f32>().ok())
-            .map(|value| value.clamp(0.0, 8.0))
-            .unwrap_or(2.0);
+        let preamp_db = env_num::<f32>("PREAMP_DB").unwrap_or(0.0).clamp(-12.0, 12.0);
+        let bass_boost_db = env_num::<f32>("BASS_BOOST_DB").unwrap_or(0.0).clamp(0.0, 12.0);
+        let treble_boost_db = env_num::<f32>("TREBLE_BOOST_DB").unwrap_or(0.0).clamp(-6.0, 6.0);
+        let audio_buffer_seconds = env_num::<usize>("AUDIO_BUFFER_SECONDS").unwrap_or(8).clamp(1, 12);
+        let prebuffer_seconds = env_num::<f32>("PREBUFFER_SECONDS").unwrap_or(2.0).clamp(0.0, 8.0);
 
         let device_id = env::var("DEVICE_ID")
             .ok()
@@ -68,25 +70,27 @@ impl Config {
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty());
 
-        let discord_channel_id: u64 = env::var("DISCORD_CHANNEL_ID")
-            .map_err(|_| ConfigError::Missing("DISCORD_CHANNEL_ID"))?
-            .parse()
-            .map_err(|_| ConfigError::Invalid("DISCORD_CHANNEL_ID"))?;
+        let discord_channel_id = parse_id(
+            "DISCORD_CHANNEL_ID",
+            &env::var("DISCORD_CHANNEL_ID").map_err(|_| ConfigError::Missing("DISCORD_CHANNEL_ID"))?,
+        )?;
+
+        let discord_guild_id = parse_id(
+            "DISCORD_GUILD_ID",
+            &env::var("DISCORD_GUILD_ID").map_err(|_| ConfigError::Missing("DISCORD_GUILD_ID"))?,
+        )?;
 
         // Text channel for embeds/controls; falls back to the voice channel's
-        // built-in text chat when unset.
+        // built-in text chat when unset or invalid.
         let discord_text_channel_id = env::var("TEXT_CHANNEL_ID")
             .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
+            .and_then(|v| parse_id("TEXT_CHANNEL_ID", &v).ok())
             .unwrap_or(discord_channel_id);
 
         Ok(Config {
             discord_token: env::var("DISCORD_TOKEN")
                 .map_err(|_| ConfigError::Missing("DISCORD_TOKEN"))?,
-            discord_guild_id: env::var("DISCORD_GUILD_ID")
-                .map_err(|_| ConfigError::Missing("DISCORD_GUILD_ID"))?
-                .parse()
-                .map_err(|_| ConfigError::Invalid("DISCORD_GUILD_ID"))?,
+            discord_guild_id,
             discord_channel_id,
             discord_text_channel_id,
             device_name: env::var("DEVICE_NAME").unwrap_or_else(|_| "Discord Player".to_string()),

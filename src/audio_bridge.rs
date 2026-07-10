@@ -69,7 +69,9 @@ impl AudioBridge {
             }
             return;
         }
-        let to_take = samples.len().min(available_space);
+        // Keep drops on whole stereo frames (even counts) so the L/R
+        // interleaving in the buffer never shifts by one sample.
+        let to_take = (samples.len().min(available_space)) & !1;
         if to_take < samples.len() {
             self.stats.total_dropped.fetch_add(
                 (samples.len() - to_take) as u64,
@@ -102,7 +104,9 @@ impl AudioBridge {
         let count = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         let mut buffer = self.buffer.lock();
-        let available = buffer.len().min(output.len());
+        // Drain whole stereo frames only, so the buffer's read position stays
+        // frame-aligned and L/R can't swap on a later pull.
+        let available = (buffer.len().min(output.len())) & !1;
 
         if count.is_multiple_of(100) {
             tracing::debug!(
@@ -224,19 +228,6 @@ impl AudioBridge {
         self.buffer.lock().clear();
         self.overlay.lock().clear();
         self.overlay_duck_volume.store(f32::to_bits(1.0), std::sync::atomic::Ordering::Relaxed);
-    }
-}
-
-impl Default for AudioBridge {
-    fn default() -> Self {
-        let cap = max_samples(4);
-        Self {
-            buffer: Mutex::new(VecDeque::with_capacity(cap)),
-            overlay: Mutex::new(VecDeque::with_capacity(cap)),
-            overlay_duck_volume: std::sync::atomic::AtomicU32::new(f32::to_bits(1.0)),
-            max_samples: cap,
-            stats: BridgeStats::default(),
-        }
     }
 }
 
