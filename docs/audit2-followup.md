@@ -43,15 +43,15 @@ source.
 - `pending_auth` reaps expired entries on insert (security F9).
 - Priority queue capped at 500 with unit tests (security F2).
 - Corrected the `track_announce_clip` doc comment (comments F3).
+- **Concurrent `/play` drain race fully serialized** (bugs F5, edge F9): a
+  single abort-safe `drain_active` guard makes exactly one drain own the queue
+  at a time, across both the `/play` trigger and the eot-driven manager. This
+  closes the two-drain-path race completely — it did NOT need the nob rebuild.
 
 ## Still open — for nob's rebuild or an operational decision
 
 None release-blocking.
 
-- **Concurrent `/play` drain race + the two-drain-path design** (bugs F5, edge
-  F9): `trigger_priority_queue_drain` and the eot-driven `priority_queue_manager`
-  can both drain. A partial guard would give false confidence; nob's single
-  player-state machine fixes it holistically. **Defer to the port.**
 - **`EndOfTrack` sends Idle + `bridge.clear()` every track** (edge F20),
   trimming tail audio — entangled with the eot→queue coordination above.
 - **Crypto**: reject `V_PLAIN` rows when a key is set + bind ciphertext to its
