@@ -105,6 +105,9 @@ struct Handler {
     priority_queue: Arc<Mutex<PriorityQueue>>,
     spirc_cmd_tx: Arc<Mutex<Option<mpsc::UnboundedSender<SpircCommand>>>>,
     active_priority_item: Arc<Mutex<Option<QueueItem>>>,
+    /// True while a queue drain is running. A single owner drains at a time, so
+    /// the /play-triggered drain and the eot-driven manager can't race.
+    drain_active: Arc<AtomicBool>,
     feeder_cancel: Arc<Mutex<Option<CancellationToken>>>,
     feeder_paused: Arc<AtomicBool>,
     dj: Arc<DJAnnouncer>,
@@ -520,6 +523,16 @@ async fn post_priority_history(
 
 // --- Priority queue manager ---
 
+/// Clears the drain-active flag on drop, so an aborted or panicking drain task
+/// can't leave the flag stuck true (which would block all future drains).
+struct DrainGuard(Arc<AtomicBool>);
+
+impl Drop for DrainGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
 // Wide orchestration fn wiring together the queue, bridge, and UI state. The
 // nob port folds these into its actions/panel layer; kept flat here.
 #[allow(clippy::too_many_arguments)]
@@ -535,6 +548,7 @@ async fn priority_queue_manager(
     feeder_paused: Arc<AtomicBool>,
     dj: Arc<DJAnnouncer>,
     announce_enabled: Arc<AtomicBool>,
+    drain_active: Arc<AtomicBool>,
     controls_message_id: Arc<Mutex<Option<MessageId>>>,
     now_playing_message_id: Arc<Mutex<Option<MessageId>>>,
 ) {
@@ -546,6 +560,13 @@ async fn priority_queue_manager(
                 return;
             }
         }
+
+        // Only one drain runs at a time. If a /play-triggered drain already
+        // owns it, that drain will pick up whatever is queued — skip.
+        if drain_active.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+            continue;
+        }
+        let _drain_guard = DrainGuard(drain_active.clone());
 
         // Drain the priority queue
         let mut cancelled = false;
@@ -1485,6 +1506,7 @@ impl Handler {
             feeder_paused,
             self.dj.clone(),
             self.announce_enabled.clone(),
+            self.drain_active.clone(),
             controls_message_id,
             now_playing_message_id,
         ));
@@ -1732,6 +1754,12 @@ impl Handler {
     }
 
     async fn trigger_priority_queue_drain(&self) {
+        // One drain at a time — if the eot-driven manager (or another /play)
+        // is already draining, it will pick up what we just queued.
+        if self.drain_active.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+            return;
+        }
+        let drain_active = self.drain_active.clone();
         let pq = self.priority_queue.clone();
         let bridge = self.bridge.clone();
         let ctx_arc = self.ctx.clone();
@@ -1797,6 +1825,8 @@ impl Handler {
         let announce_for_drain = self.announce_enabled.clone();
 
         tokio::spawn(async move {
+            // Clears drain_active on any exit (normal, cancel, or abort).
+            let _drain_guard = DrainGuard(drain_active);
             let mut cancelled = false;
             loop {
                 let item = {
@@ -2332,6 +2362,7 @@ impl DiscordBot {
             priority_queue: Arc::new(Mutex::new(PriorityQueue::new())),
             spirc_cmd_tx: Arc::new(Mutex::new(None)),
             active_priority_item: Arc::new(Mutex::new(None)),
+            drain_active: Arc::new(AtomicBool::new(false)),
             feeder_cancel: Arc::new(Mutex::new(None)),
             feeder_paused: Arc::new(AtomicBool::new(false)),
             dj,
