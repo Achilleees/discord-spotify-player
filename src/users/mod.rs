@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 const CREDS_DIR: &str = ".user_creds";
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct UserCredentials {
     pub discord_user_id: String,
     pub spotify_username: String,
@@ -13,6 +13,21 @@ pub struct UserCredentials {
     pub paired_at: String,
     #[serde(default = "default_true")]
     pub active: bool,
+}
+
+/// Manual Debug: token fields are redacted so `{:?}` can never leak them
+/// into logs.
+impl std::fmt::Debug for UserCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UserCredentials")
+            .field("discord_user_id", &self.discord_user_id)
+            .field("spotify_username", &self.spotify_username)
+            .field("access_token", &"<redacted>")
+            .field("refresh_token", &"<redacted>")
+            .field("paired_at", &self.paired_at)
+            .field("active", &self.active)
+            .finish()
+    }
 }
 
 fn default_true() -> bool {

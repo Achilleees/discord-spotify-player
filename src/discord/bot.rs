@@ -365,24 +365,26 @@ async fn delete_and_repost_controls(
 }
 
 /// Parse a Spotify track ID from a URL or URI.
+/// Accepts `spotify:track:<id>` and any `open.spotify.com` URL with a
+/// `/track/<id>` path segment, including locale-prefixed links
+/// (`open.spotify.com/intl-fr/track/<id>`).
 fn parse_track_id_from_url(input: &str) -> Option<String> {
     let input = input.trim();
-    if let Some(id) = input.strip_prefix("spotify:track:") {
-        let id = id.split('?').next().unwrap_or(id);
-        if !id.is_empty() {
-            return Some(id.to_string());
-        }
-    }
-    if input.contains("open.spotify.com/track/") {
-        if let Some(after) = input.split("open.spotify.com/track/").nth(1) {
-            let id = after.split('?').next().unwrap_or(after);
-            let id = id.split('/').next().unwrap_or(id);
-            if !id.is_empty() {
-                return Some(id.to_string());
-            }
-        }
-    }
-    None
+    let candidate = if let Some(rest) = input.strip_prefix("spotify:track:") {
+        rest.split('?').next().unwrap_or(rest)
+    } else if input.contains("open.spotify.com/") {
+        let after = input.split("/track/").nth(1)?;
+        after.split(['?', '/', '#']).next().unwrap_or(after)
+    } else {
+        return None;
+    };
+    is_valid_track_id(candidate).then(|| candidate.to_string())
+}
+
+/// Spotify track IDs are exactly 22 base62 characters. Rejecting anything
+/// else keeps user input out of the query string of authenticated API calls.
+fn is_valid_track_id(id: &str) -> bool {
+    id.len() == 22 && id.bytes().all(|b| b.is_ascii_alphanumeric())
 }
 
 async fn spotify_playback_command(access_token: &str, method: &str, endpoint: &str) {

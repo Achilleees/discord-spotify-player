@@ -66,10 +66,17 @@ impl Config {
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty());
 
+        let discord_channel_id: u64 = env::var("DISCORD_CHANNEL_ID")
+            .map_err(|_| ConfigError::Missing("DISCORD_CHANNEL_ID"))?
+            .parse()
+            .map_err(|_| ConfigError::Invalid("DISCORD_CHANNEL_ID"))?;
+
+        // Text channel for embeds/controls; falls back to the voice channel's
+        // built-in text chat when unset.
         let discord_text_channel_id = env::var("TEXT_CHANNEL_ID")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .unwrap_or(428011920184967168);
+            .unwrap_or(discord_channel_id);
 
         Ok(Config {
             discord_token: env::var("DISCORD_TOKEN")
@@ -78,10 +85,7 @@ impl Config {
                 .map_err(|_| ConfigError::Missing("DISCORD_GUILD_ID"))?
                 .parse()
                 .map_err(|_| ConfigError::Invalid("DISCORD_GUILD_ID"))?,
-            discord_channel_id: env::var("DISCORD_CHANNEL_ID")
-                .map_err(|_| ConfigError::Missing("DISCORD_CHANNEL_ID"))?
-                .parse()
-                .map_err(|_| ConfigError::Invalid("DISCORD_CHANNEL_ID"))?,
+            discord_channel_id,
             discord_text_channel_id,
             device_name: env::var("DEVICE_NAME").unwrap_or_else(|_| "Discord Player".to_string()),
             device_id,

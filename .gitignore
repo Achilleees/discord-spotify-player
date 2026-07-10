@@ -12,14 +12,18 @@ releases/
 credentials.json
 .spotify_cache/
 
+# Per-user OAuth tokens (plaintext until the SQLite migration)
+.user_creds/
+
 # IDE
 .idea/
 .claude/
 *.swp
 *.swo
 
-# Local tooling
-.cargo/
+# Local tooling (config.toml is tracked: it carries the cmake build fix)
+.cargo/*
+!.cargo/config.toml
 
 # OS
 .DS_Store
