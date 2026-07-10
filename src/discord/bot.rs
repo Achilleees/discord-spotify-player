@@ -547,6 +547,7 @@ async fn priority_queue_manager(
         }
 
         // Drain the priority queue
+        let mut cancelled = false;
         loop {
             let item = {
                 let mut lock = priority_queue.lock().unwrap_or_else(|e| e.into_inner());
@@ -610,7 +611,8 @@ async fn priority_queue_manager(
                     tracing::info!("priority item cancelled (skip/stop)");
                     let mut lock = active_priority_item.lock().unwrap_or_else(|e| e.into_inner());
                     *lock = None;
-                    // Don't resume Spotify here — let the skip/stop handler decide
+                    // Skip/stop owns what plays next — don't auto-resume Spotify.
+                    cancelled = true;
                     break;
                 }
                 Err(e) => {
@@ -628,8 +630,11 @@ async fn priority_queue_manager(
             }
         }
 
-        // Priority queue drained — resume Spotify
-        let _ = spirc_cmd_tx.send(SpircCommand::Play);
+        // Resume Spotify only when the queue drained naturally, not when a
+        // skip/stop cancelled the current item.
+        if !cancelled {
+            let _ = spirc_cmd_tx.send(SpircCommand::Play);
+        }
     }
 }
 
@@ -1533,6 +1538,7 @@ impl Handler {
                 let mut restarts: u32 = 0;
                 loop {
                     let access_token = { token_state.lock().unwrap_or_else(|e| e.into_inner()).0.clone() };
+                    let run_start = std::time::Instant::now();
                     match SpotifyPlayer::run_with_token(
                         &config, bridge.clone(), presence_tx.clone(), access_token,
                         Some(eot_tx.clone()),
@@ -1541,7 +1547,13 @@ impl Handler {
                         Ok(()) => tracing::info!(user = discord_user_id, "librespot session ended cleanly"),
                         Err(e) => tracing::warn!(user = discord_user_id, error = ?e, "librespot session ended with error"),
                     }
-                    restarts += 1;
+                    // Only consecutive *fast* failures count toward giving up; a
+                    // session that ran for a while resets the budget.
+                    if run_start.elapsed() >= std::time::Duration::from_secs(60) {
+                        restarts = 0;
+                    } else {
+                        restarts += 1;
+                    }
                     if restarts >= MAX_SESSION_RESTARTS {
                         tracing::warn!(user = discord_user_id, "librespot session gave up after repeated failures");
                         break;
@@ -1764,6 +1776,7 @@ impl Handler {
         let dj_for_drain = self.dj.clone();
 
         tokio::spawn(async move {
+            let mut cancelled = false;
             loop {
                 let item = {
                     let mut lock = pq.lock().unwrap_or_else(|e| e.into_inner());
@@ -1818,13 +1831,16 @@ impl Handler {
                 }
 
                 if let Err(FeederError::Cancelled) = result {
+                    cancelled = true;
                     break;
                 }
             }
 
-            // P0: Resume Spotify after priority queue drains
-            if let Some(ref tx) = spirc_resume_tx {
-                let _ = tx.send(SpircCommand::Play);
+            // Resume Spotify only on a natural drain, not after a skip/stop.
+            if !cancelled {
+                if let Some(ref tx) = spirc_resume_tx {
+                    let _ = tx.send(SpircCommand::Play);
+                }
             }
         });
     }
@@ -2108,6 +2124,11 @@ impl Handler {
     }
 
     async fn handle_logout(&self, user_id: &str, user_id_u64: u64) -> String {
+        // Serialize against spawn_session so a logout landing in the spawn
+        // window can't miss the not-yet-stored session (and then deactivate the
+        // DB row while a live session keeps running).
+        let _spawn_guard = self.spawn_lock.lock().await;
+
         // Only the owner of the live session may tear it down. A bystander's
         // /logout must not pause the DJ's audio or wipe the controls.
         let owned_live_session = {

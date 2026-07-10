@@ -57,6 +57,8 @@ impl UserStore {
     /// imported once and the directory retired.
     pub fn open(db_path: &str, enc_key: Option<&str>) -> rusqlite::Result<Self> {
         let conn = Connection::open(db_path)?;
+        // The DB holds tokens (encrypted or not); keep it owner-only on unix.
+        restrict_permissions(db_path);
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
              CREATE TABLE IF NOT EXISTS spotify_credentials (
@@ -274,9 +276,29 @@ impl UserStore {
         if imported > 0 {
             tracing::info!(imported, "migrated legacy .user_creds JSON into the database");
         }
-        let _ = std::fs::rename(dir, format!("{LEGACY_CREDS_DIR}.migrated"));
+        // Delete the legacy dir rather than renaming it — leaving plaintext
+        // token files at rest (even under a .migrated name) defeats the point.
+        if let Err(e) = std::fs::remove_dir_all(dir) {
+            tracing::warn!(error = %e, "failed to delete legacy .user_creds dir after migration");
+        }
     }
 }
+
+/// Restrict the credential DB to owner-only (0600) on unix. No-op elsewhere
+/// and for the in-memory (`:memory:`) test DB.
+#[cfg(unix)]
+fn restrict_permissions(path: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    if path == ":memory:" {
+        return;
+    }
+    if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
+        tracing::warn!(error = %e, "failed to set 0600 on credential DB");
+    }
+}
+
+#[cfg(not(unix))]
+fn restrict_permissions(_path: &str) {}
 
 #[cfg(test)]
 mod tests {
