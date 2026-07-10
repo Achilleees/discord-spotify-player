@@ -201,9 +201,11 @@ impl SpotifyPlayer {
                         tracing::debug!("loading track");
                     }
                     PlayerEvent::EndOfTrack { .. } => {
+                        // Don't clear the bridge on a natural track boundary — it
+                        // would trim the tail of an auto-advancing track. A real
+                        // stop is handled by PlayerEvent::Stopped, and a priority
+                        // item's drain clears the bridge itself before playing.
                         let _ = presence_tx_events.send(PresenceUpdate::Idle);
-                        bridge_for_events.clear();
-                        // Signal the priority queue manager
                         if let Some(ref tx) = end_of_track_tx {
                             let _ = tx.send(());
                         }

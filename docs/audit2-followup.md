@@ -47,27 +47,37 @@ source.
   single abort-safe `drain_active` guard makes exactly one drain own the queue
   at a time, across both the `/play` trigger and the eot-driven manager. This
   closes the two-drain-path race completely — it did NOT need the nob rebuild.
+- **Credential ciphertext bound to its owner via AEAD AAD + plaintext-downgrade
+  rejection** (security F3). Nothing deployed → no encrypted data to migrate.
+- **`EndOfTrack` no longer clears the bridge** (edge F20) — the natural-boundary
+  tail-trim is gone; real stops go through `Stopped`, and a priority item's
+  drain clears the bridge itself. (The brief presence flap is cosmetic; left
+  as-is to keep the change low-risk.)
+- **Deployment paths are env-configurable** (structure lens): DJ clips/cache,
+  Kokoro socket, YouTube tmp dir + cookies default to the VPS layout but can be
+  overridden. Documented in `.env.example`.
 
-## Still open — for nob's rebuild or an operational decision
+## Still open — genuinely gated
 
-None release-blocking.
+None release-blocking. Each has a concrete blocker, not effort:
 
-- **`EndOfTrack` sends Idle + `bridge.clear()` every track** (edge F20),
-  trimming tail audio — entangled with the eot→queue coordination above.
-- **Crypto**: reject `V_PLAIN` rows when a key is set + bind ciphertext to its
-  owner via AAD; stretch the KDF (security F3, F8). Defer to nob's storage
-  rebuild (spotibot stays sync-`Mutex<Connection>`; nob uses async `Db`).
+- **KDF stretching** (security F8): `Sha256::digest(key)` → a stretching KDF
+  (argon2/pbkdf2) would harden a *weak* `TOKEN_ENC_KEY` against offline
+  brute-force of a stolen DB. The mitigation already in place is "use a long
+  random key" (now the `.env.example` guidance) + the 0600 DB file, which moots
+  it for a strong key. Adding argon2 is a dep + salt/param decision — **your
+  call** whether the weak-key case is worth it.
 - **CSRF state on a bare-code paste** (security F4): PKCE verifier binding
   already mitigates (an attacker's code is useless without our verifier);
   requiring state would break the paste-just-the-code convenience. Accepted.
 - **`--remote-components ejs:github`** runs unpinned remote extractor JS
   (security F11) — operationally intended; **needs your call** to pin/remove.
-- **Hardcoded `/opt/openclaw/...` paths** for cookies, DJ clips, Kokoro socket
-  (structure lens) — make them config during the nob port.
+- **Presence flap on Spotify auto-advance** — the residual half of F20; verify
+  and tune with live audio.
 
 ## Note for the nob port
 
-Several of these (queue races, `/play` join, feeder pacing, crypto AAD/KDF,
-hardcoded paths) are cleaner to fix inside nob's `player`/`queue`/`spotify`
-module boundaries than to retrofit into spotibot's flat `bot.rs`. See `PORT.md`.
+The queue/player coordination (two drain paths, EndOfTrack↔queue) is cleaner as
+nob's single player-state machine than retrofitted into spotibot's flat
+`bot.rs`. See `PORT.md`.
 The full machine-readable report is archived with the workflow run.
