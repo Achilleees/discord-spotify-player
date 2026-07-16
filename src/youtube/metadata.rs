@@ -84,9 +84,9 @@ pub fn validate_play_url(input: &str) -> Result<String, YoutubeError> {
     }
 }
 
-/// Concurrent yt-dlp probe cap: each /play spawns a subprocess (network fetch
-/// + JSON parse) before the queue cap applies, so without a bound a rapid
-/// caller drives unbounded CPU/PID pressure on the shared VPS.
+/// Concurrent yt-dlp probe cap: each /play spawns a subprocess (network
+/// fetch and JSON parse) before the queue cap applies, so without a bound a
+/// rapid caller drives unbounded CPU/PID pressure on the shared VPS.
 fn probe_permits() -> &'static tokio::sync::Semaphore {
     static PERMITS: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
     PERMITS.get_or_init(|| tokio::sync::Semaphore::new(3))
