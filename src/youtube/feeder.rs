@@ -49,6 +49,10 @@ fn remove_partials(prefix: &str) {
 }
 
 async fn download_youtube(url: &str, token: &CancellationToken) -> Result<std::path::PathBuf, FeederError> {
+    // Defense in depth: the queued URL normally comes from yt-dlp's own
+    // metadata output, but never hand the generic extractor an arbitrary URL.
+    let url = crate::youtube::metadata::validate_play_url(url)
+        .map_err(|_| FeederError::DownloadFailed("unsupported URL".to_string()))?;
     ensure_tmp_dir().map_err(FeederError::Io)?;
     let id = Uuid::new_v4().to_string();
     let output_template = format!("{}/yt-{}.%(ext)s", crate::youtube::tmp_dir(), id);

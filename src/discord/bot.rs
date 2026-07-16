@@ -116,6 +116,8 @@ struct Handler {
     /// Metadata of the current Spotify track, kept fresh by the presence
     /// loop so /np can answer for the Spotify baseline too.
     last_spotify_meta: Arc<Mutex<Option<TrackMetadata>>>,
+    /// Last /play per user, for the metadata-probe cooldown.
+    play_cooldowns: Arc<Mutex<HashMap<u64, Instant>>>,
     auto_start_attempted: AtomicBool,
 }
 
@@ -1798,6 +1800,30 @@ impl Handler {
             return;
         }
 
+        // Per-user cooldown ahead of the metadata probe: every /play spawns a
+        // yt-dlp subprocess before the queue cap applies, so rapid calls
+        // would otherwise drive unbounded process pressure.
+        const PLAY_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(3);
+        let on_cooldown = {
+            let now = Instant::now();
+            let mut lock = self.play_cooldowns.lock();
+            match lock.get(&cmd.user.id.get()) {
+                Some(last) if now.duration_since(*last) < PLAY_COOLDOWN => true,
+                _ => {
+                    lock.insert(cmd.user.id.get(), now);
+                    false
+                }
+            }
+        };
+        if on_cooldown {
+            let _ = cmd.create_response(ctx, CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content("⏳ One /play at a time — try again in a few seconds.")
+                    .ephemeral(true)
+            )).await;
+            return;
+        }
+
         let url_arg: Option<String> = cmd.data.options.iter()
             .find(|o| o.name == "url")
             .and_then(|o| if let serenity::model::application::CommandDataOptionValue::String(s) = &o.value { Some(s.clone()) } else { None });
@@ -2485,6 +2511,7 @@ impl DiscordBot {
                 announce_persisted.as_deref() == Some("1"),
             )),
             last_spotify_meta: Arc::new(Mutex::new(None)),
+            play_cooldowns: Arc::new(Mutex::new(HashMap::new())),
             auto_start_attempted: AtomicBool::new(false),
         };
 

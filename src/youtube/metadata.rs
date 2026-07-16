@@ -16,6 +16,8 @@ pub struct YoutubeMetadata {
 
 #[derive(Debug, thiserror::Error)]
 pub enum YoutubeError {
+    #[error("Only YouTube and SoundCloud URLs are supported.")]
+    UnsupportedUrl,
     #[error("Couldn't find a track at that URL.")]
     NotFound,
     #[error("This video is age-restricted — the bot needs YouTube login cookies to play it (admin: set YOUTUBE_COOKIES).")]
@@ -54,8 +56,50 @@ struct YtDlpJson {
     is_live: Option<bool>,
 }
 
+/// Validate a /play URL before it reaches yt-dlp: https-only and an
+/// allowlisted host. yt-dlp's generic extractor fetches ANY url server-side
+/// (SSRF: loopback services, cloud metadata endpoints) and reflects the
+/// fetched page's metadata into the Now Playing embed — so unsupported hosts
+/// must be rejected before any subprocess spawns. Returns the canonicalized
+/// URL string to pass along.
+pub fn validate_play_url(input: &str) -> Result<String, YoutubeError> {
+    let trimmed = input.trim();
+    // Accept a scheme-less paste ("youtube.com/watch?v=…").
+    let parsed = url::Url::parse(trimmed)
+        .or_else(|_| url::Url::parse(&format!("https://{trimmed}")))
+        .map_err(|_| YoutubeError::UnsupportedUrl)?;
+    if parsed.scheme() != "https" {
+        return Err(YoutubeError::UnsupportedUrl);
+    }
+    let host = parsed
+        .host_str()
+        .ok_or(YoutubeError::UnsupportedUrl)?
+        .to_ascii_lowercase();
+    // Dot-anchored suffix match so "evilyoutube.com" can't pass.
+    let is_or_sub = |root: &str| host == root || host.ends_with(&format!(".{root}"));
+    if is_or_sub("youtube.com") || host == "youtu.be" || is_or_sub("soundcloud.com") {
+        Ok(parsed.into())
+    } else {
+        Err(YoutubeError::UnsupportedUrl)
+    }
+}
+
+/// Concurrent yt-dlp probe cap: each /play spawns a subprocess (network fetch
+/// + JSON parse) before the queue cap applies, so without a bound a rapid
+/// caller drives unbounded CPU/PID pressure on the shared VPS.
+fn probe_permits() -> &'static tokio::sync::Semaphore {
+    static PERMITS: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+    PERMITS.get_or_init(|| tokio::sync::Semaphore::new(3))
+}
+
 /// Run `yt-dlp --dump-json <url>` and parse the result (metadata only, no download).
 pub async fn fetch_youtube_metadata(url: &str) -> Result<YoutubeMetadata, YoutubeError> {
+    let url = validate_play_url(url)?;
+    let url = url.as_str();
+    let _permit = probe_permits()
+        .acquire()
+        .await
+        .expect("probe semaphore is never closed");
     let cookies_path = crate::youtube::cookies_path();
     let mut args = vec!["--dump-json", "--no-playlist", "--flat-playlist", "--remote-components", "ejs:github"];
     if std::path::Path::new(&cookies_path).exists() {
