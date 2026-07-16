@@ -112,6 +112,9 @@ struct Handler {
     feeder_paused: Arc<AtomicBool>,
     dj: Arc<DJAnnouncer>,
     announce_enabled: Arc<AtomicBool>,
+    /// Metadata of the current Spotify track, kept fresh by the presence
+    /// loop so /np can answer for the Spotify baseline too.
+    last_spotify_meta: Arc<Mutex<Option<TrackMetadata>>>,
     auto_start_attempted: AtomicBool,
 }
 
@@ -158,15 +161,15 @@ fn register_commands(ytdlp_available: bool) -> Vec<CreateCommand> {
     if ytdlp_available {
         cmds.push(
             CreateCommand::new("play")
-                .description("Play a YouTube URL or file attachment")
+                .description("Play a YouTube/SoundCloud URL or file attachment")
                 .add_option(
                     CreateCommandOption::new(CommandOptionType::String, "url",
-                        "YouTube URL (or any yt-dlp supported URL)")
+                        "YouTube or SoundCloud URL")
                     .required(false),
                 )
                 .add_option(
                     CreateCommandOption::new(CommandOptionType::Attachment, "file",
-                        "Audio file to play (mp3, flac, ogg, wav, m4a, aac, opus)")
+                        "Audio file to play (mp3, flac, ogg, wav, m4a, aac, opus, wma)")
                     .required(false),
                 ),
         );
@@ -766,6 +769,7 @@ async fn run_presence_loop_with_track(
     announce_enabled: Arc<AtomicBool>,
     bridge: Arc<AudioBridge>,
     active_priority_item: Arc<Mutex<Option<QueueItem>>>,
+    last_meta_store: Arc<Mutex<Option<TrackMetadata>>>,
 ) {
     let (fwd_tx, fwd_rx) = mpsc::unbounded_channel::<PresenceUpdate>();
     let ctx_presence = ctx.clone();
@@ -893,6 +897,10 @@ async fn run_presence_loop_with_track(
                     Err(e) => tracing::warn!(error = ?e, "failed to send now-playing embed"),
                 }
 
+                {
+                    let mut lock = last_meta_store.lock().unwrap_or_else(|e| e.into_inner());
+                    *lock = Some(meta.clone());
+                }
                 last_meta = Some(meta);
                 last_spotify_name = spotify_name;
 
@@ -1018,12 +1026,14 @@ impl EventHandler for Handler {
             let bridge_presence = self.bridge.clone();
             let announce_presence = self.announce_enabled.clone();
             let priority_item = self.active_priority_item.clone();
+            let last_meta_store = self.last_spotify_meta.clone();
             tokio::spawn(async move {
                 run_presence_loop_with_track(
                     ctx_presence, rx, track_handle_store, active_session,
                     text_channel_id, controls_id, np_id,
                     dj_presence, announce_presence,
                     bridge_presence, priority_item,
+                    last_meta_store,
                 ).await;
             });
         }
@@ -1131,7 +1141,11 @@ impl EventHandler for Handler {
 
             let reply_content: String = match custom_id {
                 "ctrl_prev" => {
-                    if let Some(token) = &access_token {
+                    if priority_playing {
+                        // Sending Spotify "previous" here would silently move
+                        // the paused baseline session under the active item.
+                        "⏮ Previous isn't available during queue playback.".to_string()
+                    } else if let Some(token) = &access_token {
                         if spotify_playback_command(token, "POST", "previous").await {
                             "⏮ Previous".to_string()
                         } else {
@@ -1276,7 +1290,9 @@ impl EventHandler for Handler {
         }
 
         // Commands that drive playback require sharing the bot's voice channel.
-        let needs_voice = matches!(cmd.data.name.as_str(), "queue" | "skip" | "stop" | "announce");
+        // /announce is a guild-level toggle, not playback control, and must be
+        // settable before the bot is in voice.
+        let needs_voice = matches!(cmd.data.name.as_str(), "queue" | "skip" | "stop");
         if needs_voice && !in_voice {
             let _ = cmd.create_response(&ctx, CreateInteractionResponse::Message(
                 CreateInteractionResponseMessage::new()
@@ -2044,15 +2060,31 @@ impl Handler {
 
         let spotify_name = {
             let lock = self.active_session.lock().unwrap_or_else(|e| e.into_inner());
-            lock.as_ref().map(|s| format!("Spotify session: {}", s.spotify_name))
+            lock.as_ref().map(|s| s.spotify_name.clone())
         };
-        spotify_name.unwrap_or_else(|| "Nothing is currently playing.".to_string())
+        match spotify_name {
+            Some(name) => {
+                let meta = {
+                    let lock = self.last_spotify_meta.lock().unwrap_or_else(|e| e.into_inner());
+                    lock.clone()
+                };
+                match meta {
+                    Some(m) => format!("🎵 Now playing: **{}** — {} (Spotify session: {})", m.title, m.artist, name),
+                    None => format!("Spotify session: {} — nothing played yet.", name),
+                }
+            }
+            None => "Nothing is currently playing.".to_string(),
+        }
     }
 
     async fn handle_announce(&self) -> String {
         let current = self.announce_enabled.load(Ordering::Relaxed);
         let new_val = !current;
         self.announce_enabled.store(new_val, Ordering::Relaxed);
+        // Persist so restarts (including the VPS updater's) keep the toggle.
+        if let Err(e) = self.user_store.set_setting("announce_enabled", if new_val { "1" } else { "0" }) {
+            tracing::warn!(error = %e, "failed to persist announce toggle");
+        }
         if new_val {
             "🎙️ DJ track announcements **enabled**. Spotibot will announce each track.".to_string()
         } else {
@@ -2314,7 +2346,7 @@ impl Handler {
         let lock = self.active_session.lock().unwrap_or_else(|e| e.into_inner());
         tracing::info!("handle_who: lock acquired");
         match lock.as_ref() {
-            Some(session) => format!("Active session: **{}** (Discord user {})", session.spotify_name, session.discord_user_id),
+            Some(session) => format!("Active session: **{}** (Discord: {})", session.spotify_name, session.discord_name),
             None => "No active Spotify session. Run `/login` to connect.".to_string(),
         }
     }
@@ -2415,6 +2447,7 @@ impl DiscordBot {
         let track_handle: Arc<Mutex<Option<TrackHandle>>> = Arc::new(Mutex::new(None));
 
         let dj = Arc::new(DJAnnouncer::new());
+        let announce_persisted = user_store.get_setting("announce_enabled");
         let handler = Handler {
             guild_id: GuildId::new(config.discord_guild_id),
             channel_id: ChannelId::new(config.discord_channel_id),
@@ -2445,7 +2478,12 @@ impl DiscordBot {
             feeder_cancel: Arc::new(Mutex::new(None)),
             feeder_paused: Arc::new(AtomicBool::new(false)),
             dj,
-            announce_enabled: Arc::new(AtomicBool::new(false)),
+            // Restore the persisted /announce toggle so restarts (including
+            // the VPS updater's) don't silently disable announcements.
+            announce_enabled: Arc::new(AtomicBool::new(
+                announce_persisted.as_deref() == Some("1"),
+            )),
+            last_spotify_meta: Arc::new(Mutex::new(None)),
             auto_start_attempted: AtomicBool::new(false),
         };
 

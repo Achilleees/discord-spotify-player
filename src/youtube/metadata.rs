@@ -13,20 +13,17 @@ pub struct YoutubeMetadata {
 
 #[derive(Debug, thiserror::Error)]
 pub enum YoutubeError {
-    #[error("Couldn't find a video at that URL.")]
+    #[error("Couldn't find a track at that URL.")]
     NotFound,
     #[error("This video is age-restricted — the bot needs YouTube login cookies to play it (admin: set YOUTUBE_COOKIES).")]
     AgeRestricted,
-    #[error("This video is unavailable.")]
+    #[error("This track is unavailable.")]
     Unavailable,
-    #[error("Video too long (max {0} min). Use Spotify for long content.")]
+    #[error("Track too long (max {0} min). Use Spotify for long content.")]
     TooLong(u64),
     #[error("Live streams aren't supported.")]
     LiveStream,
-    #[error("Download failed: {0}")]
-    #[allow(dead_code)]
-    DownloadFailed(String),
-    #[error("Unsupported file type. Accepted: mp3, flac, ogg, wav, m4a, aac, opus")]
+    #[error("Unsupported file type. Accepted: mp3, flac, ogg, wav, m4a, aac, opus, wma")]
     InvalidFileType,
     #[error("File too large (max 50MB).")]
     FileTooLarge,

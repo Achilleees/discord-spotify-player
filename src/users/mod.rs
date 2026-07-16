@@ -69,6 +69,10 @@ impl UserStore {
                  is_active        INTEGER NOT NULL DEFAULT 0,
                  last_used_at     TEXT,
                  created_at       TEXT NOT NULL DEFAULT (datetime('now'))
+             );
+             CREATE TABLE IF NOT EXISTS settings (
+                 key   TEXT PRIMARY KEY,
+                 value TEXT NOT NULL
              );",
         )?;
         let store = Self {
@@ -86,6 +90,29 @@ impl UserStore {
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Connection> {
         self.conn.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Read a persisted key/value setting (bot-level toggles like the
+    /// /announce state, which must survive restarts).
+    pub fn get_setting(&self, key: &str) -> Option<String> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT value FROM settings WHERE key = ?1",
+            [key],
+            |row| row.get(0),
+        )
+        .ok()
+    }
+
+    /// Persist a key/value setting.
+    pub fn set_setting(&self, key: &str, value: &str) -> rusqlite::Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [key, value],
+        )?;
+        Ok(())
     }
 
     fn row_to_creds(
