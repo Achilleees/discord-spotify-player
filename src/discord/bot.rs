@@ -1600,7 +1600,7 @@ impl Handler {
                     match SpotifyPlayer::run_with_token(
                         &config, bridge.clone(), presence_tx.clone(), access_token,
                         Some(eot_tx.clone()),
-                        spirc_rx.take(),
+                        &mut spirc_rx,
                     ).await {
                         Ok(()) => tracing::info!(user = discord_user_id, "librespot session ended cleanly"),
                         Err(e) => tracing::warn!(user = discord_user_id, error = ?e, "librespot session ended with error"),

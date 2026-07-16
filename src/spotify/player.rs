@@ -222,13 +222,17 @@ impl SpotifyPlayer {
     }
 
     /// Run Spotify Connect using an OAuth access token (no discovery).
+    ///
+    /// The command receiver is borrowed, not consumed: it stays alive across
+    /// reconnect iterations here and returns to the caller intact, so a
+    /// restarted session keeps a live Pause/Play channel.
     pub async fn run_with_token(
         config: &Config,
         bridge: Arc<AudioBridge>,
         presence_tx: mpsc::UnboundedSender<PresenceUpdate>,
         access_token: String,
         end_of_track_tx: Option<mpsc::UnboundedSender<()>>,
-        spirc_cmd_rx: Option<mpsc::UnboundedReceiver<SpircCommand>>,
+        spirc_cmd_rx: &mut Option<mpsc::UnboundedReceiver<SpircCommand>>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let cache = Self::create_cache()?;
         let device_id = Self::resolve_device_id(config);
@@ -236,8 +240,6 @@ impl SpotifyPlayer {
         let mut reconnects: usize = 0;
 
         let credentials = Credentials::with_access_token(access_token.clone());
-
-        let mut spirc_cmd_rx = spirc_cmd_rx;
 
         loop {
             bridge.clear();
@@ -303,18 +305,17 @@ impl SpotifyPlayer {
             // that the Connect session died — actually breaks us out to the
             // reconnect path instead of parking forever on cmd_rx.recv().
             tokio::pin!(spirc_task);
-            let mut cmd_rx = spirc_cmd_rx.take();
             loop {
                 tokio::select! {
                     _ = &mut spirc_task => {
                         tracing::info!("spirc task ended (session closed)");
                         break;
                     }
-                    maybe_cmd = recv_cmd(&mut cmd_rx) => {
+                    maybe_cmd = recv_cmd(spirc_cmd_rx) => {
                         match maybe_cmd {
                             Some(SpircCommand::Pause) => { let _ = spirc.pause(); }
                             Some(SpircCommand::Play)  => { let _ = spirc.play();  }
-                            None => cmd_rx = None, // all senders dropped; poll the task only
+                            None => *spirc_cmd_rx = None, // all senders dropped; poll the task only
                         }
                     }
                 }
