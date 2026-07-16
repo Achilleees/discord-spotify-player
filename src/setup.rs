@@ -178,8 +178,12 @@ pub async fn run_setup_wizard() -> Result<Config, SetupError> {
         channel_kind_label(channel_kind)
     );
     println!("  Device name:    {device_name}");
-    let masked_token = if token.len() >= 10 {
-        format!("{}...{}", &token[..6], &token[token.len() - 4..])
+    // chars(), not byte slices: a multi-byte char at either cut would panic
+    // on a non-char boundary.
+    let masked_token = if token.chars().count() >= 10 {
+        let head: String = token.chars().take(6).collect();
+        let tail: String = token.chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect();
+        format!("{}...{}", head, tail)
     } else {
         "(invalid?)".to_string()
     };

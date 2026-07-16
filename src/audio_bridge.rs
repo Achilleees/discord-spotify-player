@@ -169,6 +169,15 @@ impl AudioBridge {
         // can't grow it without limit.
         let space = self.max_samples.saturating_sub(overlay.len());
         let to_take = (samples.len().min(space)) & !1;
+        let dropped = samples.len() - to_take;
+        if dropped > 0 {
+            tracing::warn!(
+                target: "audio_stream",
+                dropped,
+                dropped_s = dropped as f64 / (44100.0 * 2.0),
+                "overlay clip truncated to bridge capacity (tail cut mid-clip)"
+            );
+        }
         overlay.extend(samples[..to_take].iter());
         tracing::debug!(
             target: "audio_stream",

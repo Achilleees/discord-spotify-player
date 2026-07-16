@@ -75,15 +75,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let ytdlp_available = ytdlp_ok && ffmpeg_ok;
     if ytdlp_available {
         tracing::info!("yt-dlp and ffmpeg available — YouTube/file playback enabled");
-        // Ensure the YouTube scratch dir exists
+        // Ensure the YouTube scratch dir exists, and clear out partials left
+        // by a previous crash or kill mid-download.
         let _ = std::fs::create_dir_all(youtube::tmp_dir());
+        youtube::sweep_tmp_dir();
     }
 
     // OAuth (Authorization Code + PKCE) is the only session path since
     // discovery/mDNS was removed in v0.5. PKCE needs the client id only.
     let oauth: Arc<SpotifyOAuth> = match config.spotify_client_id.clone() {
         Some(id) => {
-            tracing::info!(client_id_prefix = &id[..8.min(id.len())], "spotify oauth enabled");
+            // chars(), not a byte slice: a multi-byte char straddling the
+            // cut would panic on a non-char boundary.
+            let prefix: String = id.chars().take(8).collect();
+            tracing::info!(client_id_prefix = %prefix, "spotify oauth enabled");
             Arc::new(SpotifyOAuth::new(id))
         }
         None => {

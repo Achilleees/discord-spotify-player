@@ -829,9 +829,12 @@ async fn run_presence_loop_with_track(
             if last_track_key.as_deref() != Some(&track_key) {
                 last_track_key = Some(track_key.clone());
 
-                let spotify_name = {
+                let (spotify_name, fresh_token) = {
                     let lock = active_session.lock().unwrap_or_else(|e| e.into_inner());
-                    lock.as_ref().map(|s| s.discord_name.clone()).unwrap_or_default()
+                    match lock.as_ref() {
+                        Some(s) => (s.discord_name.clone(), Some(s.access_token.clone())),
+                        None => (String::new(), None),
+                    }
                 };
 
                 let prev_msg_id = {
@@ -847,8 +850,13 @@ async fn run_presence_loop_with_track(
                     }
                 }
 
-                let meta = if !track_id.is_empty() && !access_token.is_empty() {
-                    fetch_track_metadata(track_id, access_token).await
+                // The token inside the PresenceUpdate was captured once when
+                // the librespot task started and expires after ~1h; the
+                // refresher keeps ActiveSession.access_token fresh, so prefer
+                // that and fall back to the update's copy.
+                let token = fresh_token.as_deref().unwrap_or(access_token.as_str());
+                let meta = if !track_id.is_empty() && !token.is_empty() {
+                    fetch_track_metadata(track_id, token).await
                 } else {
                     None
                 };
@@ -979,20 +987,20 @@ impl EventHandler for Handler {
             let mut ctx_store = self.ctx.lock().unwrap_or_else(|e| e.into_inner());
             *ctx_store = Some(ctx.clone());
         }
-        let _ = self.ready_tx.send(Ok(())).await;
+        // try_send: main() consumes exactly one ready signal then parks, so a
+        // blocking send on a later gateway resume would park this handler
+        // task forever (one leaked task per resume).
+        let _ = self.ready_tx.try_send(Ok(()));
 
         // First-ready-only work. Discord re-fires ready() after every gateway
         // resume/reconnect; reposting controls then would orphan the live
         // controls message and clobber controls_message_id mid-playback.
         let first_ready = !self.auto_start_attempted.swap(true, Ordering::SeqCst);
         if first_ready {
-            let ctx_for_controls = ctx.clone();
-            let text_channel_id = self.text_channel_id;
-            let bot_id = ready.user.id;
-            let controls_id = self.controls_message_id.clone();
-            tokio::spawn(async move {
-                startup_controls(&ctx_for_controls, text_channel_id, bot_id, &controls_id).await;
-            });
+            // Awaited, not detached: auto_start_stored_session below also
+            // writes controls_message_id, and a detached startup post
+            // finishing second would orphan the active-user card.
+            startup_controls(&ctx, self.text_channel_id, ready.user.id, &self.controls_message_id).await;
         }
 
         let rx_taken = {
@@ -1032,10 +1040,29 @@ impl EventHandler for Handler {
         if new.guild_id != Some(self.guild_id) {
             return;
         }
-        // Ignore our own join/leave events. The bot joining an empty channel
-        // (e.g. auto-start on boot) would otherwise fire the empty-channel
-        // teardown below and immediately kill the session it just started.
+        // The bot's own join events are ignored (its join to an empty channel
+        // on auto-start would otherwise fire the empty-channel teardown and
+        // kill the session it just started) — but its own DISCONNECT must
+        // tear the session down, or an admin force-disconnect leaves
+        // librespot and the feeder pushing into a dead call forever.
         if new.user_id == ctx.cache.current_user().id {
+            if new.channel_id.is_none() {
+                let anything_active = {
+                    let session = {
+                        let lock = self.active_session.lock().unwrap_or_else(|e| e.into_inner());
+                        lock.is_some()
+                    };
+                    let priority = {
+                        let lock = self.active_priority_item.lock().unwrap_or_else(|e| e.into_inner());
+                        lock.is_some()
+                    };
+                    session || priority || self.drain_active.load(Ordering::SeqCst)
+                };
+                if anything_active {
+                    tracing::info!("bot disconnected from voice — tearing down playback");
+                    self.teardown_playback_session(&ctx, false).await;
+                }
+            }
             return;
         }
 
@@ -1062,40 +1089,13 @@ impl EventHandler for Handler {
 
         tracing::debug!(humans_in_bot_channel, ?bot_channel, "voice state checked");
 
+        // Empty channel means full teardown and leave — regardless of whether
+        // a Spotify session exists. Gating this on a session used to let
+        // YouTube/file-only playback (started via /play with no /login) keep
+        // playing to an empty channel forever.
         if humans_in_bot_channel == 0 {
-            let has_session = {
-                let lock = self.active_session.lock().unwrap_or_else(|e| e.into_inner());
-                lock.is_some()
-            };
-
-            if has_session {
-                tracing::info!("voice channel empty — auto-logout triggered");
-
-                let owner = {
-                    let mut lock = self.active_session.lock().unwrap_or_else(|e| e.into_inner());
-                    lock.take().map(|session| {
-                        session.abort();
-                        tracing::info!(user = session.discord_user_id, "auto-aborted session (empty channel)");
-                        session.discord_user_id
-                    })
-                };
-
-                self.stop_priority_playback();
-
-                let _ = self.presence_tx.send(PresenceUpdate::Idle);
-
-                delete_and_repost_controls(&ctx, self.text_channel_id, &self.controls_message_id, None).await;
-
-                if let Some(manager) = songbird::get(&ctx).await {
-                    let _ = manager.leave(self.guild_id).await;
-                    tracing::info!("bot left voice channel (channel empty)");
-                }
-
-                // Deactivate only the session owner, not every stored user.
-                if let Some(owner) = owner {
-                    let _ = self.user_store.deactivate(&owner.to_string());
-                }
-            }
+            tracing::info!("voice channel empty — tearing down playback");
+            self.teardown_playback_session(&ctx, true).await;
         }
     }
 
@@ -1345,6 +1345,39 @@ impl Handler {
         lock.as_ref().map(|s| s.discord_user_id)
     }
 
+    /// Full playback teardown: abort any Spotify session (deactivating its
+    /// owner), stop priority playback, reset presence and controls, and
+    /// optionally leave voice. Runs when the voice channel empties and when
+    /// the bot is force-disconnected.
+    async fn teardown_playback_session(&self, ctx: &Context, leave_voice: bool) {
+        let owner = {
+            let mut lock = self.active_session.lock().unwrap_or_else(|e| e.into_inner());
+            lock.take().map(|session| {
+                session.abort();
+                tracing::info!(user = session.discord_user_id, "aborted session (teardown)");
+                session.discord_user_id
+            })
+        };
+
+        self.stop_priority_playback();
+
+        let _ = self.presence_tx.send(PresenceUpdate::Idle);
+
+        delete_and_repost_controls(ctx, self.text_channel_id, &self.controls_message_id, None).await;
+
+        if leave_voice {
+            if let Some(manager) = songbird::get(ctx).await {
+                let _ = manager.leave(self.guild_id).await;
+                tracing::info!("bot left voice channel");
+            }
+        }
+
+        // Deactivate only the session owner, not every stored user.
+        if let Some(owner) = owner {
+            let _ = self.user_store.deactivate(&owner.to_string());
+        }
+    }
+
     /// Tear down priority (YouTube/file) playback: cancel any running feeder,
     /// clear the queue, and clear the active item.
     fn stop_priority_playback(&self) {
@@ -1500,8 +1533,8 @@ impl Handler {
 
         self.spawn_session(
             discord_user_id,
-            user.spotify_username.clone(),
             user.spotify_username,
+            user.discord_name,
             access_token,
             refresh_token,
             expires_in,
@@ -2149,15 +2182,20 @@ impl Handler {
             Err(e) => return format!("Couldn't read that redirect: {e}. Paste the full URL from your browser."),
         };
 
+        // Read the pending challenge without consuming it: a bad paste must
+        // not burn the challenge and force a full re-authorization. It is
+        // removed on success (used codes can't be replayed) and on expiry.
         let pending = {
-            let mut lock = self.pending_auth.lock().unwrap_or_else(|e| e.into_inner());
-            lock.remove(&user_id_u64)
+            let lock = self.pending_auth.lock().unwrap_or_else(|e| e.into_inner());
+            lock.get(&user_id_u64).cloned()
         };
         let (pkce, started) = match pending {
             Some(p) => p,
             None => return "No pending login — run `/login` first to get an authorize link.".to_string(),
         };
         if started.elapsed() > std::time::Duration::from_secs(600) {
+            let mut lock = self.pending_auth.lock().unwrap_or_else(|e| e.into_inner());
+            lock.remove(&user_id_u64);
             return "That login link expired. Run `/login` again.".to_string();
         }
         // Validate the CSRF state when the redirect carried one.
@@ -2169,10 +2207,14 @@ impl Handler {
         }
 
         let token = match self.oauth.exchange_code(&params.code, &pkce.verifier).await {
-            Ok(t) => t,
+            Ok(t) => {
+                let mut lock = self.pending_auth.lock().unwrap_or_else(|e| e.into_inner());
+                lock.remove(&user_id_u64);
+                t
+            }
             Err(e) => {
                 tracing::warn!(error = %e, "oauth code exchange failed");
-                return "Failed to exchange the code with Spotify. Run `/login` to start over.".to_string();
+                return "Failed to exchange the code with Spotify. Check the pasted URL and try again, or run `/login` to start over.".to_string();
             }
         };
         let Some(refresh_token) = token.refresh_token.clone() else {
@@ -2351,8 +2393,21 @@ impl DiscordBot {
 
         let (ready_tx, ready_rx) = mpsc::channel(1);
 
-        let prebuffer_samples =
+        // The prebuffer target must fit inside the bridge, or the prebuffer
+        // loop can never reach it and every playback start burns the full
+        // wait against a saturated, dropping buffer.
+        let bridge_capacity =
+            SAMPLE_RATE as usize * CHANNELS as usize * config.audio_buffer_seconds;
+        let prebuffer_target =
             (config.prebuffer_seconds * SAMPLE_RATE as f32) as usize * CHANNELS as usize;
+        let prebuffer_samples = prebuffer_target.min(bridge_capacity);
+        if prebuffer_target > bridge_capacity {
+            tracing::warn!(
+                prebuffer_seconds = config.prebuffer_seconds,
+                audio_buffer_seconds = config.audio_buffer_seconds,
+                "PREBUFFER_SECONDS exceeds AUDIO_BUFFER_SECONDS — clamping prebuffer to the bridge capacity"
+            );
+        }
         let prebuffer_wait =
             std::time::Duration::from_secs_f32((config.prebuffer_seconds + 0.5).clamp(0.0, 5.0));
 

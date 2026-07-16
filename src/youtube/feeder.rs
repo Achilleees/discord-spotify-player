@@ -34,6 +34,20 @@ fn ensure_tmp_dir() -> std::io::Result<()> {
     std::fs::create_dir_all(crate::youtube::tmp_dir())
 }
 
+/// Best-effort removal of tmp files matching `prefix` — cancelled or failed
+/// downloads must not accumulate partials (yt-dlp runs with --no-part, so a
+/// killed download leaves its output behind).
+fn remove_partials(prefix: &str) {
+    let tmp = crate::youtube::tmp_dir();
+    if let Ok(entries) = std::fs::read_dir(std::path::Path::new(&tmp)) {
+        for entry in entries.flatten() {
+            if entry.file_name().to_string_lossy().starts_with(prefix) {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+}
+
 async fn download_youtube(url: &str, token: &CancellationToken) -> Result<std::path::PathBuf, FeederError> {
     ensure_tmp_dir().map_err(FeederError::Io)?;
     let id = Uuid::new_v4().to_string();
@@ -54,20 +68,22 @@ async fn download_youtube(url: &str, token: &CancellationToken) -> Result<std::p
         .spawn()
         .map_err(|e| FeederError::DownloadFailed(e.to_string()))?;
 
+    let prefix = format!("yt-{}", id);
     tokio::select! {
         status = child.wait() => {
             let s = status.map_err(FeederError::Io)?;
             if !s.success() {
+                remove_partials(&prefix);
                 return Err(FeederError::DownloadFailed(format!("yt-dlp exit code: {:?}", s.code())));
             }
         }
         _ = token.cancelled() => {
             let _ = child.kill().await;
+            remove_partials(&prefix);
             return Err(FeederError::Cancelled);
         }
     }
 
-    let prefix = format!("yt-{}", id);
     find_downloaded_file(&prefix)
 }
 
@@ -88,8 +104,16 @@ async fn download_attachment(url: &str, ext: &str, token: &CancellationToken) ->
     };
 
     tokio::select! {
-        result = download_fut => { result?; }
-        _ = token.cancelled() => { return Err(FeederError::Cancelled); }
+        result = download_fut => {
+            if let Err(e) = result {
+                let _ = std::fs::remove_file(&path);
+                return Err(e);
+            }
+        }
+        _ = token.cancelled() => {
+            let _ = std::fs::remove_file(&path);
+            return Err(FeederError::Cancelled);
+        }
     }
 
     Ok(path)
@@ -133,10 +157,12 @@ async fn feed_pcm_to_bridge(
         .ok_or_else(|| FeederError::ConvertFailed("no stdout".to_string()))?;
 
     let mut buf = vec![0u8; READ_CHUNK_BYTES];
-    // Holds the 1-3 trailing bytes left when a pipe read doesn't land on an
-    // f32 boundary, so they prefix the next read instead of being dropped
-    // (which would permanently shift every later sample and swap L/R).
-    let mut carry: Vec<u8> = Vec::with_capacity(4);
+    // Holds the 1-7 trailing bytes left when a pipe read doesn't land on a
+    // stereo-frame (two f32s = 8 bytes) boundary, so they prefix the next
+    // read instead of being dropped. Aligning to 4 bytes isn't enough: an odd
+    // number of whole samples makes the bridge drop the trailing one, which
+    // permanently shifts the interleaving and swaps L/R.
+    let mut carry: Vec<u8> = Vec::with_capacity(8);
     let mut frames_sent: u64 = 0;
     let mut start = Instant::now();
 
@@ -175,11 +201,12 @@ async fn feed_pcm_to_bridge(
             break;
         }
 
-        // Prepend any carried remainder, split into whole f32s, carry the tail.
+        // Prepend any carried remainder, split into whole stereo frames,
+        // carry the tail.
         let mut bytes = Vec::with_capacity(carry.len() + n);
         bytes.extend_from_slice(&carry);
         bytes.extend_from_slice(&buf[..n]);
-        let usable = bytes.len() - (bytes.len() % 4);
+        let usable = bytes.len() - (bytes.len() % 8);
         let samples: Vec<f32> = bytes[..usable]
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -207,7 +234,16 @@ async fn feed_pcm_to_bridge(
         }
     }
 
-    let _ = child.wait().await;
+    // EOF alone doesn't mean success: corrupt or non-audio input makes ffmpeg
+    // exit non-zero with little or no output, which must reach the user as a
+    // failure rather than a silently "finished" track.
+    let status = child.wait().await.map_err(FeederError::Io)?;
+    if !status.success() {
+        return Err(FeederError::ConvertFailed(format!(
+            "ffmpeg exit code: {:?}",
+            status.code()
+        )));
+    }
     Ok(())
 }
 

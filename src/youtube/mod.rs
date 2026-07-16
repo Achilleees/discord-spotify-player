@@ -13,3 +13,26 @@ pub fn tmp_dir() -> String {
 pub fn cookies_path() -> String {
     std::env::var("YOUTUBE_COOKIES").unwrap_or_else(|_| DEFAULT_COOKIES.to_string())
 }
+
+/// Remove leftover download files (`yt-*`, `file-*`) from the scratch dir.
+/// Runs at startup: a crash or kill mid-download leaves partials that
+/// otherwise accumulate forever.
+pub fn sweep_tmp_dir() {
+    let tmp = tmp_dir();
+    let Ok(entries) = std::fs::read_dir(std::path::Path::new(&tmp)) else {
+        return;
+    };
+    let mut removed = 0usize;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if (name.starts_with("yt-") || name.starts_with("file-"))
+            && std::fs::remove_file(entry.path()).is_ok()
+        {
+            removed += 1;
+        }
+    }
+    if removed > 0 {
+        tracing::info!(removed, dir = %tmp, "swept stale download files");
+    }
+}

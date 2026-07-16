@@ -221,8 +221,17 @@ pub fn parse_redirect(input: &str) -> Result<RedirectParams, String> {
         }
     }
 
-    // Bare code: no query string. Accept only if it plausibly is one.
-    if !trimmed.contains(' ') && (20..=1024).contains(&trimmed.len()) {
+    // Bare code: no query string. Accept only if it plausibly is one — not a
+    // URL pasted without its query (slashes, dots, colons), and only chars
+    // that appear in authorization codes.
+    let looks_like_url = trimmed.contains('/')
+        || trimmed.contains('?')
+        || trimmed.contains(':')
+        || trimmed.starts_with("localhost");
+    let code_charset = trimmed
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+    if !looks_like_url && code_charset && (20..=1024).contains(&trimmed.len()) {
         Ok(RedirectParams {
             code: trimmed.to_string(),
             state: None,

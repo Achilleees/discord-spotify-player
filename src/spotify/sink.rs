@@ -250,6 +250,14 @@ impl Sink for DiscordSink {
                     } else {
                         std::thread::yield_now();
                     }
+                } else if now - target > std::time::Duration::from_millis(250) {
+                    // A decode stall left the deadline in the past. Without a
+                    // rebase every later write is "late" and returns unpaced,
+                    // so the decoder bursts ahead, the bridge saturates and
+                    // drops, and playback latency ratchets up by the full
+                    // buffer depth for the rest of the session.
+                    self.start_instant = Some(now);
+                    self.frames_sent = 0;
                 }
                 Ok(())
             }

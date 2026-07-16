@@ -101,6 +101,7 @@ impl DJAnnouncer {
     pub fn new() -> Self {
         let clips_dir = dj_clips_dir();
         let _ = std::fs::create_dir_all(dj_cache_dir());
+        evict_cache(&dj_cache_dir());
         let greetings = load_clips_from_dir(&format!("{}/greetings", clips_dir));
         let transitions = load_clips_from_dir(&format!("{}/transitions", clips_dir));
 
@@ -195,6 +196,38 @@ impl DJAnnouncer {
             }
         }
     }
+}
+
+/// Cap the TTS mp3 cache: one file accumulates per unique announcement text
+/// and nothing else ever deletes them. Keeps the newest files up to the cap.
+fn evict_cache(dir: &str) {
+    const MAX_CACHE_FILES: usize = 500;
+    let Ok(entries) = std::fs::read_dir(std::path::Path::new(dir)) else {
+        return;
+    };
+    let mut cached: Vec<(std::time::SystemTime, PathBuf)> = entries
+        .flatten()
+        .filter(|e| {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            name.starts_with("dj-") && name.ends_with(".mp3")
+        })
+        .filter_map(|e| {
+            let modified = e.metadata().ok()?.modified().ok()?;
+            Some((modified, e.path()))
+        })
+        .collect();
+    if cached.len() <= MAX_CACHE_FILES {
+        return;
+    }
+    cached.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
+    let mut removed = 0usize;
+    for (_, path) in cached.drain(MAX_CACHE_FILES..) {
+        if std::fs::remove_file(path).is_ok() {
+            removed += 1;
+        }
+    }
+    tracing::info!(removed, cap = MAX_CACHE_FILES, "evicted old DJ cache clips");
 }
 
 fn load_clips_from_dir(dir: &str) -> Vec<Vec<f32>> {
