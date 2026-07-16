@@ -20,8 +20,6 @@ pub struct TokenResponse {
     pub access_token: String,
     pub refresh_token: Option<String>,
     pub expires_in: u64,
-    #[allow(dead_code)]
-    pub token_type: String,
 }
 
 /// A pending PKCE authorization: the verifier and state are held until the
@@ -241,7 +239,7 @@ pub fn parse_redirect(input: &str) -> Result<RedirectParams, String> {
     }
 }
 
-fn pct_encode(input: &str) -> String {
+pub fn pct_encode(input: &str) -> String {
     let mut out = String::with_capacity(input.len() * 3);
     for byte in input.bytes() {
         match byte {

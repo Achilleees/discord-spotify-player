@@ -13,8 +13,9 @@ fn dj_clips_dir() -> String {
 fn dj_cache_dir() -> String {
     std::env::var("DJ_CACHE_DIR").unwrap_or_else(|_| DEFAULT_DJ_CACHE_DIR.to_string())
 }
-const SAMPLE_RATE: u32 = 44_100;
-const CHANNELS: u32 = 2;
+// Local typed aliases of the canonical bridge format.
+const SAMPLE_RATE: u32 = crate::audio_bridge::SAMPLE_RATE as u32;
+const CHANNELS: u32 = crate::audio_bridge::CHANNELS as u32;
 
 const TRACK_TEMPLATES: &[&str] = &[
     // Full title + artist

@@ -28,17 +28,13 @@ struct SpotifyAlbum {
 #[derive(Deserialize)]
 struct SpotifyImage {
     url: String,
-    #[allow(dead_code)]
-    width: Option<u32>,
-    #[allow(dead_code)]
-    height: Option<u32>,
 }
 
 pub async fn fetch_track_metadata(
     track_id: &str,
     access_token: &str,
 ) -> Option<TrackMetadata> {
-    let client = reqwest::Client::new();
+    let client = super::webapi::client();
     let url = format!("https://api.spotify.com/v1/tracks/{}", track_id);
     let resp = client
         .get(&url)
@@ -59,6 +55,7 @@ pub async fn fetch_track_metadata(
         .map(|a| a.name.as_str())
         .collect::<Vec<_>>()
         .join(", ");
+    // Spotify lists album images largest-first, so first() is the largest.
     let album_art_url = track.album.images.first().map(|img| img.url.clone());
 
     Some(TrackMetadata {

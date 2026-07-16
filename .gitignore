@@ -3,6 +3,9 @@
 *.zip
 releases/
 
+# Machine-specific build helper (hardcodes a local MSVC path)
+build.bat
+
 # Environment and secrets
 .env
 *.pem
@@ -13,11 +16,10 @@ credentials.json
 .spotify_cache/
 
 # Per-user OAuth tokens: legacy JSON dir + the SQLite credential store
+# (glob covers -shm/-wal/-journal sidecars)
 .user_creds/
 .user_creds.migrated/
-spotibot.db
-spotibot.db-shm
-spotibot.db-wal
+spotibot.db*
 
 # IDE
 .idea/

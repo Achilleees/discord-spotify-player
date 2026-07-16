@@ -2,12 +2,22 @@ use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-const SPOTIFY_SAMPLE_RATE: usize = 44_100;
-const CHANNELS: usize = 2;
+/// Canonical stream format for every producer and consumer of the bridge
+/// (librespot sink, YouTube/file feeder, DJ overlay, Songbird reader). The
+/// other modules alias these into their local integer types.
+pub const SAMPLE_RATE: usize = 44_100;
+pub const CHANNELS: usize = 2;
 /// Gain applied to DJ overlay samples when mixed on top of the music.
 const OVERLAY_GAIN: f32 = 0.18;
+
+/// Wall-clock playout deadline after `frames_sent` frames from `start`. Both
+/// real-time producers (librespot sink, YouTube/file feeder) pace against
+/// this one computation so their deadline math can't drift apart.
+pub fn playout_deadline(start: std::time::Instant, frames_sent: u64) -> std::time::Instant {
+    start + std::time::Duration::from_secs_f64(frames_sent as f64 / SAMPLE_RATE as f64)
+}
 fn max_samples(buffer_seconds: usize) -> usize {
-    SPOTIFY_SAMPLE_RATE * CHANNELS * buffer_seconds
+    SAMPLE_RATE * CHANNELS * buffer_seconds
 }
 
 /// Shared audio buffer between Spotify (producer) and Discord (consumer)

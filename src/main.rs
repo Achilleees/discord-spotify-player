@@ -13,7 +13,7 @@ mod youtube;
 use audio_bridge::AudioBridge;
 use config::Config;
 use discord::DiscordBot;
-use discord::bot::{check_ytdlp_available, check_ffmpeg_available};
+use youtube::{check_ytdlp_available, check_ffmpeg_available};
 use oauth::SpotifyOAuth;
 use presence::PresenceUpdate;
 use users::UserStore;

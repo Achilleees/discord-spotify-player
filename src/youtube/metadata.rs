@@ -1,5 +1,8 @@
 use serde::Deserialize;
-use crate::queue::YOUTUBE_MAX_DURATION_SECS;
+
+/// Maximum queue-able track duration (seconds); the env var
+/// YOUTUBE_MAX_DURATION_SECS overrides it at runtime (checked below).
+pub const YOUTUBE_MAX_DURATION_SECS: u64 = 7200;
 
 #[derive(Debug, Clone)]
 pub struct YoutubeMetadata {

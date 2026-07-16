@@ -7,8 +7,8 @@ use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-const SAMPLE_RATE: u64 = 44_100;
-const CHANNELS: u64 = 2;
+// Local typed alias of the canonical bridge format.
+const CHANNELS: u64 = crate::audio_bridge::CHANNELS as u64;
 const READ_CHUNK_BYTES: usize = 8192;
 
 #[derive(Debug)]
@@ -221,7 +221,7 @@ async fn feed_pcm_to_bridge(
         let frames_in_chunk = samples_in_chunk / CHANNELS;
         frames_sent = frames_sent.saturating_add(frames_in_chunk);
 
-        let target = start + Duration::from_secs_f64(frames_sent as f64 / SAMPLE_RATE as f64);
+        let target = crate::audio_bridge::playout_deadline(start, frames_sent);
         let now = Instant::now();
         if target > now {
             let remaining = target - now;

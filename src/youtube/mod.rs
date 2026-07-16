@@ -14,6 +14,22 @@ pub fn cookies_path() -> String {
     std::env::var("YOUTUBE_COOKIES").unwrap_or_else(|_| DEFAULT_COOKIES.to_string())
 }
 
+pub fn check_ytdlp_available() -> bool {
+    std::process::Command::new("yt-dlp")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+pub fn check_ffmpeg_available() -> bool {
+    std::process::Command::new("ffmpeg")
+        .arg("-version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 /// Remove leftover download files (`yt-*`, `file-*`) from the scratch dir.
 /// Runs at startup: a crash or kill mid-download leaves partials that
 /// otherwise accumulate forever.

@@ -9,10 +9,7 @@ mod crypto;
 use crypto::TokenCipher;
 use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use std::path::Path;
 use std::sync::Mutex;
-
-const LEGACY_CREDS_DIR: &str = ".user_creds";
 
 /// A user's stored credentials, as seen by the rest of the app.
 #[derive(Clone)]
@@ -53,12 +50,14 @@ pub struct UserStore {
 
 impl UserStore {
     /// Open (creating if needed) the credential store at `db_path`, encrypting
-    /// tokens with `enc_key` when present. Legacy `.user_creds/*.json` files are
-    /// imported once and the directory retired.
+    /// tokens with `enc_key` when present.
     pub fn open(db_path: &str, enc_key: Option<&str>) -> rusqlite::Result<Self> {
         let conn = Connection::open(db_path)?;
         // The DB holds tokens (encrypted or not); keep it owner-only on unix.
         restrict_permissions(db_path);
+        // last_used_at/created_at are written but never queried here: the
+        // schema is intentional parity with nob's 002-music.sql (see PORT.md),
+        // which does consume them.
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
              CREATE TABLE IF NOT EXISTS spotify_credentials (
@@ -84,7 +83,6 @@ impl UserStore {
                 "TOKEN_ENC_KEY not set — OAuth tokens are stored unencrypted in the database"
             );
         }
-        store.import_legacy_json();
         Ok(store)
     }
 
@@ -264,52 +262,6 @@ impl UserStore {
             .collect()
     }
 
-    /// Import legacy `.user_creds/*.json` records once, then rename the
-    /// directory so plaintext token files stop lingering and we don't re-import.
-    fn import_legacy_json(&self) {
-        let dir = Path::new(LEGACY_CREDS_DIR);
-        if !dir.is_dir() {
-            return;
-        }
-        let entries = match std::fs::read_dir(dir) {
-            Ok(e) => e,
-            Err(_) => return,
-        };
-        let mut imported = 0usize;
-        for entry in entries.filter_map(|e| e.ok()) {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("json") {
-                continue;
-            }
-            let Ok(data) = std::fs::read_to_string(&path) else { continue };
-            let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) else { continue };
-            let get = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or_default().to_string();
-            let discord_user_id = get("discord_user_id");
-            if discord_user_id.is_empty() {
-                continue;
-            }
-            let spotify_username = get("spotify_username");
-            let creds = UserCredentials {
-                discord_name: spotify_username.clone(),
-                discord_user_id,
-                spotify_username,
-                access_token: get("access_token"),
-                refresh_token: get("refresh_token"),
-                active: v.get("active").and_then(|x| x.as_bool()).unwrap_or(false),
-            };
-            if self.save(&creds).is_ok() {
-                imported += 1;
-            }
-        }
-        if imported > 0 {
-            tracing::info!(imported, "migrated legacy .user_creds JSON into the database");
-        }
-        // Delete the legacy dir rather than renaming it — leaving plaintext
-        // token files at rest (even under a .migrated name) defeats the point.
-        if let Err(e) = std::fs::remove_dir_all(dir) {
-            tracing::warn!(error = %e, "failed to delete legacy .user_creds dir after migration");
-        }
-    }
 }
 
 /// Restrict the credential DB to owner-only (0600) on unix. No-op elsewhere

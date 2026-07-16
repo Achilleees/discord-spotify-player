@@ -6,8 +6,9 @@ use songbird::input::{Input, RawAdapter};
 use std::io::{Read, Seek, SeekFrom};
 use std::sync::Arc;
 
-pub const SAMPLE_RATE: u32 = 44_100;
-pub const CHANNELS: u32 = 2;
+// Local typed aliases of the canonical bridge format.
+pub const SAMPLE_RATE: u32 = crate::audio_bridge::SAMPLE_RATE as u32;
+pub const CHANNELS: u32 = crate::audio_bridge::CHANNELS as u32;
 
 pub struct TrackErrorHandler;
 

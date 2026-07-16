@@ -1,8 +1,5 @@
 use std::collections::VecDeque;
 
-/// Maximum YouTube duration (seconds). Configurable via env YOUTUBE_MAX_DURATION_SECS.
-pub const YOUTUBE_MAX_DURATION_SECS: u64 = 7200; // 2 hours default
-
 #[derive(Clone, Debug)]
 pub enum MediaSource {
     YouTube {
@@ -11,14 +8,11 @@ pub enum MediaSource {
         title: String,
         channel: String,
         thumbnail_url: Option<String>,
-        #[allow(dead_code)]
         duration_secs: u64,
     },
     File {
         filename: String,
         attachment_url: String,
-        #[allow(dead_code)]
-        content_type: Option<String>,
     },
 }
 
@@ -37,6 +31,24 @@ impl MediaSource {
         }
     }
 
+    /// Track length as "M:SS" (or "H:MM:SS"); None for file uploads, whose
+    /// length isn't known until decode.
+    pub fn display_duration(&self) -> Option<String> {
+        match self {
+            MediaSource::YouTube { duration_secs, .. } => {
+                let h = duration_secs / 3600;
+                let m = (duration_secs % 3600) / 60;
+                let s = duration_secs % 60;
+                Some(if h > 0 {
+                    format!("{h}:{m:02}:{s:02}")
+                } else {
+                    format!("{m}:{s:02}")
+                })
+            }
+            MediaSource::File { .. } => None,
+        }
+    }
+
     pub fn embed_color(&self) -> u32 {
         match self {
             MediaSource::YouTube { .. } => 0xFF0000,
@@ -49,7 +61,6 @@ impl MediaSource {
 pub struct QueueItem {
     pub source: MediaSource,
     pub queued_by: String,
-    #[allow(dead_code)]
     pub queued_by_id: u64,
 }
 
@@ -111,6 +122,24 @@ mod tests {
             queued_by: "me".into(),
             queued_by_id: 1,
         }
+    }
+
+    #[test]
+    fn duration_formats_as_clock_time() {
+        let src = |secs| MediaSource::YouTube {
+            url: "u".into(),
+            video_id: "v".into(),
+            title: "t".into(),
+            channel: "c".into(),
+            thumbnail_url: None,
+            duration_secs: secs,
+        };
+        assert_eq!(src(59).display_duration().unwrap(), "0:59");
+        assert_eq!(src(75).display_duration().unwrap(), "1:15");
+        assert_eq!(src(3600).display_duration().unwrap(), "1:00:00");
+        assert_eq!(src(3725).display_duration().unwrap(), "1:02:05");
+        let file = MediaSource::File { filename: "f.mp3".into(), attachment_url: "a".into() };
+        assert!(file.display_duration().is_none());
     }
 
     #[test]

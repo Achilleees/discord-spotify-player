@@ -802,7 +802,6 @@ dependencies = [
  "chacha20poly1305",
  "dialoguer",
  "dotenvy",
- "futures-util",
  "hex",
  "librespot-connect",
  "librespot-core",
@@ -4966,7 +4965,6 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
- "futures-util",
  "pin-project-lite",
  "tokio",
 ]

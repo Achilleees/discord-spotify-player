@@ -235,10 +235,7 @@ impl Sink for DiscordSink {
                     std::time::Instant::now()
                 });
                 self.frames_sent = self.frames_sent.saturating_add(frames_out);
-                let target = start
-                    + std::time::Duration::from_secs_f64(
-                        self.frames_sent as f64 / SAMPLE_RATE as f64,
-                    );
+                let target = crate::audio_bridge::playout_deadline(start, self.frames_sent);
                 let now = std::time::Instant::now();
                 if target > now {
                     let remaining = target - now;

@@ -4,7 +4,6 @@ use crate::presence::PresenceUpdate;
 use crate::spotify::sink::{DiscordSink, DspConfig};
 use librespot_connect::{ConnectConfig, Spirc};
 use librespot_core::authentication::Credentials;
-use librespot_core::cache::Cache;
 use librespot_core::config::{DeviceType, SessionConfig};
 use librespot_core::session::Session;
 use librespot_core::SpotifyUri;
@@ -19,7 +18,7 @@ use tokio::sync::mpsc;
 
 const CACHE_DIR: &str = ".spotify_cache";
 const DEVICE_ID_FILE: &str = "device_id";
-const MAX_CACHED_RECONNECTS: usize = 5;
+const MAX_FAST_RECONNECTS: usize = 5;
 const MIN_STABLE_SESSION_SECS: u64 = 60;
 
 /// Commands that can be sent to the active Spirc instance from the priority queue manager.
@@ -82,16 +81,15 @@ impl SpotifyPlayer {
         id
     }
 
-    fn create_cache() -> Result<Cache, Box<dyn std::error::Error + Send + Sync>> {
-        Ok(Cache::new(Some(Self::cache_dir()), None, None, None)?)
-    }
-
-    fn create_session(cache: &Cache, device_id: &str) -> Session {
+    // No librespot Cache: it only persisted reusable credentials that nothing
+    // ever read back — every (re)connect authenticates with the OAuth access
+    // token. Only the device_id file above needs the cache directory.
+    fn create_session(device_id: &str) -> Session {
         let session_config = SessionConfig {
             device_id: device_id.to_string(),
             ..SessionConfig::default()
         };
-        Session::new(session_config, Some(cache.clone()))
+        Session::new(session_config, None)
     }
 
     fn connect_config(device_name: &str) -> ConnectConfig {
@@ -112,10 +110,11 @@ impl SpotifyPlayer {
         match track_uri {
             SpotifyUri::Track { .. } => {
                 let track = Track::get(session, track_uri).await.ok()?;
+                // All artists, joined — matching the Web API path the embeds
+                // use, so bot status and embed can't disagree.
                 let artist_names: Vec<_> = track
                     .artists
                     .iter()
-                    .take(2)
                     .map(|a| a.name.clone())
                     .collect();
                 let artist = if artist_names.is_empty() {
@@ -234,7 +233,6 @@ impl SpotifyPlayer {
         end_of_track_tx: Option<mpsc::UnboundedSender<()>>,
         spirc_cmd_rx: &mut Option<mpsc::UnboundedReceiver<SpircCommand>>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let cache = Self::create_cache()?;
         let device_id = Self::resolve_device_id(config);
         let device_name = config.device_name.clone();
         let mut reconnects: usize = 0;
@@ -243,7 +241,7 @@ impl SpotifyPlayer {
 
         loop {
             bridge.clear();
-            let session = Self::create_session(&cache, &device_id);
+            let session = Self::create_session(&device_id);
             let connect_config = Self::connect_config(&device_name);
             let mixer: Arc<dyn Mixer> = Arc::new(
                 SoftMixer::open(MixerConfig::default()).expect("Failed to create audio mixer"),
@@ -329,7 +327,7 @@ impl SpotifyPlayer {
                 reconnects = 0;
             }
 
-            if reconnects < MAX_CACHED_RECONNECTS {
+            if reconnects < MAX_FAST_RECONNECTS {
                 reconnects += 1;
                 let delay = std::time::Duration::from_secs(2u64.saturating_mul(reconnects as u64));
                 tracing::info!(attempt = reconnects, delay = ?delay, "oauth session dropped, fast reconnect");

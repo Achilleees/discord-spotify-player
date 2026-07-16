@@ -11,7 +11,6 @@ use crate::spotify::metadata::{fetch_track_metadata, TrackMetadata};
 use crate::spotify::SpotifyPlayer;
 use crate::spotify::SpircCommand;
 use crate::youtube::metadata::{fetch_youtube_metadata, validate_attachment};
-// P0/P1 imports used below
 use crate::youtube::feeder::{feed_youtube_to_bridge, feed_file_to_bridge, FeederError};
 use crate::users::{UserCredentials, UserStore};
 use serenity::all::{
@@ -32,8 +31,10 @@ use songbird::tracks::TrackHandle;
 use songbird::SerenityInit;
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
+// parking_lot: no lock poisoning, so no unwrap_or_else(into_inner)
+// incantation at every acquisition (audio_bridge already uses it).
+use parking_lot::Mutex;
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 use tokio::sync::mpsc;
@@ -242,7 +243,7 @@ async fn play_join_sound_then_bridge(
     let _ = track_handle.add_event(Event::Track(TrackEvent::Error), TrackErrorHandler);
     let _ = track_handle.add_event(Event::Track(TrackEvent::End), TrackErrorHandler);
     tracing::info!(track_uuid = ?track_handle.uuid(), "bridge reader connected after join sound");
-    let mut lock = track_handle_store.lock().unwrap_or_else(|e| e.into_inner());
+    let mut lock = track_handle_store.lock();
     *lock = Some(track_handle);
 }
 
@@ -301,12 +302,16 @@ fn build_priority_now_playing_embed(item: &QueueItem) -> CreateEmbed {
         MediaSource::File { .. } => "📎",
     };
 
+    let footer_text = match item.source.display_duration() {
+        Some(d) => format!("{} {} · {}", footer_icon, item.queued_by, d),
+        None => format!("{} {}", footer_icon, item.queued_by),
+    };
     let mut embed = CreateEmbed::new()
         .color(color)
         .author(CreateEmbedAuthor::new("Now Playing"))
         .title(format!("{} — {}", title, subtitle))
         .timestamp(Timestamp::now())
-        .footer(CreateEmbedFooter::new(format!("{} {}", footer_icon, item.queued_by)));
+        .footer(CreateEmbedFooter::new(footer_text));
 
     if let MediaSource::YouTube { video_id, thumbnail_url, .. } = &item.source {
         let url = format!("https://www.youtube.com/watch?v={}", video_id);
@@ -320,7 +325,10 @@ fn build_priority_now_playing_embed(item: &QueueItem) -> CreateEmbed {
 }
 
 fn build_priority_history_embed(item: &QueueItem) -> CreateEmbed {
-    let footer_text = format!("played by {}", item.queued_by);
+    let footer_text = match item.source.display_duration() {
+        Some(d) => format!("played by {} · {}", item.queued_by, d),
+        None => format!("played by {}", item.queued_by),
+    };
     let description = match &item.source {
         MediaSource::YouTube { title, channel, video_id, .. } => {
             format!("[{} — {}](https://www.youtube.com/watch?v={})", title, channel, video_id)
@@ -393,7 +401,7 @@ async fn delete_and_repost_controls(
     active_user: Option<&str>,
 ) {
     let old_id = {
-        let lock = controls_message_id.lock().unwrap_or_else(|e| e.into_inner());
+        let lock = controls_message_id.lock();
         *lock
     };
     if let Some(mid) = old_id {
@@ -401,7 +409,7 @@ async fn delete_and_repost_controls(
     }
 
     let new_id = post_controls(ctx, text_channel_id, active_user).await;
-    let mut lock = controls_message_id.lock().unwrap_or_else(|e| e.into_inner());
+    let mut lock = controls_message_id.lock();
     *lock = new_id;
 }
 
@@ -431,7 +439,7 @@ fn is_valid_track_id(id: &str) -> bool {
 /// Fire a Spotify Web API player command. Returns whether it succeeded so the
 /// caller can surface failures to the user.
 async fn spotify_playback_command(access_token: &str, method: &str, endpoint: &str) -> bool {
-    let client = reqwest::Client::new();
+    let client = crate::spotify::webapi::client();
     let url = format!("https://api.spotify.com/v1/me/player/{}", endpoint);
     let req = match method {
         "POST" => client.post(&url),
@@ -469,13 +477,13 @@ async fn post_priority_now_playing(
     now_playing_message_id: &Arc<Mutex<Option<MessageId>>>,
 ) {
     let ctx = {
-        let lock = ctx_store.lock().unwrap_or_else(|e| e.into_inner());
+        let lock = ctx_store.lock();
         match lock.clone() { Some(c) => c, None => return }
     };
 
     // Delete previous now-playing
     let prev_np = {
-        let lock = now_playing_message_id.lock().unwrap_or_else(|e| e.into_inner());
+        let lock = now_playing_message_id.lock();
         *lock
     };
     if let Some(mid) = prev_np {
@@ -484,7 +492,7 @@ async fn post_priority_now_playing(
 
     // Delete old controls
     let old_ctrl = {
-        let lock = controls_message_id.lock().unwrap_or_else(|e| e.into_inner());
+        let lock = controls_message_id.lock();
         *lock
     };
     if let Some(mid) = old_ctrl {
@@ -500,9 +508,9 @@ async fn post_priority_now_playing(
 
     match text_channel_id.send_message(&ctx, msg).await {
         Ok(m) => {
-            let mut np_lock = now_playing_message_id.lock().unwrap_or_else(|e| e.into_inner());
+            let mut np_lock = now_playing_message_id.lock();
             *np_lock = Some(m.id);
-            let mut ctrl_lock = controls_message_id.lock().unwrap_or_else(|e| e.into_inner());
+            let mut ctrl_lock = controls_message_id.lock();
             *ctrl_lock = Some(m.id);
         }
         Err(e) => tracing::warn!(error = ?e, "failed to send priority now-playing"),
@@ -515,7 +523,7 @@ async fn post_priority_history(
     item: &QueueItem,
 ) {
     let ctx = {
-        let lock = ctx_store.lock().unwrap_or_else(|e| e.into_inner());
+        let lock = ctx_store.lock();
         match lock.clone() { Some(c) => c, None => return }
     };
 
@@ -566,7 +574,7 @@ async fn run_queue_drain(d: &QueueDrainCtx) {
     let mut cancelled = false;
     loop {
         let item = {
-            let mut lock = d.priority_queue.lock().unwrap_or_else(|e| e.into_inner());
+            let mut lock = d.priority_queue.lock();
             lock.pop()
         };
         let item = match item {
@@ -579,7 +587,7 @@ async fn run_queue_drain(d: &QueueDrainCtx) {
         // bridge-reader track unless it sees an active priority item — which
         // would leave the whole item playing into a paused output.
         {
-            let mut lock = d.active_priority_item.lock().unwrap_or_else(|e| e.into_inner());
+            let mut lock = d.active_priority_item.lock();
             *lock = Some(item.clone());
         }
 
@@ -594,7 +602,7 @@ async fn run_queue_drain(d: &QueueDrainCtx) {
         // or idle before this drain); resume it so the feeder is heard.
         {
             let handle = {
-                let lock = d.track_handle.lock().unwrap_or_else(|e| e.into_inner());
+                let lock = d.track_handle.lock();
                 lock.clone()
             };
             if let Some(h) = handle {
@@ -619,7 +627,7 @@ async fn run_queue_drain(d: &QueueDrainCtx) {
 
         let token = CancellationToken::new();
         {
-            let mut lock = d.feeder_cancel.lock().unwrap_or_else(|e: std::sync::PoisonError<_>| e.into_inner());
+            let mut lock = d.feeder_cancel.lock();
             *lock = Some(token.clone());
         }
         d.feeder_paused.store(false, Ordering::Relaxed);
@@ -635,7 +643,7 @@ async fn run_queue_drain(d: &QueueDrainCtx) {
         };
 
         {
-            let mut lock = d.active_priority_item.lock().unwrap_or_else(|e| e.into_inner());
+            let mut lock = d.active_priority_item.lock();
             *lock = None;
         }
 
@@ -652,12 +660,13 @@ async fn run_queue_drain(d: &QueueDrainCtx) {
             Err(e) => {
                 tracing::warn!("feeder error: {}", e);
                 let ctx = {
-                    let lock = d.ctx.lock().unwrap_or_else(|e| e.into_inner());
+                    let lock = d.ctx.lock();
                     lock.clone()
                 };
                 if let Some(ctx) = ctx {
                     let msg = CreateMessage::new().content(format!(
-                        "⚠️ Couldn't play **{}** — the download or decode failed.",
+                        "⚠️ <@{}> Couldn't play **{}** — the download or decode failed.",
+                        item.queued_by_id,
                         item.source.display_title()
                     ));
                     let _ = d.text_channel_id.send_message(&ctx, msg).await;
@@ -680,16 +689,16 @@ async fn run_queue_drain(d: &QueueDrainCtx) {
         .unwrap_or(false);
     if !resumed {
         let ctx = {
-            let lock = d.ctx.lock().unwrap_or_else(|e| e.into_inner());
+            let lock = d.ctx.lock();
             lock.clone()
         };
         if let Some(ctx) = ctx {
             let np = {
-                let mut lock = d.now_playing_message_id.lock().unwrap_or_else(|e| e.into_inner());
+                let mut lock = d.now_playing_message_id.lock();
                 lock.take()
             };
             let ctrl = {
-                let lock = d.controls_message_id.lock().unwrap_or_else(|e| e.into_inner());
+                let lock = d.controls_message_id.lock();
                 *lock
             };
             if let Some(mid) = np {
@@ -790,10 +799,10 @@ async fn run_presence_loop_with_track(
             // playback. Only pause it on Spotify pause/idle when no priority
             // item is active — otherwise we'd starve the feeder's audio.
             let priority_active = {
-                let lock = active_priority_item.lock().unwrap_or_else(|e| e.into_inner());
+                let lock = active_priority_item.lock();
                 lock.is_some()
             };
-            let lock = track_handle_store.lock().unwrap_or_else(|e| e.into_inner());
+            let lock = track_handle_store.lock();
             if let Some(handle) = lock.as_ref() {
                 match &update {
                     PresenceUpdate::Playing { .. } => { let _ = handle.play(); }
@@ -812,7 +821,7 @@ async fn run_presence_loop_with_track(
         }
         if was_paused != is_paused {
             let msg_id = {
-                let lock = controls_message_id.lock().unwrap_or_else(|e| e.into_inner());
+                let lock = controls_message_id.lock();
                 *lock
             };
             if let Some(mid) = msg_id {
@@ -834,7 +843,7 @@ async fn run_presence_loop_with_track(
                 last_track_key = Some(track_key.clone());
 
                 let (spotify_name, fresh_token) = {
-                    let lock = active_session.lock().unwrap_or_else(|e| e.into_inner());
+                    let lock = active_session.lock();
                     match lock.as_ref() {
                         Some(s) => (s.discord_name.clone(), Some(s.access_token.clone())),
                         None => (String::new(), None),
@@ -842,7 +851,7 @@ async fn run_presence_loop_with_track(
                 };
 
                 let prev_msg_id = {
-                    let lock = now_playing_message_id.lock().unwrap_or_else(|e| e.into_inner());
+                    let lock = now_playing_message_id.lock();
                     *lock
                 };
                 if let Some(mid) = prev_msg_id {
@@ -878,7 +887,7 @@ async fn run_presence_loop_with_track(
 
                 {
                     let old_ctrl = {
-                        let lock = controls_message_id.lock().unwrap_or_else(|e| e.into_inner());
+                        let lock = controls_message_id.lock();
                         *lock
                     };
                     if let Some(mid) = old_ctrl {
@@ -889,16 +898,16 @@ async fn run_presence_loop_with_track(
                 match text_channel_id.send_message(&ctx, msg).await {
                     Ok(m) => {
                         tracing::info!(title = %title, artist = %artist, "now-playing embed sent");
-                        let mut lock = now_playing_message_id.lock().unwrap_or_else(|e| e.into_inner());
+                        let mut lock = now_playing_message_id.lock();
                         *lock = Some(m.id);
-                        let mut ctrl_lock = controls_message_id.lock().unwrap_or_else(|e| e.into_inner());
+                        let mut ctrl_lock = controls_message_id.lock();
                         *ctrl_lock = Some(m.id);
                     }
                     Err(e) => tracing::warn!(error = ?e, "failed to send now-playing embed"),
                 }
 
                 {
-                    let mut lock = last_meta_store.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut lock = last_meta_store.lock();
                     *lock = Some(meta.clone());
                 }
                 last_meta = Some(meta);
@@ -961,24 +970,8 @@ async fn startup_controls(
     }
 
     let new_id = post_controls(ctx, text_channel_id, None).await;
-    let mut lock = controls_message_id.lock().unwrap_or_else(|e| e.into_inner());
+    let mut lock = controls_message_id.lock();
     *lock = new_id;
-}
-
-pub fn check_ytdlp_available() -> bool {
-    std::process::Command::new("yt-dlp")
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
-pub fn check_ffmpeg_available() -> bool {
-    std::process::Command::new("ffmpeg")
-        .arg("-version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
 }
 
 #[async_trait]
@@ -992,7 +985,7 @@ impl EventHandler for Handler {
         }
 
         {
-            let mut ctx_store = self.ctx.lock().unwrap_or_else(|e| e.into_inner());
+            let mut ctx_store = self.ctx.lock();
             *ctx_store = Some(ctx.clone());
         }
         // try_send: main() consumes exactly one ready signal then parks, so a
@@ -1012,7 +1005,7 @@ impl EventHandler for Handler {
         }
 
         let rx_taken = {
-            let mut presence_rx = self.presence_rx.lock().unwrap_or_else(|e| e.into_inner());
+            let mut presence_rx = self.presence_rx.lock();
             presence_rx.take()
         };
         if let Some(rx) = rx_taken {
@@ -1059,11 +1052,11 @@ impl EventHandler for Handler {
             if new.channel_id.is_none() {
                 let anything_active = {
                     let session = {
-                        let lock = self.active_session.lock().unwrap_or_else(|e| e.into_inner());
+                        let lock = self.active_session.lock();
                         lock.is_some()
                     };
                     let priority = {
-                        let lock = self.active_priority_item.lock().unwrap_or_else(|e| e.into_inner());
+                        let lock = self.active_priority_item.lock();
                         lock.is_some()
                     };
                     session || priority || self.drain_active.load(Ordering::SeqCst)
@@ -1110,19 +1103,17 @@ impl EventHandler for Handler {
     }
 
     async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
-        tracing::info!("interaction_create fired");
-
         if let Interaction::Component(component) = &interaction {
             let custom_id = component.data.custom_id.as_str();
-            tracing::info!(custom_id, "button interaction received");
+            tracing::debug!(custom_id, "button interaction received");
 
             let access_token = {
-                let lock = self.active_session.lock().unwrap_or_else(|e| e.into_inner());
+                let lock = self.active_session.lock();
                 lock.as_ref().map(|s| s.access_token.clone())
             };
 
             let priority_playing = {
-                let lock = self.active_priority_item.lock().unwrap_or_else(|e| e.into_inner());
+                let lock = self.active_priority_item.lock();
                 lock.is_some()
             };
 
@@ -1163,9 +1154,9 @@ impl EventHandler for Handler {
                         let current = self.feeder_paused.load(Ordering::Relaxed);
                         let new_paused = !current;
                         self.feeder_paused.store(new_paused, Ordering::Relaxed);
-                        // P1: Update button visual to reflect pause/play state
+                        // Update the button visual to reflect pause/play state.
                         let msg_id = {
-                            let lock = self.controls_message_id.lock().unwrap_or_else(|e| e.into_inner());
+                            let lock = self.controls_message_id.lock();
                             *lock
                         };
                         if let Some(mid) = msg_id {
@@ -1176,7 +1167,7 @@ impl EventHandler for Handler {
                         if current { "▶ Resumed".to_string() } else { "⏸ Paused".to_string() }
                     } else if let Some(token) = &access_token {
                         let handle_clone = {
-                            let lock = self.track_handle.lock().unwrap_or_else(|e| e.into_inner());
+                            let lock = self.track_handle.lock();
                             lock.as_ref().cloned()
                         };
                         let is_paused = if let Some(h) = handle_clone {
@@ -1200,7 +1191,7 @@ impl EventHandler for Handler {
                 }
                 "ctrl_queue_hint" => {
                     let pq_snapshot = {
-                        let lock = self.priority_queue.lock().unwrap_or_else(|e| e.into_inner());
+                        let lock = self.priority_queue.lock();
                         lock.snapshot()
                     };
                     let mut lines = vec![];
@@ -1213,7 +1204,10 @@ impl EventHandler for Handler {
                     if !pq_snapshot.is_empty() {
                         lines.push(format!("\nPriority queue ({} item(s)):", pq_snapshot.len()));
                         for (i, item) in pq_snapshot.iter().enumerate().take(5) {
-                            lines.push(format!("  {}. {} — queued by {}", i + 1, item.source.display_title(), item.queued_by));
+                            let duration = item.source.display_duration()
+                                .map(|d| format!(" ({d})"))
+                                .unwrap_or_default();
+                            lines.push(format!("  {}. {}{} — queued by {}", i + 1, item.source.display_title(), duration, item.queued_by));
                         }
                     }
                     let content = if lines.is_empty() { "Nothing in queue.".to_string() } else { lines.join("\n") };
@@ -1247,7 +1241,7 @@ impl EventHandler for Handler {
             Some(c) => c,
             None => { tracing::warn!("interaction was not a command or component"); return; }
         };
-        tracing::info!(command = %cmd.data.name, "processing slash command");
+        tracing::debug!(command = %cmd.data.name, "processing slash command");
 
         let code_arg: Option<String> = cmd
             .data
@@ -1339,25 +1333,45 @@ impl EventHandler for Handler {
     }
 }
 
+/// Pure voice-gate policy (PORT.md locked decision 4): with the bot in a
+/// channel the user must share it; with the bot in none, `allow_follow`
+/// decides whether being in any voice channel suffices (the /play
+/// fresh-boot path, where the bot joins the requester).
+fn voice_gate(
+    bot_ch: Option<ChannelId>,
+    user_ch: Option<ChannelId>,
+    allow_follow: bool,
+) -> bool {
+    match bot_ch {
+        Some(bc) => user_ch == Some(bc),
+        None => allow_follow && user_ch.is_some(),
+    }
+}
+
 impl Handler {
+    /// The bot's and the given user's current voice channels, from the cache.
+    fn voice_channels(&self, ctx: &Context, user_id: UserId) -> (Option<ChannelId>, Option<ChannelId>) {
+        let bot_id = ctx.cache.current_user().id;
+        match self.guild_id.to_guild_cached(ctx) {
+            Some(guild) => (
+                guild.voice_states.get(&bot_id).and_then(|vs| vs.channel_id),
+                guild.voice_states.get(&user_id).and_then(|vs| vs.channel_id),
+            ),
+            None => (None, None),
+        }
+    }
+
     /// nob's control rule: a member may drive playback only while sharing the
     /// bot's voice channel. False when the bot isn't in a channel, the user
     /// isn't in one, or they differ.
     fn user_in_bot_voice_channel(&self, ctx: &Context, user_id: UserId) -> bool {
-        let bot_id = ctx.cache.current_user().id;
-        match self.guild_id.to_guild_cached(ctx) {
-            Some(guild) => {
-                let bot_ch = guild.voice_states.get(&bot_id).and_then(|vs| vs.channel_id);
-                let user_ch = guild.voice_states.get(&user_id).and_then(|vs| vs.channel_id);
-                bot_ch.is_some() && bot_ch == user_ch
-            }
-            None => false,
-        }
+        let (bot_ch, user_ch) = self.voice_channels(ctx, user_id);
+        voice_gate(bot_ch, user_ch, false)
     }
 
     /// The Discord user id of the current session owner, if any.
     fn active_owner(&self) -> Option<u64> {
-        let lock = self.active_session.lock().unwrap_or_else(|e| e.into_inner());
+        let lock = self.active_session.lock();
         lock.as_ref().map(|s| s.discord_user_id)
     }
 
@@ -1367,7 +1381,7 @@ impl Handler {
     /// the bot is force-disconnected.
     async fn teardown_playback_session(&self, ctx: &Context, leave_voice: bool) {
         let owner = {
-            let mut lock = self.active_session.lock().unwrap_or_else(|e| e.into_inner());
+            let mut lock = self.active_session.lock();
             lock.take().map(|session| {
                 session.abort();
                 tracing::info!(user = session.discord_user_id, "aborted session (teardown)");
@@ -1398,18 +1412,18 @@ impl Handler {
     /// clear the queue, and clear the active item.
     fn stop_priority_playback(&self) {
         let token = {
-            let lock = self.feeder_cancel.lock().unwrap_or_else(|e: std::sync::PoisonError<_>| e.into_inner());
+            let lock = self.feeder_cancel.lock();
             lock.clone()
         };
         if let Some(t) = token {
             t.cancel();
         }
         {
-            let mut lock = self.priority_queue.lock().unwrap_or_else(|e| e.into_inner());
+            let mut lock = self.priority_queue.lock();
             lock.clear();
         }
         {
-            let mut lock = self.active_priority_item.lock().unwrap_or_else(|e| e.into_inner());
+            let mut lock = self.active_priority_item.lock();
             *lock = None;
         }
     }
@@ -1418,18 +1432,8 @@ impl Handler {
     /// they must share it (the control rule); if the bot is in no channel yet,
     /// they only need to be in one so the bot can follow them in.
     fn user_can_play(&self, ctx: &Context, user_id: UserId) -> bool {
-        let bot_id = ctx.cache.current_user().id;
-        match self.guild_id.to_guild_cached(ctx) {
-            Some(guild) => {
-                let bot_ch = guild.voice_states.get(&bot_id).and_then(|vs| vs.channel_id);
-                let user_ch = guild.voice_states.get(&user_id).and_then(|vs| vs.channel_id);
-                match bot_ch {
-                    Some(bc) => user_ch == Some(bc),
-                    None => user_ch.is_some(),
-                }
-            }
-            None => false,
-        }
+        let (bot_ch, user_ch) = self.voice_channels(ctx, user_id);
+        voice_gate(bot_ch, user_ch, true)
     }
 
     /// Join the given user's voice channel (falling back to the configured
@@ -1437,7 +1441,7 @@ impl Handler {
     /// join-sound + bridge hookup. Returns whether the join succeeded.
     async fn join_voice_for_user(&self, discord_user_id: Option<u64>) -> bool {
         let ctx = {
-            let lock = self.ctx.lock().unwrap_or_else(|e| e.into_inner());
+            let lock = self.ctx.lock();
             match lock.clone() {
                 Some(c) => c,
                 None => { tracing::warn!("no ctx available for voice join"); return false; }
@@ -1533,7 +1537,7 @@ impl Handler {
                     // skip looks like the bot lost Spotify support entirely.
                     let _ = self.user_store.deactivate(&user.discord_user_id);
                     let ctx = {
-                        let lock = self.ctx.lock().unwrap_or_else(|e| e.into_inner());
+                        let lock = self.ctx.lock();
                         lock.clone()
                     };
                     if let Some(ctx) = ctx {
@@ -1591,7 +1595,7 @@ impl Handler {
         let refresh_now = Arc::new(Notify::new());
 
         {
-            let mut lock = active_session.lock().unwrap_or_else(|e| e.into_inner());
+            let mut lock = active_session.lock();
             if let Some(old) = lock.take() {
                 tracing::info!(old_user = old.discord_user_id, "aborting existing librespot session");
                 old.abort();
@@ -1607,7 +1611,7 @@ impl Handler {
 
         {
             let ctx = {
-                let lock = self.ctx.lock().unwrap_or_else(|e| e.into_inner());
+                let lock = self.ctx.lock();
                 lock.clone()
             };
             if let Some(ctx) = ctx {
@@ -1621,7 +1625,7 @@ impl Handler {
 
         // Store spirc_cmd_tx
         {
-            let mut lock = self.spirc_cmd_tx.lock().unwrap_or_else(|e| e.into_inner());
+            let mut lock = self.spirc_cmd_tx.lock();
             *lock = Some(spirc_tx.clone());
         }
 
@@ -1677,12 +1681,12 @@ impl Handler {
                             tracing::debug!(user = discord_user_id, "early token refresh requested");
                         }
                     }
-                    let current_refresh = { token_state.lock().unwrap_or_else(|e| e.into_inner()).1.clone() };
+                    let current_refresh = { token_state.lock().1.clone() };
                     match oauth.refresh_access_token(&current_refresh).await {
                         Ok(tok) => {
                             let new_refresh = tok.refresh_token.clone().unwrap_or(current_refresh);
                             {
-                                let mut s = token_state.lock().unwrap_or_else(|e| e.into_inner());
+                                let mut s = token_state.lock();
                                 s.0 = tok.access_token.clone();
                                 s.1 = new_refresh.clone();
                             }
@@ -1692,7 +1696,7 @@ impl Handler {
                                 let _ = user_store.save(&creds);
                             }
                             {
-                                let mut lock = active_session.lock().unwrap_or_else(|e| e.into_inner());
+                                let mut lock = active_session.lock();
                                 if let Some(s) = lock.as_mut() {
                                     if s.discord_user_id == discord_user_id {
                                         s.access_token = tok.access_token.clone();
@@ -1722,7 +1726,7 @@ impl Handler {
                 let mut spirc_rx = Some(spirc_rx);
                 let mut restarts: u32 = 0;
                 loop {
-                    let access_token = { token_state.lock().unwrap_or_else(|e| e.into_inner()).0.clone() };
+                    let access_token = { token_state.lock().0.clone() };
                     let run_start = std::time::Instant::now();
                     match SpotifyPlayer::run_with_token(
                         &config, bridge.clone(), presence_tx.clone(), access_token,
@@ -1753,7 +1757,7 @@ impl Handler {
                 // would only detach the refresh task, leaving it rotating the
                 // token forever and racing a future /login.
                 let owned = {
-                    let mut lock = active_session_for_task.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut lock = active_session_for_task.lock();
                     match lock.as_ref() {
                         Some(s) if s.generation == generation => lock.take(),
                         _ => None,
@@ -1766,8 +1770,8 @@ impl Handler {
             }
         });
 
-        let mut lock = active_session.lock().unwrap_or_else(|e| e.into_inner());
-        let access_token_for_store = { token_state.lock().unwrap_or_else(|e| e.into_inner()).0.clone() };
+        let mut lock = active_session.lock();
+        let access_token_for_store = { token_state.lock().0.clone() };
         *lock = Some(ActiveSession {
             discord_user_id,
             spotify_name,
@@ -1854,7 +1858,6 @@ impl Handler {
                     source: MediaSource::File {
                         filename: att.filename.clone(),
                         attachment_url: att.url.clone(),
-                        content_type: att.content_type.clone(),
                     },
                     queued_by: discord_name.clone(),
                     queued_by_id: discord_id,
@@ -1871,12 +1874,12 @@ impl Handler {
         let title = queue_item.source.display_title().to_string();
 
         let is_priority_playing = {
-            let lock = self.active_priority_item.lock().unwrap_or_else(|e| e.into_inner());
+            let lock = self.active_priority_item.lock();
             lock.is_some()
         };
 
         let (accepted, queue_len) = {
-            let mut lock = self.priority_queue.lock().unwrap_or_else(|e| e.into_inner());
+            let mut lock = self.priority_queue.lock();
             let accepted = lock.push(queue_item.clone());
             (accepted, lock.len())
         };
@@ -1917,7 +1920,7 @@ impl Handler {
                 break;
             }
             let queue_empty = {
-                let lock = self.priority_queue.lock().unwrap_or_else(|e| e.into_inner());
+                let lock = self.priority_queue.lock();
                 lock.len() == 0
             };
             if queue_empty || attempt == 9 {
@@ -1933,7 +1936,7 @@ impl Handler {
 
         // Ensure the bot is in voice before consuming the queue.
         let ctx = {
-            let lock = self.ctx.lock().unwrap_or_else(|e| e.into_inner());
+            let lock = self.ctx.lock();
             lock.clone()
         };
         if let Some(ctx) = &ctx {
@@ -1955,7 +1958,7 @@ impl Handler {
             priority_queue: self.priority_queue.clone(),
             bridge: self.bridge.clone(),
             spirc_cmd_tx: {
-                let lock = self.spirc_cmd_tx.lock().unwrap_or_else(|e| e.into_inner());
+                let lock = self.spirc_cmd_tx.lock();
                 lock.clone()
             },
             ctx: self.ctx.clone(),
@@ -1979,13 +1982,13 @@ impl Handler {
 
     async fn handle_skip(&self) -> String {
         let priority_playing = {
-            let lock = self.active_priority_item.lock().unwrap_or_else(|e| e.into_inner());
+            let lock = self.active_priority_item.lock();
             lock.is_some()
         };
 
         if priority_playing {
             let token = {
-                let lock = self.feeder_cancel.lock().unwrap_or_else(|e: std::sync::PoisonError<_>| e.into_inner());
+                let lock = self.feeder_cancel.lock();
                 lock.clone()
             };
             if let Some(t) = token {
@@ -1994,7 +1997,7 @@ impl Handler {
             self.bridge.clear();
             // Check if more items exist; if so, start the next one
             let has_more = {
-                let lock = self.priority_queue.lock().unwrap_or_else(|e| e.into_inner());
+                let lock = self.priority_queue.lock();
                 !lock.snapshot().is_empty()
             };
             if has_more {
@@ -2004,7 +2007,7 @@ impl Handler {
             } else {
                 // No more items — resume Spotify if session exists
                 let spirc_tx = {
-                    let lock = self.spirc_cmd_tx.lock().unwrap_or_else(|e| e.into_inner());
+                    let lock = self.spirc_cmd_tx.lock();
                     lock.clone()
                 };
                 if let Some(ref tx) = spirc_tx {
@@ -2014,7 +2017,7 @@ impl Handler {
             "⏭ Skipped.".to_string()
         } else {
             let access_token = {
-                let lock = self.active_session.lock().unwrap_or_else(|e| e.into_inner());
+                let lock = self.active_session.lock();
                 lock.as_ref().map(|s| s.access_token.clone())
             };
             match access_token {
@@ -2037,7 +2040,7 @@ impl Handler {
         // /stop means stop: pause Spotify too, never resume it here. Handing
         // playback back to Spotify after an interrupted item is /skip's job.
         let spirc_tx = {
-            let lock = self.spirc_cmd_tx.lock().unwrap_or_else(|e| e.into_inner());
+            let lock = self.spirc_cmd_tx.lock();
             lock.clone()
         };
         if let Some(ref tx) = spirc_tx {
@@ -2049,7 +2052,7 @@ impl Handler {
 
     async fn handle_np(&self) -> String {
         let priority_item = {
-            let lock = self.active_priority_item.lock().unwrap_or_else(|e| e.into_inner());
+            let lock = self.active_priority_item.lock();
             lock.clone()
         };
         if let Some(item) = priority_item {
@@ -2059,13 +2062,13 @@ impl Handler {
         }
 
         let spotify_name = {
-            let lock = self.active_session.lock().unwrap_or_else(|e| e.into_inner());
+            let lock = self.active_session.lock();
             lock.as_ref().map(|s| s.spotify_name.clone())
         };
         match spotify_name {
             Some(name) => {
                 let meta = {
-                    let lock = self.last_spotify_meta.lock().unwrap_or_else(|e| e.into_inner());
+                    let lock = self.last_spotify_meta.lock();
                     lock.clone()
                 };
                 match meta {
@@ -2132,7 +2135,7 @@ impl Handler {
         let pkce = new_pkce();
         let url = self.oauth.auth_url(&pkce);
         {
-            let mut pending = self.pending_auth.lock().unwrap_or_else(|e| e.into_inner());
+            let mut pending = self.pending_auth.lock();
             // Reap challenges older than their 10-min validity so abandoned
             // logins don't accumulate.
             pending.retain(|_, (_, started)| started.elapsed() < std::time::Duration::from_secs(600));
@@ -2218,7 +2221,7 @@ impl Handler {
         // not burn the challenge and force a full re-authorization. It is
         // removed on success (used codes can't be replayed) and on expiry.
         let pending = {
-            let lock = self.pending_auth.lock().unwrap_or_else(|e| e.into_inner());
+            let lock = self.pending_auth.lock();
             lock.get(&user_id_u64).cloned()
         };
         let (pkce, started) = match pending {
@@ -2226,7 +2229,7 @@ impl Handler {
             None => return "No pending login — run `/login` first to get an authorize link.".to_string(),
         };
         if started.elapsed() > std::time::Duration::from_secs(600) {
-            let mut lock = self.pending_auth.lock().unwrap_or_else(|e| e.into_inner());
+            let mut lock = self.pending_auth.lock();
             lock.remove(&user_id_u64);
             return "That login link expired. Run `/login` again.".to_string();
         }
@@ -2240,7 +2243,7 @@ impl Handler {
 
         let token = match self.oauth.exchange_code(&params.code, &pkce.verifier).await {
             Ok(t) => {
-                let mut lock = self.pending_auth.lock().unwrap_or_else(|e| e.into_inner());
+                let mut lock = self.pending_auth.lock();
                 lock.remove(&user_id_u64);
                 t
             }
@@ -2298,7 +2301,7 @@ impl Handler {
         // Only the owner of the live session may tear it down. A bystander's
         // /logout must not pause the DJ's audio or wipe the controls.
         let owned_live_session = {
-            let mut lock = self.active_session.lock().unwrap_or_else(|e| e.into_inner());
+            let mut lock = self.active_session.lock();
             match lock.as_ref() {
                 Some(session) if session.discord_user_id == user_id_u64 => {
                     session.abort();
@@ -2317,7 +2320,7 @@ impl Handler {
             self.stop_priority_playback();
             let _ = self.presence_tx.send(PresenceUpdate::Idle);
             let ctx = {
-                let lock = self.ctx.lock().unwrap_or_else(|e| e.into_inner());
+                let lock = self.ctx.lock();
                 lock.clone()
             };
             if let Some(ctx) = ctx {
@@ -2342,9 +2345,7 @@ impl Handler {
     }
 
     async fn handle_who(&self) -> String {
-        tracing::info!("handle_who: attempting lock");
-        let lock = self.active_session.lock().unwrap_or_else(|e| e.into_inner());
-        tracing::info!("handle_who: lock acquired");
+        let lock = self.active_session.lock();
         match lock.as_ref() {
             Some(session) => format!("Active session: **{}** (Discord: {})", session.spotify_name, session.discord_name),
             None => "No active Spotify session. Run `/login` to connect.".to_string(),
@@ -2363,7 +2364,7 @@ impl Handler {
         };
 
         let access_token = {
-            let lock = self.active_session.lock().unwrap_or_else(|e| e.into_inner());
+            let lock = self.active_session.lock();
             lock.as_ref().map(|s| s.access_token.clone())
         };
 
@@ -2373,10 +2374,10 @@ impl Handler {
         };
 
         let uri = format!("spotify:track:{}", track_id);
-        let client = reqwest::Client::new();
+        let client = crate::spotify::webapi::client();
         let url = format!(
             "https://api.spotify.com/v1/me/player/queue?uri={}",
-            uri.replace(":", "%3A")
+            crate::oauth::pct_encode(&uri)
         );
 
         match client
