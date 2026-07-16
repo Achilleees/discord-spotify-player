@@ -22,7 +22,7 @@ target/release/discord-spotify-player.exe          # normal
 target/release/discord-spotify-player.exe --setup  # first-run wizard
 ```
 
-`cargo check` for fast feedback, `cargo test` (48 unit tests), `cargo clippy`.
+`cargo check` for fast feedback, `cargo test` (111 unit tests), `cargo clippy`.
 
 ### Prerequisites
 - MSVC toolchain (native deps: opus, cmake). `.cargo/config.toml` (tracked)
@@ -38,8 +38,8 @@ target/release/discord-spotify-player.exe --setup  # first-run wizard
 (encrypts stored tokens), `TEXT_CHANNEL_ID`. Optional: `AUDIO_BUFFER_SECONDS`,
 `PREBUFFER_SECONDS`, `PREAMP_DB`, `BASS_BOOST_DB`, `TREBLE_BOOST_DB`,
 `DEVICE_NAME`, `DEVICE_ID`, `SPOTIBOT_DB`, `RUST_LOG`, `YOUTUBE_COOKIES`,
-`YOUTUBE_TMP_DIR`, `DJ_CLIPS_DIR`, `DJ_CACHE_DIR`, `KOKORO_SOCKET` (path
-defaults target the VPS layout under `/var/lib/spotibot`).
+`YOUTUBE_TMP_DIR`, `YOUTUBE_MAX_DURATION_SECS`, `DJ_CLIPS_DIR`, `DJ_CACHE_DIR`,
+`KOKORO_SOCKET` (path defaults target the VPS layout under `/var/lib/spotibot`).
 
 `--setup` runs the wizard; otherwise the app loads `.env` and errors if
 `SPOTIFY_CLIENT_ID` is missing (OAuth is the only session path).

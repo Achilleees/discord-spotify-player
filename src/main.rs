@@ -81,8 +81,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         youtube::sweep_tmp_dir();
     }
 
-    // OAuth (Authorization Code + PKCE) is the only session path since
-    // discovery/mDNS was removed in v0.5. PKCE needs the client id only.
+    // OAuth (Authorization Code + PKCE) is the only session path; PKCE needs
+    // the client id only.
     let oauth: Arc<SpotifyOAuth> = match config.spotify_client_id.clone() {
         Some(id) => {
             // chars(), not a byte slice: a multi-byte char straddling the

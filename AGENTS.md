@@ -12,7 +12,7 @@ hardened reference for nob's music stack — see `PORT.md` before large changes.
 
 ## Build and run
 - `cargo build --release`; binary is `target\release\discord-spotify-player.exe`.
-- `cargo check` for fast feedback; `cargo test` (48 unit tests); `cargo clippy`.
+- `cargo check` for fast feedback; `cargo test` (111 unit tests); `cargo clippy`.
 - First-run setup: `--setup` writes `.env`. OAuth also needs `SPOTIFY_CLIENT_ID`.
 - `.cargo/config.toml` (tracked) carries the cmake fix; MSVC toolchain on Windows.
 
@@ -42,12 +42,15 @@ hardened reference for nob's music stack — see `PORT.md` before large changes.
   (upstream issue librespot#1681). Check upstream before bumping.
 - `rand` 0.10 (`rand::random::<T>()`). `parking_lot::Mutex` for the audio hot
   path; `std::sync::Mutex` elsewhere is fine.
-- `sha2`/`chacha20poly1305` come free via songbird's DAVE — reuse, don't add
-  crypto crates.
+- `sha2`/`chacha20poly1305` come free via songbird's DAVE — reuse them.
+  `pbkdf2` 0.12 is the one direct crypto addition (TOKEN_ENC_KEY stretching);
+  don't add others.
 
 ## Authorization
-- Controlling playback (buttons, `/queue`, `/play`, `/skip`, `/stop`,
-  `/announce`, session takeover) requires sharing the bot's voice channel.
+- Controlling playback (buttons, `/queue`, `/play`, `/skip`, `/stop`, session
+  takeover) requires sharing the bot's voice channel. Exceptions: `/play` with
+  the bot out of voice needs only *some* voice channel (the bot follows the
+  requester in); `/announce` is a guild-level toggle, not gated.
 
 ## Testing
 - Pure logic is unit-tested (parsers, crypto, store, biquads, ring buffer).

@@ -109,7 +109,7 @@ impl SpotifyOAuth {
     }
 
     /// Exchange an authorization code for tokens using the PKCE verifier.
-    /// No client secret is sent — that is the whole point of PKCE.
+    /// No client secret is sent.
     pub async fn exchange_code(
         &self,
         code: &str,

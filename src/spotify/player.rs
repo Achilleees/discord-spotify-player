@@ -21,7 +21,8 @@ const DEVICE_ID_FILE: &str = "device_id";
 const MAX_FAST_RECONNECTS: usize = 5;
 const MIN_STABLE_SESSION_SECS: u64 = 60;
 
-/// Commands that can be sent to the active Spirc instance from the priority queue manager.
+/// Commands the Discord layer (queue drains, /skip, /stop) sends to the
+/// active Spirc instance.
 pub enum SpircCommand {
     Pause,
     Play,

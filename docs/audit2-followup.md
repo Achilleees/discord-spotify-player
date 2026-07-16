@@ -33,7 +33,7 @@ source.
   (bugs F15/comments F1, security F10).
 - yt-dlp stderr no longer leaked to the requester (security F5).
 
-## Also fixed on `fix/audit2-followup` (post-v0.5.0 tag)
+## Also fixed on `fix/audit2-followup` (after commit a57ac8b "chore: release v0.5.0"; no v0.5.0 tag exists — the version was walked back to rc for live VPS testing)
 
 - Kokoro socket exchange bounded by a 20s timeout (edge F8).
 - `/play` reachable on a fresh boot — gated on user-in-a-channel when the bot

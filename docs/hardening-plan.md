@@ -3,6 +3,11 @@
 **Written:** 2026-07-10 · **Basis:** full 8-lens audit of `main@9ae78db` (124 confirmed findings, ~30 unique issues) + 12 locked design decisions.
 **End state:** spotibot is the complete, hardened, tested, documented reference implementation of the music stack — proven live — ready to transplant into `never-off-beat` (nob) Phase 1c.
 
+> **Status (2026-07-16): executed through Phase H.** The `v0.5-hardening`
+> branch is fully merged; `main` is at v0.5.0-rc2 and live on the VPS. The
+> working rules below are historical, not in force. Deviations from the plan
+> are annotated inline (decisions 8/C5, D6).
+
 ---
 
 ## Locked decisions (2026-07-10)
@@ -16,7 +21,7 @@
 | 5 | OAuth | **Authorization Code + PKCE** (no client secret), hardened paste-back (validated state, tolerant parser, modal input) |
 | 6 | Token storage | **SQLite, encrypted** with a key from env (0600 secrets file), replaces `.user_creds/` JSON |
 | 7 | Discovery (mDNS) mode | **Delete.** OAuth-only, like nob. Kills P0 #2 by removal |
-| 8 | Token refresh | **Proactive** (expires_in − margin) **+ 401-retry fallback** on Web API calls |
+| 8 | Token refresh | **Proactive** (expires_in − margin) **+ 401-retry fallback** on Web API calls — *superseded: shipped as proactive refresh + a Notify early-refresh signal (PORT.md decision 8); the 401-retry wrapper was never implemented* |
 | 9 | Tests | nob-style, portable (incl. clock abstraction for pacing) |
 | 10 | Docs | **Full rewrite** of all 6 docs + `PORT.md` transfer dossier |
 | 11 | Songbird/DAVE | **Migrate to songbird 0.6 stable** (same stack as nob; kills mutable fork pin) |
@@ -58,7 +63,7 @@ The `feat/youtube-playback` branch (+1800 lines: yt-dlp/ffmpeg pipeline, smart /
 - C2. **Delete discovery mode.** Remove `run_discovery`, `librespot-discovery` dep, and the mDNS surface (security/F8). Single session path = `run_with_token`. Rewire **auto-start through the same machinery as `/login`** (spawn_session → voice join → bridge reader → refresh loop) — fixes P0 #1 (no sound after restart: bugs/F1-F2, edge/F3, seams/F1-F2) structurally instead of patching two half-broken paths.
 - C3. **SQLite introduction.** `rusqlite` 0.32 (nob's version), single DB file, nob-style migration runner (PRAGMA user_version, ~20 lines). `credentials` table with encrypted token columns (key from `TOKEN_ENC_KEY` env; XChaCha20-Poly1305 via the `chacha20poly1305` crate — small, audited, no ring dependency). One-time migration: import `.user_creds/*.json`, then delete files. Atomic writes and corrupt-data surfacing come free (edge/F10-F11, tc/F14).
 - C4. **OAuth → PKCE + hardened paste-back.** Drop client-secret requirement; code_verifier/challenge; per-user pending-state store with expiry; state validated on paste-back (bugs/F14, security/F6); parser handles schemeless URLs and `?error=access_denied` (bugs/F15, edge/F17, tc/F5); modal input for the redirect URL; Defer on all slow interactions (from branch merge).
-- C5. **Token refresh architecture.** Proactive per-session refresh task driven by `expires_in` minus ~5 min margin (edge/F6, tc/F4, seams/F6); 401-retry-after-refresh wrapper around every Spotify Web API call; rotated tokens persisted atomically via C3.
+- C5. **Token refresh architecture.** Proactive per-session refresh task driven by `expires_in` minus ~5 min margin (edge/F6, tc/F4, seams/F6); 401-retry-after-refresh wrapper around every Spotify Web API call; rotated tokens persisted atomically via C3. *Superseded: shipped without the 401-retry wrapper — the librespot task instead fires a Notify early-refresh signal on session death (see PORT.md decision 8).*
 - C6. **Session lifecycle correctness.** Close the concurrent-`/login` race with compare-and-swap semantics on `active_session` (edge/F2, F9); deactivate the displaced user on takeover (bugs/F8, edge/F20); clear `ActiveSession` + presence on session death; scope empty-channel deactivation to the session owner (tc/F18).
 
 **Gate per slice:** compiles, unit-smoke locally, committed separately.
@@ -70,7 +75,7 @@ The `feat/youtube-playback` branch (+1800 lines: yt-dlp/ffmpeg pipeline, smart /
 - D3. Surface failures: ephemeral error replies on button/API failures instead of silent `Acknowledge`; non-success HTTP at `warn` (edge/F5, tc/F16).
 - D4. Controls lifecycle: broaden startup cleanup match (bugs/F11), guard Ready re-dispatch from clobbering live controls (edge/F7), fix unreachable "is playing" embed arm (bugs/F10), track-dedup by `track_id` + clear on pause (tc/F17).
 - D5. Stage channels: restore unsuppress via `EditVoiceState` after join (wizard offers stages, so support them properly — bugs/F7, seams/F4).
-- D6. `/who` gated by the same in-channel rule (security/F7).
+- D6. `/who` gated by the same in-channel rule (security/F7). *Dropped: `/who` shipped ungated (it only names the active DJ); code and README both treat it as ungated.*
 
 ## Phase E — Robustness
 

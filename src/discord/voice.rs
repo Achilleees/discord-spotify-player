@@ -141,7 +141,8 @@ impl Read for SimpleBridgeReader {
             chunk.copy_from_slice(&sample.to_le_bytes());
         }
 
-        // Pace the stream so Songbird cannot drain the source faster than real-time.
+        // Starvation backoff only — real-time pacing lives with the producers
+        // (DiscordSink::write / the feeder), never in this reader.
         if samples_read == 0 {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }

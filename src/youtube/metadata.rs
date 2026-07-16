@@ -133,10 +133,11 @@ fn metadata_from_json(first_line: &str, max_secs: u64) -> Result<YoutubeMetadata
         return Err(YoutubeError::TooLong(max_secs / 60));
     }
 
-    // No age_limit check here: getting metadata JSON for an age-gated video
-    // already required authenticated (cookie) access — the anonymous case
-    // fails earlier via stderr. Rejecting on age_limit would block exactly
-    // the videos that configured cookies unlock.
+    // The probe JSON's age_limit field is deliberately not parsed or checked:
+    // metadata success already means the video is playable under the current
+    // cookie config (the anonymous age-gated case fails earlier, via stderr).
+    // Pinned by tests::age_limit_field_is_ignored — a defensive age_limit
+    // reject here would block exactly the videos configured cookies unlock.
 
     let channel = raw
         .channel
@@ -347,6 +348,15 @@ mod tests {
             metadata_from_json("not json", 7200),
             Err(YoutubeError::Parse(_))
         ));
+    }
+
+    #[test]
+    fn age_limit_field_is_ignored() {
+        // Reaching metadata already proves the video is playable with the
+        // current cookie config; a "defensive" age_limit reject here would
+        // block exactly the videos that configured cookies unlock.
+        let m = metadata_from_json(&json(r#","duration":10.0,"age_limit":18"#), 7200);
+        assert!(m.is_ok(), "age-gated metadata that probed successfully must play");
     }
 
     #[test]

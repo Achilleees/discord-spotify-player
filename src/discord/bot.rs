@@ -713,8 +713,7 @@ async fn run_queue_drain(d: &QueueDrainCtx) {
     }
 }
 
-// Wide orchestration fn wiring together the queue, bridge, and UI state. The
-// nob port folds these into its actions/panel layer; kept flat here.
+// Wide orchestration fn wiring together the queue, bridge, and UI state.
 #[allow(clippy::too_many_arguments)]
 async fn priority_queue_manager(
     mut end_of_track_rx: mpsc::UnboundedReceiver<()>,
@@ -1530,8 +1529,8 @@ impl Handler {
     }
 
     /// Restart the stored active user's Spotify session on boot, through the
-    /// exact same path /login uses. Skips when OAuth is unconfigured, no user
-    /// is marked active, or the stored record is unusable.
+    /// exact same path /login uses. Skips when no user is marked active or the
+    /// stored record is unusable (unparseable id, failed refresh).
     async fn auto_start_stored_session(&self) {
         let oauth = self.oauth.clone();
         let Some(user) = self.user_store.list().into_iter().find(|u| u.active) else {
@@ -1562,8 +1561,7 @@ impl Handler {
                 }
                 Err(e) => {
                     tracing::warn!(error = ?e, "auto-start token refresh failed; skipping auto-start");
-                    // Dead stored token (revoked, or minted by the pre-v0.5
-                    // client-secret flow). Deactivate it so every boot stops
+                    // Dead stored token: deactivate it so every boot stops
                     // retrying, and say so in the text channel — a silent
                     // skip looks like the bot lost Spotify support entirely.
                     let _ = self.user_store.deactivate(&user.discord_user_id);
@@ -2243,11 +2241,10 @@ impl Handler {
             }
             Err(e) => {
                 tracing::warn!(error = %e, "token refresh failed on reactivation; issuing fresh authorize URL");
-                // The stored refresh token is dead — revoked, or minted by the
-                // pre-v0.5 client-secret flow, which PKCE can't refresh.
-                // Deactivate it so auto-start stops retrying it, and go
-                // straight to a fresh authorization instead of dead-ending
-                // the user into a /forget + /login round-trip.
+                // The stored refresh token is dead. Deactivate it so
+                // auto-start stops retrying it, and go straight to a fresh
+                // authorization instead of dead-ending the user into a
+                // /forget + /login round-trip.
                 let _ = self.user_store.deactivate(user_id);
                 format!(
                     "Your stored Spotify session for **{}** can't be refreshed — let's re-authorize.\n\n{}",

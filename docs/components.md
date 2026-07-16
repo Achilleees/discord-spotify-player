@@ -8,7 +8,7 @@ High-level map of the app for contributors; end users start with README.md.
 Spotify (librespot decode) ─┐
 YouTube/SoundCloud (yt-dlp) ─┼─> AudioBridge ─> SimpleBridgeReader ─> Songbird ─> Discord voice
 uploaded files ─────────────┘         ▲
-DJ TTS (Kokoro) ── overlay ───────────┘ (mixes on top with ducking)
+DJ TTS (Kokoro) ── overlay ───────────┘ (mixes on top at a fixed gain)
 ```
 
 - **AudioBridge** (`src/audio_bridge.rs`): lock-based `VecDeque<f32>` ring buffer
@@ -40,21 +40,25 @@ DJ TTS (Kokoro) ── overlay ───────────┘ (mixes on to
   voice-join + auto-leave logic, and `spawn_session`.
 - `src/discord/voice.rs`: bridge reader + Songbird track events.
 - `src/discord/presence.rs`: bot status text + presence loop.
-- Controlling playback requires sharing the bot's voice channel.
+- Controlling playback requires sharing the bot's voice channel. Exceptions:
+  `/play` with the bot out of voice needs only some voice channel (the bot
+  follows the requester in); `/announce` is an ungated guild-level toggle.
 
 ## Storage and config
 
 - `src/users/mod.rs` + `crypto.rs`: per-user credentials in SQLite
   (`spotify_credentials`), tokens in an encrypted `auth_blob`
-  (XChaCha20-Poly1305, key = sha256 of `TOKEN_ENC_KEY`; plaintext with a warning
-  if unset). Legacy `.user_creds/*.json` are imported once.
+  (XChaCha20-Poly1305 with owner-bound AAD; key = PBKDF2-HMAC-SHA256 of
+  `TOKEN_ENC_KEY`, 600k iterations, fixed app salt; plaintext with a warning if
+  unset). A `settings` table persists bot-level toggles (e.g. `/announce`).
 - `src/config.rs`: `.env` config (validated: non-zero snowflakes, warns on bad
   numbers). `src/setup.rs`: first-run CLI wizard.
 
 ## DJ / YouTube
 
-- `src/audio/dj.rs`: Kokoro TTS client (Unix socket on Linux), announcement
-  templates, FNV-hash clip cache, mixer overlay with ducking.
+- `src/audio/dj.rs`: Kokoro TTS client (Unix domain socket, `#[cfg(unix)]` with
+  a non-unix stub; pre-recorded clips play anywhere), announcement templates,
+  FNV-hash clip cache (capped at 500 files), fixed-gain mixer overlay.
 - `src/youtube/`: yt-dlp process management (feeder) + metadata.
 
 ## Logging

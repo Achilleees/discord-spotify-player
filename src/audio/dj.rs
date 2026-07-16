@@ -301,11 +301,12 @@ fn kokoro_socket() -> String {
     std::env::var("KOKORO_SOCKET").unwrap_or_else(|_| DEFAULT_KOKORO_SOCKET.to_string())
 }
 
-/// Kokoro TTS is reached over a Unix domain socket, which only exists on the
-/// Linux deployment. On other platforms DJ announcements are unavailable.
+/// Kokoro TTS is reached over a Unix domain socket, so generation is
+/// `#[cfg(unix)]`-only. This stub fails the TTS call; callers fall back to
+/// pre-recorded clips (`DJ_CLIPS_DIR`), which play on any platform.
 #[cfg(not(unix))]
 async fn kokoro_socket_generate(_text: &str, _output_path: &str) -> Result<(), String> {
-    Err("DJ announcements require the Kokoro unix socket, unavailable on this platform".to_string())
+    Err("Kokoro TTS needs a unix socket, unavailable on this platform".to_string())
 }
 
 #[cfg(unix)]

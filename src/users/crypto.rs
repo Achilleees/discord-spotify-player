@@ -13,12 +13,12 @@ use sha2::Sha256;
 const V_PLAIN: u8 = 0x00;
 const V_XCHACHA_AAD: u8 = 0x02; // XChaCha20-Poly1305 with owner-bound AAD
 const NONCE_LEN: usize = 24;
-/// Fixed application salt + iteration count for stretching TOKEN_ENC_KEY. A
-/// fixed salt is fine here: the "password" is the operator's env key, and the
-/// stretch is what slows an offline brute-force of a weak key from a stolen DB.
+/// Fixed application salt for stretching TOKEN_ENC_KEY. Salt and iteration
+/// count are part of the frozen storage format: changing either changes every
+/// derived key and deployed blobs stop opening (pinned by the golden-blob test).
 const KDF_SALT: &[u8] = b"discord-spotify-player:token-enc:v1";
-// OWASP-recommended count for PBKDF2-HMAC-SHA256; lowered under test so the
-// unoptimized debug build stays fast (the derivation logic is identical).
+// Same derivation code under test, only the count differs (unoptimized debug
+// builds make 600k-iteration PBKDF2 too slow for the suite).
 #[cfg(not(test))]
 const KDF_ITERATIONS: u32 = 600_000;
 #[cfg(test)]

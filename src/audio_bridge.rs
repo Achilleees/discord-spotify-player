@@ -20,8 +20,10 @@ fn max_samples(buffer_seconds: usize) -> usize {
     SAMPLE_RATE * CHANNELS * buffer_seconds
 }
 
-/// Shared audio buffer between Spotify (producer) and Discord (consumer)
-/// Keeps Spotify's native 44.1kHz f32 samples; Songbird handles resampling to 48kHz.
+/// Shared audio buffer between the producers — librespot's sink, the
+/// YouTube/file feeder, and the DJ overlay (a second, mixed-on-top deque) —
+/// and the Discord consumer (SimpleBridgeReader).
+/// Holds 44.1kHz stereo f32 samples; Songbird handles resampling to 48kHz.
 pub struct AudioBridge {
     buffer: Mutex<VecDeque<f32>>,
     overlay: Mutex<VecDeque<f32>>,
@@ -50,7 +52,8 @@ impl AudioBridge {
         })
     }
 
-    /// Called by librespot to push audio samples (44.1kHz stereo f32)
+    /// Push music samples (44.1kHz stereo f32). Called by the librespot sink
+    /// and the YouTube/file feeder; DJ clips go through push_overlay instead.
     pub fn push_samples(&self, samples: &[f32]) {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let count = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -107,8 +110,11 @@ impl AudioBridge {
         }
     }
 
-    /// Called by Songbird to pull audio samples (44.1kHz stereo f32)
-    /// Returns the number of samples read
+    /// Called by Songbird to pull audio samples (44.1kHz stereo f32).
+    /// Returns the number of MUSIC samples drained; overlay samples are mixed
+    /// into `output` afterwards and may extend past that count (starved music
+    /// with queued overlay returns 0 while still writing audio), so the caller
+    /// must consume the whole buffer regardless of the return value.
     pub fn pull_samples(&self, output: &mut [f32]) -> usize {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let count = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

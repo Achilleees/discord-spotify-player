@@ -11,10 +11,11 @@ what NOT to bring across.
 2. **YouTube branch** — merged into v0.5 (yt-dlp/ffmpeg, mixed queue, DJ TTS).
 3. **Quality bar** — full audit burn-down (2 audits, 8 lenses each).
 4. **Authorization** — nob's rule: sharing the bot's voice channel is required
-   to control playback (buttons, `/queue`, `/play`, `/skip`, `/stop`,
-   `/announce`, and taking over a session via `/login`). Deliberate exception:
-   when the bot is not yet in voice, `/play` accepts a requester in any voice
-   channel and the bot joins them (fresh-boot path).
+   to control playback (buttons, `/queue`, `/play`, `/skip`, `/stop`, and
+   taking over a session via `/login`). Deliberate exceptions: when the bot is
+   not yet in voice, `/play` accepts a requester in any voice channel and the
+   bot joins them (fresh-boot path); `/announce` is a guild-level toggle, not
+   playback control, and is ungated so it can be set before the bot joins.
 5. **OAuth** — Authorization Code + PKCE (no client secret). Paste-back UX,
    hardened: validated `state`, tolerant parser, 10-min pending expiry.
 6. **Token storage** — SQLite `spotify_credentials` table, tokens in an
@@ -24,7 +25,7 @@ what NOT to bring across.
 7. **Discovery (mDNS)** — deleted. OAuth-only, like nob.
 8. **Token refresh** — proactive (single-owner task, `expires_in` − 5 min) plus
    an early-refresh Notify signal from the librespot task on session death.
-9. **Tests** — nob-style, portable (53 unit tests).
+9. **Tests** — nob-style, portable (111 unit tests).
 10. **Docs** — full rewrite + this file.
 11. **Songbird/DAVE** — songbird 0.6 stable (same as nob), not the fork.
 12. **Kickoff** — plan → merge → burn down by slice, each slice deployable.

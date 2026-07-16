@@ -24,7 +24,8 @@ playback is controlled from Spotify clients or from buttons in Discord.
 - A now-playing text channel: rich embeds with album art, plus prev/pause/next
   buttons and a queue view.
 - `/queue`, `/play` (YouTube/SoundCloud/file), `/skip`, `/stop`, `/np`.
-- Optional DJ track announcements via a Kokoro TTS backend.
+- Optional DJ track announcements via a Kokoro TTS backend, toggled with
+  `/announce` (persists across restarts).
 - Auto-starts the last active user's session on boot; auto-leaves and
   deactivates when the voice channel empties.
 
@@ -37,12 +38,15 @@ playback is controlled from Spotify clients or from buttons in Discord.
 | `/forget` | Delete your stored credentials | no |
 | `/who` | Show the active DJ | no |
 | `/queue <url>` | Add a Spotify track to the queue | yes |
-| `/play <url>` | Queue a YouTube/SoundCloud/file track | yes |
+| `/play <url>` | Queue a YouTube/SoundCloud/file track | yes (see below) |
 | `/skip` `/stop` | Skip / stop playback | yes |
 | `/np` | Now playing | no |
+| `/announce` | Toggle DJ track announcements | no |
 
 Playback control (buttons, `/queue`, `/play`, `/skip`, `/stop`) requires sharing
-the bot's voice channel.
+the bot's voice channel. Exception: when the bot isn't in voice yet, `/play`
+only requires the requester to be in *some* voice channel — the bot joins them
+(the fresh-boot path).
 
 ## Requirements
 
@@ -55,8 +59,9 @@ the bot's voice channel.
 ## Setup
 
 1. `cargo build --release`
-2. First run: `target/release/discord-spotify-player.exe --setup` (writes `.env`).
-3. Add `SPOTIFY_CLIENT_ID` and `TOKEN_ENC_KEY` to `.env` (see `.env.example`).
+2. First run: `target/release/discord-spotify-player.exe --setup` (writes `.env`,
+   including `SPOTIFY_CLIENT_ID`).
+3. Add `TOKEN_ENC_KEY` to `.env` (see `.env.example`).
 4. Start: `target/release/discord-spotify-player.exe`
 5. In Discord, run `/login` and follow the link, then paste the redirect URL
    back with `/login code:<url>`.
@@ -68,7 +73,9 @@ See `.env.example`. Required: `DISCORD_TOKEN`, `DISCORD_GUILD_ID`,
 stored tokens at rest), `TEXT_CHANNEL_ID` (now-playing channel; defaults to the
 voice channel's text chat). Optional tuning: `AUDIO_BUFFER_SECONDS`,
 `PREBUFFER_SECONDS`, `PREAMP_DB`, `BASS_BOOST_DB`, `TREBLE_BOOST_DB`,
-`DEVICE_NAME`, `DEVICE_ID`, `RUST_LOG`, `SPOTIBOT_DB`.
+`DEVICE_NAME`, `DEVICE_ID`, `RUST_LOG`, `SPOTIBOT_DB`, `YOUTUBE_COOKIES`,
+`YOUTUBE_TMP_DIR`, `YOUTUBE_MAX_DURATION_SECS`, `DJ_CLIPS_DIR`, `DJ_CACHE_DIR`,
+`KOKORO_SOCKET`.
 
 ## Logging
 
@@ -86,6 +93,6 @@ pipeline stats emit at `debug` on the `audio_stream` target every 5s.
 
 ## Development
 
-`cargo check` for fast feedback, `cargo test` (48 unit tests), `cargo clippy`.
+`cargo check` for fast feedback, `cargo test` (111 unit tests), `cargo clippy`.
 `.cargo/config.toml` carries a cmake fix required by native deps; the MSVC
 toolchain is required on Windows.
