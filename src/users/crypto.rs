@@ -160,4 +160,60 @@ mod tests {
         let c = TokenCipher::new(Some("k"));
         assert_ne!(c.seal(b"x", AAD), c.seal(b"x", AAD));
     }
+
+    #[test]
+    fn malformed_blobs_open_to_none() {
+        let c = TokenCipher::new(Some("k"));
+        // Empty blob: no version byte at all.
+        assert!(c.open(&[], AAD).is_none());
+        // Unknown version byte — including the retired 0x01 scheme, which must
+        // NOT decode (there is deliberately no 0x01 handler).
+        assert!(c.open(&[0x01, 1, 2, 3], AAD).is_none());
+        assert!(c.open(&[0xFF], AAD).is_none());
+        // Truncated: a valid version byte but fewer than NONCE_LEN bytes after.
+        let mut truncated = vec![V_XCHACHA_AAD];
+        truncated.extend_from_slice(&[0u8; NONCE_LEN - 1]);
+        assert!(c.open(&truncated, AAD).is_none());
+        // Nonce present but ciphertext cut short of a whole tag.
+        let sealed = c.seal(b"secret", AAD);
+        assert!(c.open(&sealed[..sealed.len() - 1], AAD).is_none());
+        // A keyless cipher must not accept encrypted rows.
+        assert!(TokenCipher::new(None).open(&sealed, AAD).is_none());
+    }
+
+    /// Pins the storage format end-to-end: a blob sealed by THIS code today is
+    /// hardcoded below, and every future build must still open it. Any change
+    /// to KDF_SALT, the (test) iteration count, the scheme byte, the nonce
+    /// layout, or the AAD binding fails here — the failure mode it guards is a
+    /// "refactor" that silently orphans every deployed row. If the format ever
+    /// changes ON PURPOSE, bump the scheme byte, keep this vector openable via
+    /// the old path, and add a new one. Regenerate with:
+    /// `cargo test golden_blob_generator -- --ignored --nocapture`
+    /// (Test builds derive with 1_000 iterations; the production constant is
+    /// 600_000, same derivation code.)
+    #[test]
+    fn golden_blob_still_opens() {
+        let hex = "0218553551173e90b1f25cc3a8633cbd0de9e95a196b5127e17d1729b4a6ce132e34f39a805c0522d968d05028e94bf34faa22b6d6e2a0f815";
+        let blob: Vec<u8> = (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect();
+        let c = TokenCipher::new(Some("golden-key"));
+        assert_eq!(
+            c.open(&blob, b"golden-user").as_deref(),
+            Some(&b"golden-plaintext"[..]),
+            "stored-format compatibility broken: deployed rows would no longer decrypt"
+        );
+    }
+
+    /// Not a test — regenerates the golden vector after an INTENTIONAL format
+    /// change. Run with `cargo test golden_blob_generator -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn golden_blob_generator() {
+        let c = TokenCipher::new(Some("golden-key"));
+        let blob = c.seal(b"golden-plaintext", b"golden-user");
+        let hex: String = blob.iter().map(|b| format!("{b:02x}")).collect();
+        println!("golden blob hex: {hex}");
+    }
 }

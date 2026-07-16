@@ -22,8 +22,13 @@ pub struct Config {
 /// Parse a numeric env var, warning (rather than silently defaulting) when a
 /// value is present but unparseable — so a typo is distinguishable from unset.
 fn env_num<T: std::str::FromStr>(key: &str) -> Option<T> {
-    let raw = env::var(key).ok()?;
-    let trimmed = raw.trim();
+    parse_num(key, env::var(key).ok().as_deref())
+}
+
+/// The pure half of [`env_num`]: None for unset/blank, Some for a valid parse,
+/// and a warn + None for a present-but-unparseable value.
+fn parse_num<T: std::str::FromStr>(key: &str, raw: Option<&str>) -> Option<T> {
+    let trimmed = raw?.trim();
     if trimmed.is_empty() {
         return None;
     }
@@ -34,6 +39,13 @@ fn env_num<T: std::str::FromStr>(key: &str) -> Option<T> {
             None
         }
     }
+}
+
+/// Resolve the embeds/controls text channel: a valid TEXT_CHANNEL_ID wins,
+/// unset or invalid falls back to the voice channel's built-in text chat.
+fn resolve_text_channel_id(raw: Option<&str>, voice_channel_id: u64) -> u64 {
+    raw.and_then(|v| parse_id("TEXT_CHANNEL_ID", v).ok())
+        .unwrap_or(voice_channel_id)
 }
 
 /// Parse a Discord snowflake id, rejecting zero (serenity's Id::new panics on 0).
@@ -80,12 +92,8 @@ impl Config {
             &env::var("DISCORD_GUILD_ID").map_err(|_| ConfigError::Missing("DISCORD_GUILD_ID"))?,
         )?;
 
-        // Text channel for embeds/controls; falls back to the voice channel's
-        // built-in text chat when unset or invalid.
-        let discord_text_channel_id = env::var("TEXT_CHANNEL_ID")
-            .ok()
-            .and_then(|v| parse_id("TEXT_CHANNEL_ID", &v).ok())
-            .unwrap_or(discord_channel_id);
+        let discord_text_channel_id =
+            resolve_text_channel_id(env::var("TEXT_CHANNEL_ID").ok().as_deref(), discord_channel_id);
 
         Ok(Config {
             discord_token: env::var("DISCORD_TOKEN")
@@ -127,7 +135,7 @@ impl std::error::Error for ConfigError {}
 
 #[cfg(test)]
 mod tests {
-    use super::parse_id;
+    use super::{parse_id, parse_num, resolve_text_channel_id};
 
     #[test]
     fn accepts_valid_snowflake() {
@@ -148,5 +156,29 @@ mod tests {
     #[test]
     fn trims_whitespace() {
         assert_eq!(parse_id("X", "  123  ").unwrap(), 123);
+    }
+
+    #[test]
+    fn parse_num_distinguishes_unset_blank_and_invalid() {
+        // Unset and blank are silent defaults …
+        assert_eq!(parse_num::<f32>("X", None), None);
+        assert_eq!(parse_num::<f32>("X", Some("")), None);
+        assert_eq!(parse_num::<f32>("X", Some("   ")), None);
+        // … a typo also yields None (with a warn in the real path) …
+        assert_eq!(parse_num::<f32>("X", Some("3.o")), None);
+        assert_eq!(parse_num::<usize>("X", Some("-1")), None);
+        // … and a valid value parses, whitespace tolerated.
+        assert_eq!(parse_num::<f32>("X", Some(" 3.5 ")), Some(3.5));
+        assert_eq!(parse_num::<usize>("X", Some("8")), Some(8));
+    }
+
+    #[test]
+    fn text_channel_falls_back_to_voice_channel() {
+        // Valid override wins.
+        assert_eq!(resolve_text_channel_id(Some("42"), 7), 42);
+        // Unset, invalid, and zero all fall back to the voice channel chat.
+        assert_eq!(resolve_text_channel_id(None, 7), 7);
+        assert_eq!(resolve_text_channel_id(Some("not-an-id"), 7), 7);
+        assert_eq!(resolve_text_channel_id(Some("0"), 7), 7);
     }
 }

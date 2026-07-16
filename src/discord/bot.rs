@@ -1335,6 +1335,35 @@ impl EventHandler for Handler {
     }
 }
 
+/// Outcome of validating a pasted redirect against the stashed PKCE challenge.
+#[derive(Debug, PartialEq, Eq)]
+enum PendingLoginCheck {
+    Ok,
+    /// The 10-minute pending window has elapsed; the challenge must be burned.
+    Expired,
+    /// The redirect carried a state that doesn't match the stashed one (CSRF).
+    StateMismatch,
+}
+
+/// Pure policy for a pending login attempt. A redirect with NO state (a bare
+/// pasted code) deliberately skips the CSRF comparison: state defends the
+/// URL-paste path against swapped links, while a bare code is useless without
+/// this user's stashed PKCE verifier — the token exchange itself enforces
+/// that binding.
+fn check_pending_login(
+    age: std::time::Duration,
+    expected_state: &str,
+    returned_state: Option<&str>,
+) -> PendingLoginCheck {
+    if age > std::time::Duration::from_secs(600) {
+        return PendingLoginCheck::Expired;
+    }
+    match returned_state {
+        Some(returned) if returned != expected_state => PendingLoginCheck::StateMismatch,
+        _ => PendingLoginCheck::Ok,
+    }
+}
+
 /// Pure voice-gate policy (PORT.md locked decision 4): with the bot in a
 /// channel the user must share it; with the bot in none, `allow_follow`
 /// decides whether being in any voice channel suffices (the /play
@@ -2254,17 +2283,17 @@ impl Handler {
             Some(p) => p,
             None => return "No pending login — run `/login` first to get an authorize link.".to_string(),
         };
-        if started.elapsed() > std::time::Duration::from_secs(600) {
-            let mut lock = self.pending_auth.lock();
-            lock.remove(&user_id_u64);
-            return "That login link expired. Run `/login` again.".to_string();
-        }
-        // Validate the CSRF state when the redirect carried one.
-        if let Some(returned) = params.state.as_deref() {
-            if returned != pkce.state {
+        match check_pending_login(started.elapsed(), &pkce.state, params.state.as_deref()) {
+            PendingLoginCheck::Expired => {
+                let mut lock = self.pending_auth.lock();
+                lock.remove(&user_id_u64);
+                return "That login link expired. Run `/login` again.".to_string();
+            }
+            PendingLoginCheck::StateMismatch => {
                 tracing::warn!(user = %user_id, "OAuth state mismatch");
                 return "Login state mismatch — for safety, run `/login` again.".to_string();
             }
+            PendingLoginCheck::Ok => {}
         }
 
         let token = match self.oauth.exchange_code(&params.code, &pkce.verifier).await {
@@ -2538,9 +2567,109 @@ impl DiscordBot {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_valid_track_id, parse_track_id_from_url};
+    use super::{
+        check_pending_login, is_valid_track_id, parse_track_id_from_url, voice_gate,
+        DrainGuard, PendingLoginCheck,
+    };
+    use serenity::all::ChannelId;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
 
     const ID: &str = "4cOdK2wGLETKBW3PvgPWqT"; // 22 base62 chars
+
+    // --- voice_gate: the authorization rule behind every playback command ---
+
+    #[test]
+    fn gate_requires_sharing_the_bots_channel() {
+        let bot = Some(ChannelId::new(10));
+        assert!(voice_gate(bot, Some(ChannelId::new(10)), false), "same channel passes");
+        assert!(!voice_gate(bot, Some(ChannelId::new(11)), false), "other channel fails");
+        assert!(!voice_gate(bot, None, false), "not in voice fails");
+        // allow_follow changes nothing while the bot IS in a channel.
+        assert!(!voice_gate(bot, Some(ChannelId::new(11)), true));
+        assert!(!voice_gate(bot, None, true));
+    }
+
+    #[test]
+    fn gate_with_bot_out_of_voice_depends_on_follow() {
+        // Strict commands (buttons, /skip, /stop…) fail when the bot isn't in
+        // voice; /play's follow mode only needs the requester to be in one.
+        assert!(!voice_gate(None, Some(ChannelId::new(10)), false));
+        assert!(voice_gate(None, Some(ChannelId::new(10)), true));
+        assert!(!voice_gate(None, None, true), "follow still needs the user in voice");
+    }
+
+    // --- check_pending_login: the /login paste-back policy ---
+
+    #[test]
+    fn pending_login_expires_after_ten_minutes() {
+        assert_eq!(
+            check_pending_login(Duration::from_secs(600), "s", Some("s")),
+            PendingLoginCheck::Ok,
+            "at the boundary the link still works"
+        );
+        assert_eq!(
+            check_pending_login(Duration::from_secs(601), "s", Some("s")),
+            PendingLoginCheck::Expired
+        );
+    }
+
+    #[test]
+    fn pending_login_rejects_state_mismatch() {
+        assert_eq!(
+            check_pending_login(Duration::ZERO, "expected", Some("tampered")),
+            PendingLoginCheck::StateMismatch
+        );
+        assert_eq!(
+            check_pending_login(Duration::ZERO, "expected", Some("expected")),
+            PendingLoginCheck::Ok
+        );
+    }
+
+    #[test]
+    fn bare_code_paste_skips_the_state_check_by_design() {
+        // Pinned as intended: a bare code carries no state to compare, and it
+        // cannot be exchanged without this user's stashed PKCE verifier — the
+        // exchange enforces the binding the state check would have.
+        assert_eq!(
+            check_pending_login(Duration::ZERO, "expected", None),
+            PendingLoginCheck::Ok
+        );
+        // Expiry still applies to bare codes.
+        assert_eq!(
+            check_pending_login(Duration::from_secs(601), "expected", None),
+            PendingLoginCheck::Expired
+        );
+    }
+
+    // --- DrainGuard: the single-flight drain flag ---
+
+    #[test]
+    fn drain_flag_is_single_flight_and_guard_releases_on_drop() {
+        let flag = Arc::new(AtomicBool::new(false));
+        assert!(flag.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_ok());
+        let guard = DrainGuard(flag.clone());
+        // A second would-be drain loses the race while the first one runs.
+        assert!(flag.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err());
+        drop(guard);
+        assert!(!flag.load(Ordering::SeqCst), "drop released the flag");
+        assert!(flag.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_ok());
+    }
+
+    #[test]
+    fn drain_guard_releases_even_on_panic() {
+        // The abort-safety property the guard exists for: a drain that panics
+        // (or is cancelled) must not wedge every future drain.
+        let flag = Arc::new(AtomicBool::new(true));
+        let flag2 = flag.clone();
+        let result = std::panic::catch_unwind(move || {
+            let _guard = DrainGuard(flag2);
+            panic!("drain blew up");
+        });
+        assert!(result.is_err());
+        assert!(!flag.load(Ordering::SeqCst), "flag released during unwind");
+    }
 
     #[test]
     fn parses_plain_url() {

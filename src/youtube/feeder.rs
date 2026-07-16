@@ -34,6 +34,25 @@ fn ensure_tmp_dir() -> std::io::Result<()> {
     std::fs::create_dir_all(crate::youtube::tmp_dir())
 }
 
+/// Prepend `carry` to `chunk`, decode whole stereo frames (two LE f32s = 8
+/// bytes), and leave the 0-7 byte tail in `carry` for the next read. Framing —
+/// not just f32 alignment — is the invariant: emitting an odd number of whole
+/// samples would make the bridge drop one to stay even and permanently swap
+/// L/R from that point on.
+fn split_stereo_frames(carry: &mut Vec<u8>, chunk: &[u8]) -> Vec<f32> {
+    let mut bytes = Vec::with_capacity(carry.len() + chunk.len());
+    bytes.extend_from_slice(carry);
+    bytes.extend_from_slice(chunk);
+    let usable = bytes.len() - (bytes.len() % 8);
+    let samples: Vec<f32> = bytes[..usable]
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    carry.clear();
+    carry.extend_from_slice(&bytes[usable..]);
+    samples
+}
+
 /// Best-effort removal of tmp files matching `prefix` — cancelled or failed
 /// downloads must not accumulate partials (yt-dlp runs with --no-part, so a
 /// killed download leaves its output behind).
@@ -161,11 +180,8 @@ async fn feed_pcm_to_bridge(
         .ok_or_else(|| FeederError::ConvertFailed("no stdout".to_string()))?;
 
     let mut buf = vec![0u8; READ_CHUNK_BYTES];
-    // Holds the 1-7 trailing bytes left when a pipe read doesn't land on a
-    // stereo-frame (two f32s = 8 bytes) boundary, so they prefix the next
-    // read instead of being dropped. Aligning to 4 bytes isn't enough: an odd
-    // number of whole samples makes the bridge drop the trailing one, which
-    // permanently shifts the interleaving and swaps L/R.
+    // Trailing bytes of a read that missed a frame boundary — see
+    // split_stereo_frames for the L/R invariant.
     let mut carry: Vec<u8> = Vec::with_capacity(8);
     let mut frames_sent: u64 = 0;
     let mut start = Instant::now();
@@ -205,19 +221,7 @@ async fn feed_pcm_to_bridge(
             break;
         }
 
-        // Prepend any carried remainder, split into whole stereo frames,
-        // carry the tail.
-        let mut bytes = Vec::with_capacity(carry.len() + n);
-        bytes.extend_from_slice(&carry);
-        bytes.extend_from_slice(&buf[..n]);
-        let usable = bytes.len() - (bytes.len() % 8);
-        let samples: Vec<f32> = bytes[..usable]
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect();
-        carry.clear();
-        carry.extend_from_slice(&bytes[usable..]);
-
+        let samples = split_stereo_frames(&mut carry, &buf[..n]);
         bridge.push_samples(&samples);
 
         // Real-time pacing (mirrors DiscordSink)
@@ -276,4 +280,64 @@ pub async fn feed_file_to_bridge(
     let result = feed_pcm_to_bridge(&path, &bridge, &token, &paused).await;
     let _ = tokio::fs::remove_file(&path).await;
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::split_stereo_frames;
+
+    /// A little-endian byte stream of the f32 sequence 0.0, 1.0, 2.0, …, n-1.
+    fn le_stream(n: usize) -> Vec<u8> {
+        (0..n).flat_map(|i| (i as f32).to_le_bytes()).collect()
+    }
+
+    #[test]
+    fn aligned_chunk_passes_through_whole() {
+        let mut carry = Vec::new();
+        let samples = split_stereo_frames(&mut carry, &le_stream(4));
+        assert_eq!(samples, vec![0.0, 1.0, 2.0, 3.0]);
+        assert!(carry.is_empty());
+    }
+
+    #[test]
+    fn tail_is_carried_not_dropped() {
+        let mut carry = Vec::new();
+        let stream = le_stream(4);
+        // First read stops 3 bytes short of the second frame.
+        let first = split_stereo_frames(&mut carry, &stream[..13]);
+        assert_eq!(first, vec![0.0, 1.0], "only the whole frame is emitted");
+        assert_eq!(carry.len(), 5);
+        // The next read completes it; nothing lost, order intact.
+        let second = split_stereo_frames(&mut carry, &stream[13..]);
+        assert_eq!(second, vec![2.0, 3.0]);
+        assert!(carry.is_empty());
+    }
+
+    #[test]
+    fn emits_only_even_sample_counts() {
+        // 12 bytes = 3 whole f32s, but an odd sample count would shift L/R at
+        // the bridge — one whole frame comes out, one sample stays carried.
+        let mut carry = Vec::new();
+        let samples = split_stereo_frames(&mut carry, &le_stream(3));
+        assert_eq!(samples, vec![0.0, 1.0]);
+        assert_eq!(carry.len(), 4);
+    }
+
+    #[test]
+    fn byte_at_a_time_stream_reassembles_exactly() {
+        // The worst pipe-read pattern: every read lands mid-sample. All frames
+        // must come out, in order, with every emission frame-even.
+        let stream = le_stream(64);
+        let mut carry = Vec::new();
+        let mut out = Vec::new();
+        for b in &stream {
+            let chunk = split_stereo_frames(&mut carry, std::slice::from_ref(b));
+            assert_eq!(chunk.len() % 2, 0);
+            assert!(carry.len() < 8, "carry must stay under one frame");
+            out.extend(chunk);
+        }
+        let expected: Vec<f32> = (0..64).map(|i| i as f32).collect();
+        assert_eq!(out, expected);
+        assert!(carry.is_empty());
+    }
 }

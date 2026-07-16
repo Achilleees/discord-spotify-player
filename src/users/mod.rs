@@ -350,6 +350,53 @@ mod tests {
     }
 
     #[test]
+    fn wrong_key_reads_as_absent_not_garbage() {
+        // Reopening the store under a rotated/wrong TOKEN_ENC_KEY must make
+        // rows unreadable-but-skippable: load() → None (the recovery flow
+        // treats it as "not logged in"), list() filters the row out. Needs a
+        // file-backed DB — a second :memory: open is a different database.
+        let path = std::env::temp_dir().join(format!(
+            "spotibot-test-keyrot-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path_str = path.to_str().unwrap().to_string();
+
+        {
+            let s = UserStore::open(&path_str, Some("key-A")).unwrap();
+            s.save(&creds("1", true)).unwrap();
+        } // dropped: connection closed before reopening
+
+        {
+            let s = UserStore::open(&path_str, Some("key-B")).unwrap();
+            assert!(s.load("1").is_none(), "wrong key must not yield tokens");
+            assert!(s.list().is_empty(), "list skips undecryptable rows");
+            // The right key still works — the row itself is intact.
+        }
+        {
+            let s = UserStore::open(&path_str, Some("key-A")).unwrap();
+            assert_eq!(s.load("1").unwrap().access_token, "at");
+        }
+
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{path_str}{suffix}"));
+        }
+    }
+
+    #[test]
+    fn settings_roundtrip_and_overwrite() {
+        let s = store();
+        assert_eq!(s.get_setting("announce_enabled"), None);
+        s.set_setting("announce_enabled", "1").unwrap();
+        assert_eq!(s.get_setting("announce_enabled").as_deref(), Some("1"));
+        s.set_setting("announce_enabled", "0").unwrap();
+        assert_eq!(s.get_setting("announce_enabled").as_deref(), Some("0"));
+    }
+
+    #[test]
     fn tokens_are_encrypted_at_rest_with_a_key() {
         let s = UserStore::open(":memory:", Some("a-key")).unwrap();
         s.save(&creds("1", true)).unwrap();

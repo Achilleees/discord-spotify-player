@@ -13,6 +13,11 @@ pub struct SpotifyOAuth {
     pub client_id: String,
     pub redirect_uri: String,
     http: Client,
+    /// Base URL for accounts.spotify.com endpoints (token exchange/refresh).
+    /// Overridable so tests can point at a local mock server.
+    accounts_base: String,
+    /// Base URL for api.spotify.com endpoints (profile fetch).
+    api_base: String,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -76,13 +81,25 @@ impl SpotifyOAuth {
                 .timeout(std::time::Duration::from_secs(10))
                 .build()
                 .unwrap_or_default(),
+            accounts_base: "https://accounts.spotify.com".to_string(),
+            api_base: "https://api.spotify.com".to_string(),
         }
+    }
+
+    /// Test-only constructor pointing both endpoint families at a mock server.
+    #[cfg(test)]
+    fn with_base_urls(client_id: &str, accounts_base: &str, api_base: &str) -> Self {
+        let mut o = Self::new(client_id.to_string());
+        o.accounts_base = accounts_base.trim_end_matches('/').to_string();
+        o.api_base = api_base.trim_end_matches('/').to_string();
+        o
     }
 
     /// Build the Spotify authorization URL for the Authorization Code + PKCE flow.
     pub fn auth_url(&self, pkce: &PkceChallenge) -> String {
         format!(
-            "https://accounts.spotify.com/authorize?response_type=code&client_id={}&scope={}&redirect_uri={}&state={}&code_challenge_method=S256&code_challenge={}",
+            "{}/authorize?response_type=code&client_id={}&scope={}&redirect_uri={}&state={}&code_challenge_method=S256&code_challenge={}",
+            self.accounts_base,
             pct_encode(&self.client_id),
             pct_encode(SCOPES),
             pct_encode(&self.redirect_uri),
@@ -107,7 +124,7 @@ impl SpotifyOAuth {
 
         let resp = self
             .http
-            .post("https://accounts.spotify.com/api/token")
+            .post(format!("{}/api/token", self.accounts_base))
             .form(&params)
             .send()
             .await?;
@@ -135,7 +152,7 @@ impl SpotifyOAuth {
 
         let resp = self
             .http
-            .post("https://accounts.spotify.com/api/token")
+            .post(format!("{}/api/token", self.accounts_base))
             .form(&params)
             .send()
             .await?;
@@ -155,7 +172,7 @@ impl SpotifyOAuth {
     pub async fn get_user_profile(&self, access_token: &str) -> Result<String, OAuthError> {
         let resp = self
             .http
-            .get("https://api.spotify.com/v1/me")
+            .get(format!("{}/v1/me", self.api_base))
             .header("Authorization", format!("Bearer {}", access_token))
             .send()
             .await?;
@@ -259,13 +276,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pkce_challenge_is_sha256_of_verifier() {
+    fn pkce_challenge_matches_rfc7636_vector() {
         let pkce = new_pkce();
         // Verifier is 32 bytes base64url-no-pad = 43 chars.
         assert_eq!(pkce.verifier.len(), 43);
-        // Challenge recomputes deterministically from the verifier.
-        let expected = URL_SAFE_NO_PAD.encode(Sha256::digest(pkce.verifier.as_bytes()));
-        assert_eq!(pkce.challenge, expected);
+        // RFC 7636 Appendix B fixed vector — an independent oracle, unlike
+        // recomputing the challenge with the implementation's own expression
+        // (which would pass even if both shared a wrong encoding).
+        let challenge = URL_SAFE_NO_PAD
+            .encode(Sha256::digest(b"dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"));
+        assert_eq!(challenge, "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM");
     }
 
     #[test]
@@ -323,5 +343,107 @@ mod tests {
         assert!(url.contains(&format!("code_challenge={}", pkce.challenge)));
         assert!(url.contains(&format!("state={}", pkce.state)));
         assert!(url.contains("client_id=client123"));
+    }
+
+    // --- Network methods against a local one-shot mock server ---
+
+    /// True once the buffered request holds full headers plus any declared body.
+    fn request_complete(req: &[u8]) -> bool {
+        let Some(header_end) = req.windows(4).position(|w| w == b"\r\n\r\n") else {
+            return false;
+        };
+        let headers = String::from_utf8_lossy(&req[..header_end]).to_lowercase();
+        let content_length = headers
+            .lines()
+            .find_map(|l| l.strip_prefix("content-length:").map(str::trim))
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0);
+        req.len() >= header_end + 4 + content_length
+    }
+
+    /// Bind a local port and answer the first request with `status` + `body`.
+    /// Returns the base URL to point the client at.
+    fn mock_http_once(status: &'static str, body: &'static str) -> String {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
+                let mut req = Vec::new();
+                let mut buf = [0u8; 4096];
+                loop {
+                    match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            req.extend_from_slice(&buf[..n]);
+                            if request_complete(&req) {
+                                break;
+                            }
+                        }
+                    }
+                }
+                let resp = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn exchange_code_parses_token_response() {
+        let base = mock_http_once(
+            "200 OK",
+            r#"{"access_token":"AT","refresh_token":"RT","expires_in":3600}"#,
+        );
+        let oauth = SpotifyOAuth::with_base_urls("cid", &base, &base);
+        let tok = oauth.exchange_code("code", "verifier").await.unwrap();
+        assert_eq!(tok.access_token, "AT");
+        assert_eq!(tok.refresh_token.as_deref(), Some("RT"));
+        assert_eq!(tok.expires_in, 3600);
+    }
+
+    #[tokio::test]
+    async fn exchange_code_maps_non_2xx_to_api_error() {
+        let base = mock_http_once("400 Bad Request", r#"{"error":"invalid_grant"}"#);
+        let oauth = SpotifyOAuth::with_base_urls("cid", &base, &base);
+        match oauth.exchange_code("code", "verifier").await {
+            Err(OAuthError::Api(msg)) => {
+                assert!(msg.contains("400"), "got: {msg}");
+                assert!(msg.contains("invalid_grant"), "got: {msg}");
+            }
+            other => panic!("expected Api error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_without_rotated_token_parses_as_none() {
+        // Spotify often omits refresh_token on refresh; the caller keeps the
+        // old one, so this must parse as None rather than fail.
+        let base = mock_http_once("200 OK", r#"{"access_token":"AT2","expires_in":3600}"#);
+        let oauth = SpotifyOAuth::with_base_urls("cid", &base, &base);
+        let tok = oauth.refresh_access_token("rt").await.unwrap();
+        assert_eq!(tok.access_token, "AT2");
+        assert!(tok.refresh_token.is_none());
+    }
+
+    #[tokio::test]
+    async fn profile_falls_back_to_id_when_display_name_is_null() {
+        let base = mock_http_once("200 OK", r#"{"id":"user-id-1","display_name":null}"#);
+        let oauth = SpotifyOAuth::with_base_urls("cid", &base, &base);
+        assert_eq!(oauth.get_user_profile("at").await.unwrap(), "user-id-1");
+    }
+
+    #[tokio::test]
+    async fn profile_non_2xx_is_api_error() {
+        let base = mock_http_once("401 Unauthorized", r#"{"error":"expired"}"#);
+        let oauth = SpotifyOAuth::with_base_urls("cid", &base, &base);
+        assert!(matches!(
+            oauth.get_user_profile("at").await,
+            Err(OAuthError::Api(_))
+        ));
     }
 }

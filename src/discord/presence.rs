@@ -67,7 +67,43 @@ pub async fn run_presence_loop(ctx: Context, mut rx: mpsc::UnboundedReceiver<Pre
 
 #[cfg(test)]
 mod tests {
-    use super::truncate_status;
+    use super::{status_text, truncate_status};
+    use crate::presence::PresenceUpdate;
+
+    fn playing(title: &str, artist: &str) -> PresenceUpdate {
+        PresenceUpdate::Playing {
+            title: title.to_string(),
+            artist: artist.to_string(),
+            track_id: "t".to_string(),
+            access_token: "at".to_string(),
+        }
+    }
+
+    #[test]
+    fn maps_all_three_states() {
+        assert_eq!(status_text(&PresenceUpdate::Idle, false), "Idle");
+        assert_eq!(status_text(&PresenceUpdate::Paused, false), "Paused");
+        assert_eq!(
+            status_text(&playing("Song", "Artist"), false),
+            "\u{266C} Song - Artist"
+        );
+    }
+
+    #[test]
+    fn dance_flip_alternates_the_note() {
+        let p = playing("Song", "Artist");
+        assert!(status_text(&p, true).starts_with('\u{266A}'));
+        assert!(status_text(&p, false).starts_with('\u{266C}'));
+        // The flip only animates Playing; Idle/Paused stay untouched.
+        assert_eq!(status_text(&PresenceUpdate::Idle, true), "Idle");
+    }
+
+    #[test]
+    fn playing_status_is_truncated_to_discord_limit() {
+        let long = status_text(&playing(&"x".repeat(200), "Artist"), false);
+        assert!(long.chars().count() <= 96);
+        assert!(long.ends_with("..."));
+    }
 
     #[test]
     fn short_text_is_unchanged() {

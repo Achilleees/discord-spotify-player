@@ -166,3 +166,102 @@ impl MediaSource for SimpleBridgeReader {
         None
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::SimpleBridgeReader;
+    use crate::audio_bridge::AudioBridge;
+    use std::io::Read as _;
+    use std::time::{Duration, Instant};
+
+    fn reader(bridge: &std::sync::Arc<AudioBridge>) -> SimpleBridgeReader {
+        SimpleBridgeReader::new(bridge.clone(), 0, Duration::ZERO)
+    }
+
+    #[test]
+    fn starved_reader_returns_silence_never_eof() {
+        // The soak-critical invariant: Ok(0) is EOF to Songbird and ends the
+        // track permanently. An empty bridge must yield a full buffer of
+        // silence instead.
+        let bridge = AudioBridge::new(1);
+        let mut r = reader(&bridge);
+        let mut buf = [0xFFu8; 64];
+        let n = r.read(&mut buf).unwrap();
+        assert_eq!(n, 64, "still a full write, not EOF");
+        assert!(buf.iter().all(|&b| b == 0), "silence, not stale bytes");
+    }
+
+    #[test]
+    fn buffer_smaller_than_one_sample_gets_silence() {
+        let bridge = AudioBridge::new(1);
+        let mut r = reader(&bridge);
+        let mut buf = [0xFFu8; 3];
+        let n = r.read(&mut buf).unwrap();
+        assert_eq!(n, 3, "sub-sample buffer is zero-filled, not Ok(0)");
+        assert_eq!(buf, [0, 0, 0]);
+    }
+
+    #[test]
+    fn samples_are_packed_little_endian() {
+        let bridge = AudioBridge::new(1);
+        bridge.push_samples(&[0.5, -0.25]);
+        let mut r = reader(&bridge);
+        let mut buf = [0u8; 8];
+        assert_eq!(r.read(&mut buf).unwrap(), 8);
+        let a = f32::from_le_bytes(buf[0..4].try_into().unwrap());
+        let b = f32::from_le_bytes(buf[4..8].try_into().unwrap());
+        assert_eq!((a, b), (0.5, -0.25));
+    }
+
+    #[test]
+    fn partial_starvation_zero_fills_the_tail() {
+        let bridge = AudioBridge::new(1);
+        bridge.push_samples(&[1.0, 1.0]);
+        let mut r = reader(&bridge);
+        let mut buf = [0xFFu8; 16];
+        assert_eq!(r.read(&mut buf).unwrap(), 16);
+        assert_eq!(f32::from_le_bytes(buf[0..4].try_into().unwrap()), 1.0);
+        assert_eq!(f32::from_le_bytes(buf[4..8].try_into().unwrap()), 1.0);
+        assert!(buf[8..].iter().all(|&b| b == 0), "unfilled samples are silence");
+    }
+
+    #[test]
+    fn odd_buffer_returns_whole_samples_only() {
+        let bridge = AudioBridge::new(1);
+        bridge.push_samples(&[1.0, 1.0]);
+        let mut r = reader(&bridge);
+        let mut buf = [0u8; 6]; // 1.5 samples
+        assert_eq!(r.read(&mut buf).unwrap(), 4, "trailing half-sample not written");
+    }
+
+    #[test]
+    fn first_read_blocks_until_prebuffer_timeout() {
+        let bridge = AudioBridge::new(1);
+        let mut r = SimpleBridgeReader::new(bridge, 4, Duration::from_millis(150));
+        let mut buf = [0u8; 16];
+        let t = Instant::now();
+        assert_eq!(r.read(&mut buf).unwrap(), 16);
+        assert!(
+            t.elapsed() >= Duration::from_millis(140),
+            "first read must wait out the prebuffer window on an empty bridge"
+        );
+        // Later reads must not re-block: prebuffering is first-read-only.
+        let t = Instant::now();
+        assert_eq!(r.read(&mut buf).unwrap(), 16);
+        assert!(t.elapsed() < Duration::from_millis(100));
+    }
+
+    #[test]
+    fn prebuffer_releases_early_once_filled() {
+        let bridge = AudioBridge::new(1);
+        bridge.push_samples(&[1.0, 1.0]);
+        let mut r = SimpleBridgeReader::new(bridge, 2, Duration::from_secs(5));
+        let mut buf = [0u8; 8];
+        let t = Instant::now();
+        assert_eq!(r.read(&mut buf).unwrap(), 8);
+        assert!(
+            t.elapsed() < Duration::from_secs(1),
+            "a filled bridge must not wait out the full window"
+        );
+    }
+}

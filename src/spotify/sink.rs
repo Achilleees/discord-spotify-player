@@ -268,9 +268,57 @@ impl Sink for DiscordSink {
 
 #[cfg(test)]
 mod tests {
-    use super::Biquad;
+    use super::{Biquad, DiscordSink, DspConfig};
+    use crate::audio_bridge::AudioBridge;
+    use librespot_playback::audio_backend::Sink as _;
+    use librespot_playback::decoder::AudioPacket;
 
     const SR: f32 = 44_100.0;
+
+    fn write(sink: &mut DiscordSink, samples: Vec<f64>) {
+        let mut conv = librespot_playback::convert::Converter::new(None);
+        sink.write(AudioPacket::Samples(samples), &mut conv).unwrap();
+    }
+
+    #[test]
+    fn dsp_off_write_is_clamped_passthrough() {
+        let bridge = AudioBridge::new(1);
+        let mut sink = DiscordSink::new(bridge.clone(), DspConfig::new(0.0, 0.0, 0.0));
+        write(&mut sink, vec![0.5, -0.5, 1.5, -1.5]);
+        let mut out = [0.0f32; 4];
+        assert_eq!(bridge.pull_samples(&mut out), 4);
+        // Values pass through untouched except the [-1, 1] safety clamp.
+        assert_eq!(out, [0.5, -0.5, 1.0, -1.0]);
+    }
+
+    #[test]
+    fn preamp_gain_applies_and_clamps() {
+        let bridge = AudioBridge::new(1);
+        // +6 dB preamp, flat shelves (zero-gain biquads are identity).
+        let mut sink = DiscordSink::new(bridge.clone(), DspConfig::new(6.0, 0.0, 0.0));
+        write(&mut sink, vec![0.1, 0.1, 0.9, 0.9]);
+        let mut out = [0.0f32; 4];
+        assert_eq!(bridge.pull_samples(&mut out), 4);
+        let gain = 10f32.powf(6.0 / 20.0);
+        assert!((out[0] - 0.1 * gain).abs() < 1e-6, "got {}", out[0]);
+        assert!((out[1] - 0.1 * gain).abs() < 1e-6);
+        // 0.9 × ~2 would exceed full scale; the clamp must catch it.
+        assert_eq!(out[2], 1.0);
+        assert_eq!(out[3], 1.0);
+    }
+
+    #[test]
+    fn start_and_stop_clear_the_bridge() {
+        let bridge = AudioBridge::new(1);
+        let mut sink = DiscordSink::new(bridge.clone(), DspConfig::new(0.0, 0.0, 0.0));
+        write(&mut sink, vec![0.5, 0.5]);
+        assert_eq!(bridge.len(), 2);
+        sink.start().unwrap();
+        assert_eq!(bridge.len(), 0, "start flushes stale audio");
+        write(&mut sink, vec![0.5, 0.5]);
+        sink.stop().unwrap();
+        assert_eq!(bridge.len(), 0, "stop flushes too");
+    }
 
     #[test]
     fn fresh_biquad_is_identity() {

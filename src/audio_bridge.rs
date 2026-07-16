@@ -319,4 +319,85 @@ mod tests {
         b.clear();
         assert_eq!(b.len(), 0);
     }
+
+    // --- DJ overlay path ---
+
+    #[test]
+    fn overlay_mixes_on_top_of_music_at_fixed_gain() {
+        let b = AudioBridge::new(1);
+        b.push_samples(&[1.0, 1.0]);
+        b.push_overlay(&[1.0, 1.0]);
+        let mut out = [0.0f32; 2];
+        assert_eq!(b.pull_samples(&mut out), 2);
+        assert_eq!(out, [1.0 + OVERLAY_GAIN, 1.0 + OVERLAY_GAIN]);
+    }
+
+    #[test]
+    fn overlay_plays_even_when_music_is_starved() {
+        // The contract voice.rs relies on: pull_samples' return value counts
+        // only MUSIC samples, but the output buffer still carries the mixed
+        // overlay — the reader must consume the whole buffer regardless.
+        let b = AudioBridge::new(1);
+        b.push_overlay(&[1.0, 1.0]);
+        let mut out = [0.0f32; 4];
+        assert_eq!(b.pull_samples(&mut out), 0, "no music was pulled");
+        assert_eq!(out[..2], [OVERLAY_GAIN, OVERLAY_GAIN], "overlay mixed anyway");
+        assert_eq!(out[2..], [0.0, 0.0]);
+    }
+
+    #[test]
+    fn overlay_drops_odd_tail_to_stay_frame_aligned() {
+        let b = AudioBridge::new(1);
+        b.push_overlay(&[1.0, 1.0, 1.0]); // odd
+        let mut out = [0.0f32; 4];
+        b.pull_samples(&mut out);
+        assert_eq!(out, [OVERLAY_GAIN, OVERLAY_GAIN, 0.0, 0.0], "only one whole frame kept");
+    }
+
+    #[test]
+    fn overlay_is_bounded_by_bridge_capacity() {
+        let b = AudioBridge::new(1); // cap = 88_200 samples
+        b.push_overlay(&vec![1.0f32; 100_000]);
+        // Count how much overlay actually survives by draining it all.
+        let mut total = 0usize;
+        let mut out = [0.0f32; 8_192];
+        loop {
+            out.fill(0.0);
+            b.pull_samples(&mut out);
+            let nonzero = out.iter().filter(|&&s| s != 0.0).count();
+            if nonzero == 0 {
+                break;
+            }
+            total += nonzero;
+        }
+        assert_eq!(total, 88_200, "overlay truncated to capacity, tail dropped");
+    }
+
+    #[test]
+    fn overlay_drains_at_output_pace() {
+        // A pull mixes at most output.len() overlay samples; the rest stays
+        // queued for later pulls instead of being dumped in one go.
+        let b = AudioBridge::new(1);
+        b.push_overlay(&[1.0, 1.0, 1.0, 1.0]);
+        let mut out = [0.0f32; 2];
+        b.pull_samples(&mut out);
+        assert_eq!(out, [OVERLAY_GAIN, OVERLAY_GAIN]);
+        out.fill(0.0);
+        b.pull_samples(&mut out);
+        assert_eq!(out, [OVERLAY_GAIN, OVERLAY_GAIN], "second frame arrives on the next pull");
+    }
+
+    // --- Shared pacing deadline ---
+
+    #[test]
+    fn playout_deadline_is_frames_over_sample_rate() {
+        let start = std::time::Instant::now();
+        assert_eq!(playout_deadline(start, 0), start);
+        let one_second = playout_deadline(start, SAMPLE_RATE as u64);
+        assert_eq!(one_second - start, std::time::Duration::from_secs(1));
+        // 250ms worth of frames — the fractional path.
+        let quarter = playout_deadline(start, SAMPLE_RATE as u64 / 4);
+        let d = quarter - start;
+        assert!((d.as_secs_f64() - 0.25).abs() < 1e-6, "got {d:?}");
+    }
 }
