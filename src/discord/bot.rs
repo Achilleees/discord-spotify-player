@@ -533,6 +533,172 @@ impl Drop for DrainGuard {
     }
 }
 
+/// Everything one queue-drain pass needs. Built by each drain owner (the
+/// eot-driven manager and the /play-triggered drain) so both entry points run
+/// the same implementation and cannot diverge.
+struct QueueDrainCtx {
+    priority_queue: Arc<Mutex<PriorityQueue>>,
+    bridge: Arc<AudioBridge>,
+    spirc_cmd_tx: Option<mpsc::UnboundedSender<SpircCommand>>,
+    ctx: Arc<Mutex<Option<Context>>>,
+    text_channel_id: ChannelId,
+    active_priority_item: Arc<Mutex<Option<QueueItem>>>,
+    feeder_cancel: Arc<Mutex<Option<CancellationToken>>>,
+    feeder_paused: Arc<AtomicBool>,
+    dj: Arc<DJAnnouncer>,
+    announce_enabled: Arc<AtomicBool>,
+    controls_message_id: Arc<Mutex<Option<MessageId>>>,
+    now_playing_message_id: Arc<Mutex<Option<MessageId>>>,
+    track_handle: Arc<Mutex<Option<TrackHandle>>>,
+}
+
+/// Drain the priority queue until it is empty or the current item is
+/// cancelled. The caller must already own the drain-active flag (DrainGuard).
+///
+/// Semantics decided once for both owners: no history embed for cancelled or
+/// failed items (failures get a user-facing error message instead); Spotify
+/// resumes only after a natural drain; a cancelled drain resumes nothing —
+/// skip/stop owns what plays next.
+async fn run_queue_drain(d: &QueueDrainCtx) {
+    let mut cancelled = false;
+    loop {
+        let item = {
+            let mut lock = d.priority_queue.lock().unwrap_or_else(|e| e.into_inner());
+            lock.pop()
+        };
+        let item = match item {
+            Some(i) => i,
+            None => break,
+        };
+
+        // Mark the item active BEFORE pausing Spotify: the pause lands as a
+        // Paused/Idle player event, and the presence loop pauses the shared
+        // bridge-reader track unless it sees an active priority item — which
+        // would leave the whole item playing into a paused output.
+        {
+            let mut lock = d.active_priority_item.lock().unwrap_or_else(|e| e.into_inner());
+            *lock = Some(item.clone());
+        }
+
+        if let Some(ref tx) = d.spirc_cmd_tx {
+            if tx.send(SpircCommand::Pause).is_ok() {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            }
+        }
+        d.bridge.clear();
+
+        // The bridge-reader track may already be paused (Spotify was paused
+        // or idle before this drain); resume it so the feeder is heard.
+        {
+            let handle = {
+                let lock = d.track_handle.lock().unwrap_or_else(|e| e.into_inner());
+                lock.clone()
+            };
+            if let Some(h) = handle {
+                let _ = h.play();
+            }
+        }
+
+        post_priority_now_playing(
+            &d.ctx, d.text_channel_id, &item,
+            &d.controls_message_id, &d.now_playing_message_id,
+        ).await;
+
+        // DJ announcement before track (honors the /announce toggle)
+        if d.announce_enabled.load(Ordering::Relaxed) && d.dj.is_enabled() {
+            let title = item.source.display_title().to_string();
+            let subtitle = item.source.display_subtitle().to_string();
+            let queued_by = item.queued_by.clone();
+            if let Some(clip) = d.dj.track_announce_clip(&title, &subtitle, &queued_by).await {
+                d.bridge.push_overlay(&clip);
+            }
+        }
+
+        let token = CancellationToken::new();
+        {
+            let mut lock = d.feeder_cancel.lock().unwrap_or_else(|e: std::sync::PoisonError<_>| e.into_inner());
+            *lock = Some(token.clone());
+        }
+        d.feeder_paused.store(false, Ordering::Relaxed);
+
+        let feed_result = match &item.source {
+            MediaSource::YouTube { url, .. } => {
+                feed_youtube_to_bridge(url, d.bridge.clone(), token, d.feeder_paused.clone()).await
+            }
+            MediaSource::File { attachment_url, filename, .. } => {
+                let ext = filename.rsplit('.').next().unwrap_or("mp3");
+                feed_file_to_bridge(attachment_url, ext, d.bridge.clone(), token, d.feeder_paused.clone()).await
+            }
+        };
+
+        {
+            let mut lock = d.active_priority_item.lock().unwrap_or_else(|e| e.into_inner());
+            *lock = None;
+        }
+
+        match feed_result {
+            Ok(()) => {
+                tracing::info!("priority item finished: {}", item.source.display_title());
+                post_priority_history(&d.ctx, d.text_channel_id, &item).await;
+            }
+            Err(FeederError::Cancelled) => {
+                tracing::info!("priority item cancelled (skip/stop)");
+                cancelled = true;
+                break;
+            }
+            Err(e) => {
+                tracing::warn!("feeder error: {}", e);
+                let ctx = {
+                    let lock = d.ctx.lock().unwrap_or_else(|e| e.into_inner());
+                    lock.clone()
+                };
+                if let Some(ctx) = ctx {
+                    let msg = CreateMessage::new().content(format!(
+                        "⚠️ Couldn't play **{}** — the download or decode failed.",
+                        item.source.display_title()
+                    ));
+                    let _ = d.text_channel_id.send_message(&ctx, msg).await;
+                }
+            }
+        }
+    }
+
+    if cancelled {
+        return;
+    }
+
+    // Natural drain end: hand playback back to Spotify. With no live session
+    // to resume, delete the last Now Playing card instead of leaving it in
+    // the channel with dead buttons.
+    let resumed = d
+        .spirc_cmd_tx
+        .as_ref()
+        .map(|tx| tx.send(SpircCommand::Play).is_ok())
+        .unwrap_or(false);
+    if !resumed {
+        let ctx = {
+            let lock = d.ctx.lock().unwrap_or_else(|e| e.into_inner());
+            lock.clone()
+        };
+        if let Some(ctx) = ctx {
+            let np = {
+                let mut lock = d.now_playing_message_id.lock().unwrap_or_else(|e| e.into_inner());
+                lock.take()
+            };
+            let ctrl = {
+                let lock = d.controls_message_id.lock().unwrap_or_else(|e| e.into_inner());
+                *lock
+            };
+            if let Some(mid) = np {
+                if ctrl != Some(mid) {
+                    let _ = d.text_channel_id.delete_message(&ctx, mid).await;
+                }
+            }
+            delete_and_repost_controls(&ctx, d.text_channel_id, &d.controls_message_id, None).await;
+        }
+    }
+}
+
 // Wide orchestration fn wiring together the queue, bridge, and UI state. The
 // nob port folds these into its actions/panel layer; kept flat here.
 #[allow(clippy::too_many_arguments)]
@@ -551,7 +717,23 @@ async fn priority_queue_manager(
     drain_active: Arc<AtomicBool>,
     controls_message_id: Arc<Mutex<Option<MessageId>>>,
     now_playing_message_id: Arc<Mutex<Option<MessageId>>>,
+    track_handle: Arc<Mutex<Option<TrackHandle>>>,
 ) {
+    let drain_ctx = QueueDrainCtx {
+        priority_queue,
+        bridge,
+        spirc_cmd_tx: Some(spirc_cmd_tx),
+        ctx,
+        text_channel_id,
+        active_priority_item,
+        feeder_cancel,
+        feeder_paused,
+        dj,
+        announce_enabled,
+        controls_message_id,
+        now_playing_message_id,
+        track_handle,
+    };
     loop {
         match end_of_track_rx.recv().await {
             Some(()) => {}
@@ -567,96 +749,7 @@ async fn priority_queue_manager(
             continue;
         }
         let _drain_guard = DrainGuard(drain_active.clone());
-
-        // Drain the priority queue
-        let mut cancelled = false;
-        loop {
-            let item = {
-                let mut lock = priority_queue.lock().unwrap_or_else(|e| e.into_inner());
-                lock.pop()
-            };
-            let item = match item {
-                Some(i) => i,
-                None => break,
-            };
-
-            // Pause Spotify
-            let _ = spirc_cmd_tx.send(SpircCommand::Pause);
-            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-            bridge.clear();
-
-            // Store current item
-            {
-                let mut lock = active_priority_item.lock().unwrap_or_else(|e| e.into_inner());
-                *lock = Some(item.clone());
-            }
-
-            // Post now-playing embed
-            post_priority_now_playing(
-                &ctx, text_channel_id, &item,
-                &controls_message_id, &now_playing_message_id,
-            ).await;
-
-            // DJ announcement before track (honors the /announce toggle)
-            if announce_enabled.load(Ordering::Relaxed) && dj.is_enabled() {
-                let title = item.source.display_title().to_string();
-                let subtitle = item.source.display_subtitle().to_string();
-                let queued_by = item.queued_by.clone();
-                if let Some(clip) = dj.track_announce_clip(&title, &subtitle, &queued_by).await {
-                    bridge.push_overlay(&clip);
-                }
-            }
-            // Create cancel token
-            let token = CancellationToken::new();
-            {
-                let mut lock = feeder_cancel.lock().unwrap_or_else(|e: std::sync::PoisonError<_>| e.into_inner());
-                *lock = Some(token.clone());
-            }
-            feeder_paused.store(false, Ordering::Relaxed);
-
-            // Run the feeder
-            let feed_result = match &item.source {
-                MediaSource::YouTube { url, .. } => {
-                    feed_youtube_to_bridge(url, bridge.clone(), token, feeder_paused.clone()).await
-                }
-                MediaSource::File { attachment_url, filename, .. } => {
-                    let ext = filename.rsplit('.').next().unwrap_or("mp3");
-                    feed_file_to_bridge(attachment_url, ext, bridge.clone(), token, feeder_paused.clone()).await
-                }
-            };
-
-            match feed_result {
-                Ok(()) => {
-                    tracing::info!("priority item finished: {}", item.source.display_title());
-                }
-                Err(FeederError::Cancelled) => {
-                    tracing::info!("priority item cancelled (skip/stop)");
-                    let mut lock = active_priority_item.lock().unwrap_or_else(|e| e.into_inner());
-                    *lock = None;
-                    // Skip/stop owns what plays next — don't auto-resume Spotify.
-                    cancelled = true;
-                    break;
-                }
-                Err(e) => {
-                    tracing::warn!("feeder error: {}", e);
-                }
-            }
-
-            // Post history embed
-            post_priority_history(&ctx, text_channel_id, &item).await;
-
-            // Clear current item
-            {
-                let mut lock = active_priority_item.lock().unwrap_or_else(|e| e.into_inner());
-                *lock = None;
-            }
-        }
-
-        // Resume Spotify only when the queue drained naturally, not when a
-        // skip/stop cancelled the current item.
-        if !cancelled {
-            let _ = spirc_cmd_tx.send(SpircCommand::Play);
-        }
+        run_queue_drain(&drain_ctx).await;
     }
 }
 
@@ -987,23 +1080,7 @@ impl EventHandler for Handler {
                     })
                 };
 
-                // Cancel any active feeder
-                {
-                    let token = {
-                        let lock = self.feeder_cancel.lock().unwrap_or_else(|e: std::sync::PoisonError<_>| e.into_inner());
-                        lock.clone()
-                    };
-                    if let Some(t) = token { t.cancel(); }
-                }
-                // Clear priority queue
-                {
-                    let mut lock = self.priority_queue.lock().unwrap_or_else(|e| e.into_inner());
-                    lock.clear();
-                }
-                {
-                    let mut lock = self.active_priority_item.lock().unwrap_or_else(|e| e.into_inner());
-                    *lock = None;
-                }
+                self.stop_priority_playback();
 
                 let _ = self.presence_tx.send(PresenceUpdate::Idle);
 
@@ -1052,37 +1129,21 @@ impl EventHandler for Handler {
                 return;
             }
 
-            let reply_content = match custom_id {
+            let reply_content: String = match custom_id {
                 "ctrl_prev" => {
                     if let Some(token) = &access_token {
                         if spotify_playback_command(token, "POST", "previous").await {
-                            "⏮ Previous"
+                            "⏮ Previous".to_string()
                         } else {
-                            "⚠ Spotify didn't accept that — try again."
+                            "⚠ Spotify didn't accept that — try again.".to_string()
                         }
                     } else {
-                        "No active session"
+                        "No active session".to_string()
                     }
                 }
-                "ctrl_next" => {
-                    if priority_playing {
-                        let token = {
-                            let lock = self.feeder_cancel.lock().unwrap_or_else(|e: std::sync::PoisonError<_>| e.into_inner());
-                            lock.clone()
-                        };
-                        if let Some(t) = token { t.cancel(); }
-                        self.bridge.clear();
-                        "⏭ Skipped"
-                    } else if let Some(token) = &access_token {
-                        if spotify_playback_command(token, "POST", "next").await {
-                            "⏭ Skipped"
-                        } else {
-                            "⚠ Spotify didn't accept that — try again."
-                        }
-                    } else {
-                        "No active session"
-                    }
-                }
+                // Same semantics as /skip: cancel the current priority item
+                // and either continue the queue or resume Spotify.
+                "ctrl_next" => self.handle_skip().await,
                 "ctrl_pause_toggle" => {
                     if priority_playing {
                         let current = self.feeder_paused.load(Ordering::Relaxed);
@@ -1098,7 +1159,7 @@ impl EventHandler for Handler {
                             let edit = EditMessage::new().components(vec![buttons]);
                             let _ = self.text_channel_id.edit_message(&ctx, mid, edit).await;
                         }
-                        if current { "▶ Resumed" } else { "⏸ Paused" }
+                        if current { "▶ Resumed".to_string() } else { "⏸ Paused".to_string() }
                     } else if let Some(token) = &access_token {
                         let handle_clone = {
                             let lock = self.track_handle.lock().unwrap_or_else(|e| e.into_inner());
@@ -1116,11 +1177,11 @@ impl EventHandler for Handler {
                         } else {
                             spotify_playback_command(token, "PUT", "pause").await
                         };
-                        if !ok { "⚠ Spotify didn't accept that — try again." }
-                        else if is_paused { "▶ Resumed" }
-                        else { "⏸ Paused" }
+                        if !ok { "⚠ Spotify didn't accept that — try again.".to_string() }
+                        else if is_paused { "▶ Resumed".to_string() }
+                        else { "⏸ Paused".to_string() }
                     } else {
-                        "No active session"
+                        "No active session".to_string()
                     }
                 }
                 "ctrl_queue_hint" => {
@@ -1151,7 +1212,7 @@ impl EventHandler for Handler {
                     }
                     return;
                 }
-                _ => "Unknown button",
+                _ => "Unknown button".to_string(),
             };
 
             if custom_id != "ctrl_queue_hint" {
@@ -1284,6 +1345,26 @@ impl Handler {
         lock.as_ref().map(|s| s.discord_user_id)
     }
 
+    /// Tear down priority (YouTube/file) playback: cancel any running feeder,
+    /// clear the queue, and clear the active item.
+    fn stop_priority_playback(&self) {
+        let token = {
+            let lock = self.feeder_cancel.lock().unwrap_or_else(|e: std::sync::PoisonError<_>| e.into_inner());
+            lock.clone()
+        };
+        if let Some(t) = token {
+            t.cancel();
+        }
+        {
+            let mut lock = self.priority_queue.lock().unwrap_or_else(|e| e.into_inner());
+            lock.clear();
+        }
+        {
+            let mut lock = self.active_priority_item.lock().unwrap_or_else(|e| e.into_inner());
+            *lock = None;
+        }
+    }
+
     /// Whether a user may queue via /play: if the bot is already in a channel,
     /// they must share it (the control rule); if the bot is in no channel yet,
     /// they only need to be in one so the bot can follow them in.
@@ -1302,26 +1383,31 @@ impl Handler {
         }
     }
 
-    async fn join_voice_for_user(&self, discord_user_id: u64) {
+    /// Join the given user's voice channel (falling back to the configured
+    /// channel), self-deafen, unsuppress on stage channels, and start the
+    /// join-sound + bridge hookup. Returns whether the join succeeded.
+    async fn join_voice_for_user(&self, discord_user_id: Option<u64>) -> bool {
         let ctx = {
             let lock = self.ctx.lock().unwrap_or_else(|e| e.into_inner());
             match lock.clone() {
                 Some(c) => c,
-                None => { tracing::warn!("no ctx available for voice join"); return; }
+                None => { tracing::warn!("no ctx available for voice join"); return false; }
             }
         };
 
-        let user_channel = self.guild_id.to_guild_cached(&ctx)
-            .and_then(|guild| {
-                guild.voice_states.get(&UserId::new(discord_user_id))
-                    .and_then(|vs| vs.channel_id)
-            });
+        let user_channel = discord_user_id.and_then(|id| {
+            self.guild_id.to_guild_cached(&ctx)
+                .and_then(|guild| {
+                    guild.voice_states.get(&UserId::new(id))
+                        .and_then(|vs| vs.channel_id)
+                })
+        });
 
         let target_channel = user_channel.unwrap_or(self.channel_id);
 
         let manager = match songbird::get(&ctx).await {
             Some(m) => m,
-            None => { tracing::error!("songbird not registered"); return; }
+            None => { tracing::error!("songbird not registered"); return false; }
         };
 
         match manager.join(self.guild_id, target_channel).await {
@@ -1350,8 +1436,12 @@ impl Handler {
                 let track_handle_store = self.track_handle.clone();
                 let dj_join = self.dj.clone();
                 tokio::spawn(play_join_sound_then_bridge(call, bridge, prebuffer_samples, prebuffer_wait, track_handle_store, dj_join));
+                true
             }
-            Err(e) => tracing::warn!(error = ?e, "failed to join voice channel on login"),
+            Err(e) => {
+                tracing::warn!(error = ?e, "failed to join voice channel");
+                false
+            }
         }
     }
 
@@ -1433,22 +1523,9 @@ impl Handler {
         let _spawn_guard = self.spawn_lock.lock().await;
         let generation = self.session_gen.fetch_add(1, Ordering::SeqCst);
 
-        // P1: Cancel any active YouTube/file feeder before starting Spotify session
-        {
-            let token = {
-                let lock = self.feeder_cancel.lock().unwrap_or_else(|e: std::sync::PoisonError<_>| e.into_inner());
-                lock.clone()
-            };
-            if let Some(t) = token { t.cancel(); }
-        }
-        {
-            let mut lock = self.priority_queue.lock().unwrap_or_else(|e| e.into_inner());
-            lock.clear();
-        }
-        {
-            let mut lock = self.active_priority_item.lock().unwrap_or_else(|e| e.into_inner());
-            *lock = None;
-        }
+        // A fresh Spotify session owns the audio path — cancel any active
+        // YouTube/file playback before starting it.
+        self.stop_priority_playback();
 
         let config = self.config.clone();
         let bridge = self.bridge.clone();
@@ -1477,7 +1554,7 @@ impl Handler {
             tracing::warn!(error = %e, "failed to set exclusive active user");
         }
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        self.join_voice_for_user(discord_user_id).await;
+        let _ = self.join_voice_for_user(Some(discord_user_id)).await;
 
         {
             let ctx = {
@@ -1525,6 +1602,7 @@ impl Handler {
             self.drain_active.clone(),
             controls_message_id,
             now_playing_message_id,
+            self.track_handle.clone(),
         ));
 
         // Proactive refresher: the sole owner of the refresh cycle. Wakes on a
@@ -1759,9 +1837,12 @@ impl Handler {
         } else if is_priority_playing {
             format!("✅ Added to queue: **{}** · Position #{}", title, queue_len)
         } else {
-            // Nothing actively playing — start immediately.
-            self.trigger_priority_queue_drain().await;
-            format!("▶ Playing: **{}**", title)
+            // No priority item active — start a drain immediately (Spotify
+            // Connect may still be playing; the drain pauses it).
+            match self.trigger_priority_queue_drain(Some(discord_id)).await {
+                Err(msg) => format!("❌ {}", msg),
+                Ok(_) => format!("▶ Playing: **{}**", title),
+            }
         };
 
         let _ = cmd.edit_response(ctx, EditInteractionResponse::new()
@@ -1769,147 +1850,82 @@ impl Handler {
         ).await;
     }
 
-    async fn trigger_priority_queue_drain(&self) {
-        // One drain at a time — if the eot-driven manager (or another /play)
-        // is already draining, it will pick up what we just queued.
-        if self.drain_active.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
-            return;
+    /// Start a queue drain if none is running. Returns Ok(true) when this
+    /// call started a drain, Ok(false) when a live drain owns the queue (it
+    /// will pick up whatever is queued), and Err with a user-facing message
+    /// when the bot could not join voice — nothing would be heard, so the
+    /// caller must report the failure instead of claiming playback started.
+    async fn trigger_priority_queue_drain(&self, requester_id: Option<u64>) -> Result<bool, String> {
+        // One drain at a time. A drain cancelled by skip/next releases the
+        // flag within moments, so retry briefly instead of racing it with a
+        // fixed sleep. A genuinely live drain keeps the flag for its whole
+        // playback and consumes the queue itself — once the queue is empty or
+        // the window closes, give up quietly.
+        let mut acquired = false;
+        for attempt in 0..10 {
+            if self.drain_active.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+                acquired = true;
+                break;
+            }
+            let queue_empty = {
+                let lock = self.priority_queue.lock().unwrap_or_else(|e| e.into_inner());
+                lock.len() == 0
+            };
+            if queue_empty || attempt == 9 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
-        let drain_active = self.drain_active.clone();
-        let pq = self.priority_queue.clone();
-        let bridge = self.bridge.clone();
-        let ctx_arc = self.ctx.clone();
-        let text_channel_id = self.text_channel_id;
-        let active_priority_item = self.active_priority_item.clone();
-        let feeder_cancel = self.feeder_cancel.clone();
-        let feeder_paused = self.feeder_paused.clone();
-        let controls_message_id = self.controls_message_id.clone();
-        let now_playing_message_id = self.now_playing_message_id.clone();
+        if !acquired {
+            return Ok(false);
+        }
+        // Owns the flag from here; drops (releasing it) on every exit path.
+        let drain_guard = DrainGuard(self.drain_active.clone());
 
-        // Ensure bot is in voice
+        // Ensure the bot is in voice before consuming the queue.
         let ctx = {
             let lock = self.ctx.lock().unwrap_or_else(|e| e.into_inner());
             lock.clone()
         };
         if let Some(ctx) = &ctx {
-            let manager = songbird::get(ctx).await;
-            if let Some(manager) = manager {
-                // Check if already in a call
-                let in_call = manager.get(self.guild_id).is_some();
-                if !in_call {
-                    // Join the queuing user's voice channel, fallback to configured
-                    let user_channel = self.guild_id.to_guild_cached(ctx)
-                        .and_then(|guild| {
-                            // Find any human in a voice channel to follow
-                            let bot_id = ctx.cache.current_user().id;
-                            guild.voice_states.values()
-                                .filter(|vs| vs.user_id != bot_id)
-                                .filter_map(|vs| vs.channel_id)
-                                .next()
-                        })
-                        .unwrap_or(self.channel_id);
-                    match manager.join(self.guild_id, user_channel).await {
-                        Ok(call) => {
-                            let bridge_clone = self.bridge.clone();
-                            let prebuffer_samples = self.prebuffer_samples;
-                            let prebuffer_wait = self.prebuffer_wait;
-                            let track_handle_store = self.track_handle.clone();
-                            let dj_join2 = self.dj.clone();
-                            tokio::spawn(play_join_sound_then_bridge(call, bridge_clone, prebuffer_samples, prebuffer_wait, track_handle_store, dj_join2));
-                            // Wait for join sound + bridge setup
-                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                        }
-                        Err(e) => tracing::warn!(error = ?e, "failed to join voice for standalone play"),
+            if let Some(manager) = songbird::get(ctx).await {
+                if manager.get(self.guild_id).is_none() {
+                    if !self.join_voice_for_user(requester_id).await {
+                        return Err(
+                            "Couldn't join a voice channel, so nothing would be heard. Try again from a voice channel.".to_string()
+                        );
                     }
+                    // Fixed grace delay for the join sound + bridge hookup
+                    // (not a synchronized wait on either).
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                 }
             }
         }
 
-        // P0: Pause Spotify before feeding YouTube/file audio to the bridge
-        let spirc_cmd_tx_for_drain = {
-            let lock = self.spirc_cmd_tx.lock().unwrap_or_else(|e| e.into_inner());
-            lock.clone()
+        let drain_ctx = QueueDrainCtx {
+            priority_queue: self.priority_queue.clone(),
+            bridge: self.bridge.clone(),
+            spirc_cmd_tx: {
+                let lock = self.spirc_cmd_tx.lock().unwrap_or_else(|e| e.into_inner());
+                lock.clone()
+            },
+            ctx: self.ctx.clone(),
+            text_channel_id: self.text_channel_id,
+            active_priority_item: self.active_priority_item.clone(),
+            feeder_cancel: self.feeder_cancel.clone(),
+            feeder_paused: self.feeder_paused.clone(),
+            dj: self.dj.clone(),
+            announce_enabled: self.announce_enabled.clone(),
+            controls_message_id: self.controls_message_id.clone(),
+            now_playing_message_id: self.now_playing_message_id.clone(),
+            track_handle: self.track_handle.clone(),
         };
-        if let Some(ref tx) = spirc_cmd_tx_for_drain {
-            let _ = tx.send(SpircCommand::Pause);
-            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        }
-        self.bridge.clear();
-
-        let spirc_resume_tx = spirc_cmd_tx_for_drain;
-        let dj_for_drain = self.dj.clone();
-        let announce_for_drain = self.announce_enabled.clone();
-
         tokio::spawn(async move {
             // Clears drain_active on any exit (normal, cancel, or abort).
-            let _drain_guard = DrainGuard(drain_active);
-            let mut cancelled = false;
-            loop {
-                let item = {
-                    let mut lock = pq.lock().unwrap_or_else(|e| e.into_inner());
-                    lock.pop()
-                };
-                let item = match item {
-                    Some(i) => i,
-                    None => break,
-                };
-
-                {
-                    let mut lock = active_priority_item.lock().unwrap_or_else(|e| e.into_inner());
-                    *lock = Some(item.clone());
-                }
-
-                post_priority_now_playing(
-                    &ctx_arc, text_channel_id, &item,
-                    &controls_message_id, &now_playing_message_id,
-                ).await;
-
-                // DJ announcement before track (honors the /announce toggle)
-                if announce_for_drain.load(Ordering::Relaxed) && dj_for_drain.is_enabled() {
-                    let title = item.source.display_title().to_string();
-                    let subtitle = item.source.display_subtitle().to_string();
-                    let queued_by = item.queued_by.clone();
-                    if let Some(clip) = dj_for_drain.track_announce_clip(&title, &subtitle, &queued_by).await {
-                        bridge.push_overlay(&clip);
-                    }
-                }
-                let token = CancellationToken::new();
-                {
-                    let mut lock = feeder_cancel.lock().unwrap_or_else(|e: std::sync::PoisonError<_>| e.into_inner());
-                    *lock = Some(token.clone());
-                }
-                feeder_paused.store(false, Ordering::Relaxed);
-
-                let result = match &item.source {
-                    MediaSource::YouTube { url, .. } => {
-                        feed_youtube_to_bridge(url, bridge.clone(), token, feeder_paused.clone()).await
-                    }
-                    MediaSource::File { attachment_url, filename, .. } => {
-                        let ext = filename.rsplit('.').next().unwrap_or("mp3");
-                        feed_file_to_bridge(attachment_url, ext, bridge.clone(), token, feeder_paused.clone()).await
-                    }
-                };
-
-                post_priority_history(&ctx_arc, text_channel_id, &item).await;
-
-                {
-                    let mut lock = active_priority_item.lock().unwrap_or_else(|e| e.into_inner());
-                    *lock = None;
-                }
-
-                if let Err(FeederError::Cancelled) = result {
-                    cancelled = true;
-                    break;
-                }
-            }
-
-            // Resume Spotify only on a natural drain, not after a skip/stop.
-            if !cancelled {
-                if let Some(ref tx) = spirc_resume_tx {
-                    let _ = tx.send(SpircCommand::Play);
-                }
-            }
+            let _drain_guard = drain_guard;
+            run_queue_drain(&drain_ctx).await;
         });
+        Ok(true)
     }
 
     async fn handle_skip(&self) -> String {
@@ -1933,8 +1949,9 @@ impl Handler {
                 !lock.snapshot().is_empty()
             };
             if has_more {
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                self.trigger_priority_queue_drain().await;
+                // The cancelled drain releases the drain flag within moments;
+                // the trigger retries the handoff instead of racing it.
+                let _ = self.trigger_priority_queue_drain(None).await;
             } else {
                 // No more items — resume Spotify if session exists
                 let spirc_tx = {
@@ -1965,33 +1982,17 @@ impl Handler {
     }
 
     async fn handle_stop(&self) -> String {
-        let token = {
-            let lock = self.feeder_cancel.lock().unwrap_or_else(|e: std::sync::PoisonError<_>| e.into_inner());
-            lock.clone()
-        };
-        if let Some(t) = token {
-            t.cancel();
-        }
-
-        {
-            let mut lock = self.priority_queue.lock().unwrap_or_else(|e| e.into_inner());
-            lock.clear();
-        }
-
-        {
-            let mut lock = self.active_priority_item.lock().unwrap_or_else(|e| e.into_inner());
-            *lock = None;
-        }
-
+        self.stop_priority_playback();
         self.bridge.clear();
 
-        // Resume Spotify if a session exists
+        // /stop means stop: pause Spotify too, never resume it here. Handing
+        // playback back to Spotify after an interrupted item is /skip's job.
         let spirc_tx = {
             let lock = self.spirc_cmd_tx.lock().unwrap_or_else(|e| e.into_inner());
             lock.clone()
         };
         if let Some(ref tx) = spirc_tx {
-            let _ = tx.send(SpircCommand::Play);
+            let _ = tx.send(SpircCommand::Pause);
         }
 
         "⏹ Stopped. Priority queue cleared.".to_string()
@@ -2239,21 +2240,7 @@ impl Handler {
             // Also tear down any priority (YouTube/file) playback, mirroring the
             // empty-channel path — otherwise a queued track keeps playing and
             // posts a history embed after logout.
-            {
-                let token = {
-                    let lock = self.feeder_cancel.lock().unwrap_or_else(|e: std::sync::PoisonError<_>| e.into_inner());
-                    lock.clone()
-                };
-                if let Some(t) = token { t.cancel(); }
-            }
-            {
-                let mut lock = self.priority_queue.lock().unwrap_or_else(|e| e.into_inner());
-                lock.clear();
-            }
-            {
-                let mut lock = self.active_priority_item.lock().unwrap_or_else(|e| e.into_inner());
-                *lock = None;
-            }
+            self.stop_priority_playback();
             let _ = self.presence_tx.send(PresenceUpdate::Idle);
             let ctx = {
                 let lock = self.ctx.lock().unwrap_or_else(|e| e.into_inner());
