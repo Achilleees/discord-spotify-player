@@ -980,12 +980,13 @@ async fn run_presence_loop_with_track(
                 } // end announce_enabled check
             }
         } else if matches!(update, PresenceUpdate::Idle | PresenceUpdate::Paused { .. }) {
-            // Clear the dedup key on pause/stop so resuming the same track
-            // reposts the now-playing card instead of being swallowed.
-            last_track_key = None;
-            // Idle means nothing is loaded — drop the stale track metadata so
-            // /np and /queue don't describe a track that finished.
+            // Idle means nothing is loaded — clear the dedup key so the next
+            // track always posts a fresh card, and drop the stale metadata so
+            // /np and /queue don't describe a track that finished. A pause
+            // keeps both: resuming the same track is not a track change and
+            // must not repost history or the controls.
             if matches!(update, PresenceUpdate::Idle) {
+                last_track_key = None;
                 let mut lock = last_meta_store.lock();
                 *lock = None;
                 last_meta = None;
