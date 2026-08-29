@@ -2,7 +2,7 @@ use crate::audio_bridge::AudioBridge;
 use crate::config::Config;
 use crate::presence::PresenceUpdate;
 use crate::spotify::sink::{DiscordSink, DspConfig};
-use librespot_connect::{ConnectConfig, Spirc};
+use librespot_connect::{ConnectConfig, LoadRequest, LoadRequestOptions, Spirc};
 use librespot_core::authentication::Credentials;
 use librespot_core::config::{DeviceType, SessionConfig};
 use librespot_core::session::Session;
@@ -30,6 +30,8 @@ pub enum SpircCommand {
     Next,
     Previous,
     AddToQueue(SpotifyUri),
+    /// Start playing this track now, replacing the current context.
+    Load(SpotifyUri),
 }
 
 fn extract_track_id(uri: &SpotifyUri) -> String {
@@ -370,6 +372,18 @@ impl SpotifyPlayer {
                             Some(SpircCommand::AddToQueue(uri)) => {
                                 if let Err(e) = spirc.add_to_queue(uri) {
                                     tracing::warn!(error = ?e, "spirc add_to_queue failed");
+                                }
+                            }
+                            Some(SpircCommand::Load(uri)) => {
+                                let req = LoadRequest::from_tracks(
+                                    vec![uri.to_uri()],
+                                    LoadRequestOptions {
+                                        start_playing: true,
+                                        ..Default::default()
+                                    },
+                                );
+                                if let Err(e) = spirc.load(req) {
+                                    tracing::warn!(error = ?e, "spirc load failed");
                                 }
                             }
                             None => *spirc_cmd_rx = None, // all senders dropped; poll the task only

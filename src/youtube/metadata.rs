@@ -16,7 +16,7 @@ pub struct YoutubeMetadata {
 
 #[derive(Debug, thiserror::Error)]
 pub enum YoutubeError {
-    #[error("Only YouTube and SoundCloud URLs are supported.")]
+    #[error("Only Spotify track, YouTube and SoundCloud links are supported.")]
     UnsupportedUrl,
     #[error("Couldn't find a track at that URL.")]
     NotFound,

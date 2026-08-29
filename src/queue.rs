@@ -87,12 +87,27 @@ impl PriorityQueue {
         true
     }
 
+    /// Enqueue an item at the front, ahead of everything already queued.
+    /// Returns `false` (rejecting it) when the queue is full, matching
+    /// `push`'s cap semantics.
+    pub fn push_front(&mut self, item: QueueItem) -> bool {
+        if self.items.len() >= MAX_QUEUE_LEN {
+            return false;
+        }
+        self.items.push_front(item);
+        true
+    }
+
     pub fn pop(&mut self) -> Option<QueueItem> {
         self.items.pop_front()
     }
 
     pub fn len(&self) -> usize {
         self.items.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
     }
 
 
@@ -168,6 +183,27 @@ mod tests {
             assert!(q.push(item(&i.to_string())), "should accept up to the cap");
         }
         assert!(!q.push(item("overflow")), "rejects past the cap");
+        assert_eq!(q.len(), MAX_QUEUE_LEN);
+    }
+
+    #[test]
+    fn push_front_takes_priority_over_push() {
+        let mut q = PriorityQueue::new();
+        assert!(q.push(item("a")));
+        assert!(q.push_front(item("b")));
+        let snap = q.snapshot();
+        assert_eq!(snap.len(), 2);
+        assert_eq!(snap[0].source.display_title(), "b");
+        assert_eq!(snap[1].source.display_title(), "a");
+    }
+
+    #[test]
+    fn push_front_rejects_when_full() {
+        let mut q = PriorityQueue::new();
+        for i in 0..MAX_QUEUE_LEN {
+            assert!(q.push(item(&i.to_string())), "should accept up to the cap");
+        }
+        assert!(!q.push_front(item("overflow")), "rejects past the cap");
         assert_eq!(q.len(), MAX_QUEUE_LEN);
     }
 

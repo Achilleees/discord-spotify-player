@@ -128,12 +128,28 @@ struct Handler {
     /// Metadata of the current Spotify track, kept fresh by the presence
     /// loop so /np can answer for the Spotify baseline too.
     last_spotify_meta: Arc<Mutex<Option<SpotifyTrackInfo>>>,
-    /// True while the Spotify baseline session is paused, kept fresh by the
-    /// presence loop so /np can report pause state without a Web API call.
-    spotify_paused: Arc<Mutex<bool>>,
+    /// The Spotify baseline session's playback state, kept fresh by the
+    /// presence loop so /np, /queue, and the control buttons can read it
+    /// without a Web API call.
+    spotify_state: Arc<Mutex<SpotifyState>>,
+    /// Whether Spotify was playing when the current/most recent
+    /// priority-queue drain started. `run_queue_drain` sets this once per
+    /// drain and uses it to decide whether a natural end resumes Spotify;
+    /// `handle_skip` reads it for the same decision when a drain is
+    /// cancelled instead of ending naturally.
+    resume_spotify_after_drain: Arc<AtomicBool>,
     /// Last /play per user, for the metadata-probe cooldown.
     play_cooldowns: Arc<Mutex<HashMap<u64, Instant>>>,
     auto_start_attempted: AtomicBool,
+}
+
+/// The Spotify Connect baseline session's playback state, as last reported by
+/// a `PresenceUpdate`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SpotifyState {
+    Idle,
+    Playing,
+    Paused,
 }
 
 
@@ -149,14 +165,19 @@ fn register_commands(ytdlp_available: bool) -> Vec<CreateCommand> {
         CreateCommand::new("who")
             .description("Show whose Spotify account is currently active"),
         CreateCommand::new("queue")
-            .description("Add a track to the Spotify queue")
+            .description("Add to the queue without starting playback; no argument shows the queue")
             .add_option(
                 CreateCommandOption::new(
                     CommandOptionType::String,
                     "url",
-                    "Spotify track URL or URI (e.g. https://open.spotify.com/track/... or spotify:track:...)",
+                    "Spotify track URL/URI, or YouTube/SoundCloud URL",
                 )
-                .required(true),
+                .required(false),
+            )
+            .add_option(
+                CreateCommandOption::new(CommandOptionType::Attachment, "file",
+                    "Audio file to queue (mp3, flac, ogg, wav, m4a, aac, opus, wma)")
+                .required(false),
             ),
         CreateCommand::new("skip")
             .description("Skip the current track"),
@@ -171,15 +192,20 @@ fn register_commands(ytdlp_available: bool) -> Vec<CreateCommand> {
     if ytdlp_available {
         cmds.push(
             CreateCommand::new("play")
-                .description("Play a YouTube/SoundCloud URL or file attachment")
+                .description("Play a Spotify/YouTube/SoundCloud URL or file attachment")
                 .add_option(
                     CreateCommandOption::new(CommandOptionType::String, "url",
-                        "YouTube or SoundCloud URL")
+                        "Spotify, YouTube, or SoundCloud URL")
                     .required(false),
                 )
                 .add_option(
                     CreateCommandOption::new(CommandOptionType::Attachment, "file",
                         "Audio file to play (mp3, flac, ogg, wav, m4a, aac, opus, wma)")
+                    .required(false),
+                )
+                .add_option(
+                    CreateCommandOption::new(CommandOptionType::Boolean, "next",
+                        "Play this right after the current track")
                     .required(false),
                 ),
         );
@@ -445,6 +471,32 @@ fn is_valid_track_id(id: &str) -> bool {
     id.len() == 22 && id.bytes().all(|b| b.is_ascii_alphanumeric())
 }
 
+/// Result of sorting a `/play` or `/queue` link argument into the Spotify
+/// fast path or the generic YouTube/SoundCloud/attachment path.
+enum LinkKind {
+    Spotify(librespot_core::SpotifyUri),
+    Other,
+}
+
+/// Classifies a URL/URI argument. A recognized Spotify track link resolves
+/// straight to a `SpotifyUri`; anything else (including a malformed Spotify
+/// link) falls through to the YouTube/SoundCloud/attachment path, which
+/// reports its own "unsupported URL" error for garbage input.
+fn classify_link(input: &str) -> LinkKind {
+    let track_id = match parse_track_id_from_url(input) {
+        Some(id) => id,
+        None => return LinkKind::Other,
+    };
+    let uri = format!("spotify:track:{}", track_id);
+    match librespot_core::SpotifyUri::from_uri(&uri) {
+        Ok(u) => LinkKind::Spotify(u),
+        Err(e) => {
+            tracing::warn!(error = %e, uri = %uri, "failed to parse Spotify track URI");
+            LinkKind::Other
+        }
+    }
+}
+
 // --- Priority queue embed posting helpers ---
 
 async fn post_priority_now_playing(
@@ -539,6 +591,8 @@ struct QueueDrainCtx {
     controls_message_id: Arc<Mutex<Option<MessageId>>>,
     now_playing_message_id: Arc<Mutex<Option<MessageId>>>,
     track_handle: Arc<Mutex<Option<TrackHandle>>>,
+    spotify_state: Arc<Mutex<SpotifyState>>,
+    resume_spotify_after_drain: Arc<AtomicBool>,
 }
 
 /// Drain the priority queue until it is empty or the current item is
@@ -549,6 +603,13 @@ struct QueueDrainCtx {
 /// resumes only after a natural drain; a cancelled drain resumes nothing —
 /// skip/stop owns what plays next.
 async fn run_queue_drain(d: &QueueDrainCtx) {
+    // Only resume Spotify at the end of a natural drain if it was actually
+    // playing when the drain started — an idle/paused baseline should stay
+    // that way, not spring back to life because a queued item finished.
+    // Recorded into the shared flag too, so a cancelled (skipped) drain's
+    // caller (handle_skip) can make the same decision.
+    let resume_spotify = *d.spotify_state.lock() == SpotifyState::Playing;
+    d.resume_spotify_after_drain.store(resume_spotify, Ordering::SeqCst);
     let mut cancelled = false;
     loop {
         let item = {
@@ -657,14 +718,16 @@ async fn run_queue_drain(d: &QueueDrainCtx) {
         return;
     }
 
-    // Natural drain end: hand playback back to Spotify. With no live session
-    // to resume, delete the last Now Playing card instead of leaving it in
-    // the channel with dead buttons.
-    let resumed = d
-        .spirc_cmd_tx
-        .as_ref()
-        .map(|tx| tx.send(SpircCommand::Play).is_ok())
-        .unwrap_or(false);
+    // Natural drain end: hand playback back to Spotify, but only if it was
+    // playing before this drain started. With no live session to resume (or
+    // nothing to resume to), delete the last Now Playing card instead of
+    // leaving it in the channel with dead buttons.
+    let resumed = resume_spotify
+        && d
+            .spirc_cmd_tx
+            .as_ref()
+            .map(|tx| tx.send(SpircCommand::Play).is_ok())
+            .unwrap_or(false);
     if !resumed {
         let ctx = {
             let lock = d.ctx.lock();
@@ -707,6 +770,8 @@ async fn priority_queue_manager(
     controls_message_id: Arc<Mutex<Option<MessageId>>>,
     now_playing_message_id: Arc<Mutex<Option<MessageId>>>,
     track_handle: Arc<Mutex<Option<TrackHandle>>>,
+    spotify_state: Arc<Mutex<SpotifyState>>,
+    resume_spotify_after_drain: Arc<AtomicBool>,
 ) {
     let drain_ctx = QueueDrainCtx {
         priority_queue,
@@ -722,6 +787,8 @@ async fn priority_queue_manager(
         controls_message_id,
         now_playing_message_id,
         track_handle,
+        spotify_state,
+        resume_spotify_after_drain,
     };
     loop {
         match end_of_track_rx.recv().await {
@@ -756,7 +823,7 @@ async fn run_presence_loop_with_track(
     bridge: Arc<AudioBridge>,
     active_priority_item: Arc<Mutex<Option<QueueItem>>>,
     last_meta_store: Arc<Mutex<Option<SpotifyTrackInfo>>>,
-    spotify_paused: Arc<Mutex<bool>>,
+    spotify_state: Arc<Mutex<SpotifyState>>,
 ) {
     let (fwd_tx, fwd_rx) = mpsc::unbounded_channel::<PresenceUpdate>();
     let ctx_presence = ctx.clone();
@@ -810,12 +877,17 @@ async fn run_presence_loop_with_track(
             }
         }
 
-        // Keep the /np pause flag in sync with every update, not only the
-        // ones that flip the controls buttons.
+        // Keep the shared playback state in sync with every update, not only
+        // the ones that flip the controls buttons — /np, /queue, and the
+        // control buttons all read it directly.
         {
-            let paused_now = matches!(update, PresenceUpdate::Paused { .. });
-            let mut lock = spotify_paused.lock();
-            *lock = paused_now;
+            let new_state = match &update {
+                PresenceUpdate::Idle => SpotifyState::Idle,
+                PresenceUpdate::Paused { .. } => SpotifyState::Paused,
+                PresenceUpdate::Playing { .. } => SpotifyState::Playing,
+            };
+            let mut lock = spotify_state.lock();
+            *lock = new_state;
         }
 
         if let PresenceUpdate::Playing { title, artist, track_id, album_art_url } = &update {
@@ -911,6 +983,13 @@ async fn run_presence_loop_with_track(
             // Clear the dedup key on pause/stop so resuming the same track
             // reposts the now-playing card instead of being swallowed.
             last_track_key = None;
+            // Idle means nothing is loaded — drop the stale track metadata so
+            // /np and /queue don't describe a track that finished.
+            if matches!(update, PresenceUpdate::Idle) {
+                let mut lock = last_meta_store.lock();
+                *lock = None;
+                last_meta = None;
+            }
             // A session that comes up already paused (bot restart mid-pause)
             // never sends Playing, so /np would show nothing — seed it here.
             if let PresenceUpdate::Paused { title, artist, track_id } = &update {
@@ -1009,14 +1088,14 @@ impl EventHandler for Handler {
             let announce_presence = self.announce_enabled.clone();
             let priority_item = self.active_priority_item.clone();
             let last_meta_store = self.last_spotify_meta.clone();
-            let spotify_paused = self.spotify_paused.clone();
+            let spotify_state = self.spotify_state.clone();
             tokio::spawn(async move {
                 run_presence_loop_with_track(
                     ctx_presence, rx, track_handle_store, active_session,
                     text_channel_id, controls_id, np_id,
                     dj_presence, announce_presence,
                     bridge_presence, priority_item,
-                    last_meta_store, spotify_paused,
+                    last_meta_store, spotify_state,
                 ).await;
             });
         }
@@ -1097,11 +1176,6 @@ impl EventHandler for Handler {
             let custom_id = component.data.custom_id.as_str();
             tracing::debug!(custom_id, "button interaction received");
 
-            let access_token = {
-                let lock = self.active_session.lock();
-                lock.as_ref().map(|s| s.access_token.clone())
-            };
-
             let spirc_tx = {
                 let lock = self.spirc_cmd_tx.lock();
                 lock.clone()
@@ -1161,38 +1235,34 @@ impl EventHandler for Handler {
                         }
                         if current { "▶ Resumed".to_string() } else { "⏸ Paused".to_string() }
                     } else if let Some(tx) = &spirc_tx {
-                        let is_paused = *self.spotify_paused.lock();
-                        let cmd = if is_paused { SpircCommand::Play } else { SpircCommand::Pause };
-                        let ok = tx.send(cmd).is_ok();
-                        if !ok { "⚠ Spotify didn't accept that — try again.".to_string() }
-                        else if is_paused { "▶ Resumed".to_string() }
-                        else { "⏸ Paused".to_string() }
+                        let state = *self.spotify_state.lock();
+                        if state == SpotifyState::Playing {
+                            let ok = tx.send(SpircCommand::Pause).is_ok();
+                            if ok { "⏸ Paused".to_string() } else { "⚠ Spotify didn't accept that — try again.".to_string() }
+                        } else {
+                            // ▶ pressed while Spotify isn't playing: a
+                            // non-empty priority queue takes precedence over
+                            // resuming the Spotify baseline.
+                            let queue_non_empty = {
+                                let lock = self.priority_queue.lock();
+                                !lock.is_empty()
+                            };
+                            if queue_non_empty {
+                                match self.trigger_priority_queue_drain(None).await {
+                                    Ok(_) => "▶ Playing from queue".to_string(),
+                                    Err(msg) => format!("⚠ {}", msg),
+                                }
+                            } else {
+                                let ok = tx.send(SpircCommand::Play).is_ok();
+                                if ok { "▶ Resumed".to_string() } else { "⚠ Spotify didn't accept that — try again.".to_string() }
+                            }
+                        }
                     } else {
                         "No active Spotify session.".to_string()
                     }
                 }
                 "ctrl_queue_hint" => {
-                    let pq_snapshot = {
-                        let lock = self.priority_queue.lock();
-                        lock.snapshot()
-                    };
-                    let mut lines = vec![];
-                    if access_token.is_some() {
-                        lines.push("Use `/queue <spotify_url>` to add Spotify tracks.".to_string());
-                    }
-                    if self.ytdlp_available {
-                        lines.push("Use `/play <youtube_url>` to add YouTube tracks.".to_string());
-                    }
-                    if !pq_snapshot.is_empty() {
-                        lines.push(format!("\nPriority queue ({} item(s)):", pq_snapshot.len()));
-                        for (i, item) in pq_snapshot.iter().enumerate().take(5) {
-                            let duration = item.source.display_duration()
-                                .map(|d| format!(" ({d})"))
-                                .unwrap_or_default();
-                            lines.push(format!("  {}. {}{} — queued by {}", i + 1, item.source.display_title(), duration, item.queued_by));
-                        }
-                    }
-                    let content = if lines.is_empty() { "Nothing in queue.".to_string() } else { lines.join("\n") };
+                    let content = self.format_queue_listing();
 
                     let response = CreateInteractionResponse::Message(
                         CreateInteractionResponseMessage::new().content(content).ephemeral(true),
@@ -1244,6 +1314,22 @@ impl EventHandler for Handler {
             return;
         }
 
+        // Handle /queue separately too: an "Other" (YT/SC/attachment) link
+        // spawns the same yt-dlp metadata probe /play does, so it needs the
+        // same deferred-response treatment.
+        if cmd.data.name.as_str() == "queue" {
+            if !in_voice {
+                let _ = cmd.create_response(&ctx, CreateInteractionResponse::Message(
+                    CreateInteractionResponseMessage::new()
+                        .content("You must be in the bot's voice channel to control playback.")
+                        .ephemeral(true),
+                )).await;
+                return;
+            }
+            self.handle_queue(&cmd, &ctx).await;
+            return;
+        }
+
         // Defer login immediately — OAuth + session startup takes >3s
         if cmd.data.name.as_str() == "login" {
             let _ = cmd.defer_ephemeral(&ctx).await;
@@ -1273,7 +1359,7 @@ impl EventHandler for Handler {
         // Commands that drive playback require sharing the bot's voice channel.
         // /announce is a guild-level toggle, not playback control, and must be
         // settable before the bot is in voice.
-        let needs_voice = matches!(cmd.data.name.as_str(), "queue" | "skip" | "stop");
+        let needs_voice = matches!(cmd.data.name.as_str(), "skip" | "stop");
         if needs_voice && !in_voice {
             let _ = cmd.create_response(&ctx, CreateInteractionResponse::Message(
                 CreateInteractionResponseMessage::new()
@@ -1288,21 +1374,6 @@ impl EventHandler for Handler {
             "logout" => self.handle_logout(&user_id, user_id_u64).await,
             "forget" => self.handle_forget(&user_id, user_id_u64).await,
             "who" => self.handle_who().await,
-            "queue" => {
-                let url_arg: Option<String> = cmd
-                    .data
-                    .options
-                    .iter()
-                    .find(|o| o.name == "url")
-                    .and_then(|o| {
-                        if let serenity::model::application::CommandDataOptionValue::String(s) = &o.value {
-                            Some(s.clone())
-                        } else {
-                            None
-                        }
-                    });
-                self.handle_queue(url_arg.as_deref()).await
-            }
             "skip" => self.handle_skip().await,
             "stop" => self.handle_stop().await,
             "np" => self.handle_np().await,
@@ -1367,6 +1438,56 @@ impl Handler {
     fn active_owner(&self) -> Option<u64> {
         let lock = self.active_session.lock();
         lock.as_ref().map(|s| s.discord_user_id)
+    }
+
+    /// Whether audio is actively being produced right now: a priority
+    /// (YouTube/file) item, or the Spotify baseline reported as playing.
+    fn something_is_playing(&self) -> bool {
+        let priority_active = {
+            let lock = self.active_priority_item.lock();
+            lock.is_some()
+        };
+        priority_active || *self.spotify_state.lock() == SpotifyState::Playing
+    }
+
+    /// Whether a Spotify Connect session is live (able to accept commands),
+    /// regardless of its current playback state.
+    fn has_spotify_session(&self) -> bool {
+        self.spirc_cmd_tx.lock().is_some()
+    }
+
+    /// The queue listing shown by the `ctrl_queue_hint` button and by
+    /// `/queue` with no arguments: how to add tracks, the current Spotify
+    /// playback state, and the first few priority-queue items.
+    fn format_queue_listing(&self) -> String {
+        let has_session = self.has_spotify_session();
+        let pq_snapshot = {
+            let lock = self.priority_queue.lock();
+            lock.snapshot()
+        };
+        let mut lines = vec![];
+        if has_session {
+            lines.push("Use `/queue <spotify_url>` to add Spotify tracks.".to_string());
+        }
+        if self.ytdlp_available {
+            lines.push("Use `/play <youtube_url>` to add YouTube tracks.".to_string());
+        }
+        let spotify_line = match *self.spotify_state.lock() {
+            SpotifyState::Playing => "Spotify: playing",
+            SpotifyState::Paused => "Spotify: paused",
+            SpotifyState::Idle => "Spotify: idle",
+        };
+        lines.push(spotify_line.to_string());
+        if !pq_snapshot.is_empty() {
+            lines.push(format!("\nPriority queue ({} item(s)):", pq_snapshot.len()));
+            for (i, item) in pq_snapshot.iter().enumerate().take(5) {
+                let duration = item.source.display_duration()
+                    .map(|d| format!(" ({d})"))
+                    .unwrap_or_default();
+                lines.push(format!("  {}. {}{} — queued by {}", i + 1, item.source.display_title(), duration, item.queued_by));
+            }
+        }
+        lines.join("\n")
     }
 
     /// Full playback teardown: abort any Spotify session (deactivating its
@@ -1649,6 +1770,8 @@ impl Handler {
             controls_message_id,
             now_playing_message_id,
             self.track_handle.clone(),
+            self.spotify_state.clone(),
+            self.resume_spotify_after_drain.clone(),
         ));
 
         // Proactive refresher: the sole owner of the refresh cycle. Wakes on a
@@ -1777,11 +1900,120 @@ impl Handler {
         tracing::info!(user = discord_user_id, spotify = %spotify_name_clone, "librespot session spawned");
     }
 
+    /// Extracts `url`/`file`/`next` from a `/play` or `/queue` interaction's
+    /// options. `next` is always `false` for commands without that option
+    /// (only `/play` registers it).
+    fn parse_play_queue_options(
+        cmd: &serenity::model::application::CommandInteraction,
+    ) -> (Option<String>, Option<serenity::model::channel::Attachment>, bool) {
+        let url_arg: Option<String> = cmd.data.options.iter()
+            .find(|o| o.name == "url")
+            .and_then(|o| if let serenity::model::application::CommandDataOptionValue::String(s) = &o.value { Some(s.clone()) } else { None });
+        let attachment_arg = cmd.data.resolved.attachments.values().next().cloned();
+        let next: bool = cmd.data.options.iter()
+            .find(|o| o.name == "next")
+            .and_then(|o| if let serenity::model::application::CommandDataOptionValue::Boolean(b) = &o.value { Some(*b) } else { None })
+            .unwrap_or(false);
+        (url_arg, attachment_arg, next)
+    }
+
+    /// Builds a `QueueItem` from a YouTube/SoundCloud URL (via yt-dlp
+    /// metadata) or a file attachment (via extension/size validation). Not
+    /// used for Spotify links, which never enter the priority queue.
+    async fn build_media_queue_item(
+        url: Option<String>,
+        attachment: Option<serenity::model::channel::Attachment>,
+        discord_name: &str,
+        discord_id: u64,
+    ) -> Result<QueueItem, String> {
+        if let Some(url) = url {
+            let meta = fetch_youtube_metadata(&url).await.map_err(|e| e.to_string())?;
+            Ok(QueueItem {
+                source: MediaSource::YouTube {
+                    url: meta.webpage_url.clone(),
+                    video_id: meta.video_id,
+                    title: meta.title,
+                    channel: meta.channel,
+                    thumbnail_url: meta.thumbnail_url,
+                    duration_secs: meta.duration_secs,
+                },
+                queued_by: discord_name.to_string(),
+                queued_by_id: discord_id,
+            })
+        } else {
+            let att = attachment.expect("caller ensures url xor attachment is Some");
+            validate_attachment(&att.filename, att.size as u64).map_err(|e| e.to_string())?;
+            Ok(QueueItem {
+                source: MediaSource::File {
+                    filename: att.filename.clone(),
+                    attachment_url: att.url.clone(),
+                },
+                queued_by: discord_name.to_string(),
+                queued_by_id: discord_id,
+            })
+        }
+    }
+
     async fn handle_play(
         &self,
         cmd: &serenity::model::application::CommandInteraction,
         ctx: &Context,
     ) {
+        let (url_arg, attachment_arg, next) = Self::parse_play_queue_options(cmd);
+
+        if url_arg.is_none() && attachment_arg.is_none() {
+            let _ = cmd.create_response(ctx, CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content("❌ Provide a Spotify/YouTube/SoundCloud URL or attach an audio file.")
+                    .ephemeral(true)
+            )).await;
+            return;
+        }
+        if url_arg.is_some() && attachment_arg.is_some() {
+            let _ = cmd.create_response(ctx, CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content("❌ Provide either a URL or a file, not both.")
+                    .ephemeral(true)
+            )).await;
+            return;
+        }
+
+        let discord_name = cmd.user.global_name.clone().unwrap_or_else(|| cmd.user.name.clone());
+        let discord_id = cmd.user.id.get();
+
+        // Spotify track link: no yt-dlp probe, no cooldown — reply
+        // immediately instead of deferring.
+        if let Some(url) = &url_arg {
+            if let LinkKind::Spotify(spotify_uri) = classify_link(url) {
+                let reply = if !self.has_spotify_session() {
+                    "Run `/login` first.".to_string()
+                } else if next {
+                    "Spotify tracks always play next after the current track — use `/play` without `next`.".to_string()
+                } else {
+                    let tx = { let lock = self.spirc_cmd_tx.lock(); lock.clone() };
+                    match tx {
+                        Some(tx) if self.something_is_playing() => {
+                            match tx.send(SpircCommand::AddToQueue(spotify_uri)) {
+                                Ok(()) => "Queued on Spotify — plays after the current track.".to_string(),
+                                Err(_) => "No active Spotify session.".to_string(),
+                            }
+                        }
+                        Some(tx) => {
+                            match tx.send(SpircCommand::Load(spotify_uri)) {
+                                Ok(()) => "Playing now on Spotify.".to_string(),
+                                Err(_) => "No active Spotify session.".to_string(),
+                            }
+                        }
+                        None => "No active Spotify session.".to_string(),
+                    }
+                };
+                let _ = cmd.create_response(ctx, CreateInteractionResponse::Message(
+                    CreateInteractionResponseMessage::new().content(reply).ephemeral(true)
+                )).await;
+                return;
+            }
+        }
+
         if !self.ytdlp_available {
             let _ = cmd.create_response(ctx, CreateInteractionResponse::Message(
                 CreateInteractionResponseMessage::new()
@@ -1815,102 +2047,39 @@ impl Handler {
             return;
         }
 
-        let url_arg: Option<String> = cmd.data.options.iter()
-            .find(|o| o.name == "url")
-            .and_then(|o| if let serenity::model::application::CommandDataOptionValue::String(s) = &o.value { Some(s.clone()) } else { None });
-
-        let attachment_arg = cmd.data.resolved.attachments.values().next().cloned();
-
-        if url_arg.is_none() && attachment_arg.is_none() {
-            let _ = cmd.create_response(ctx, CreateInteractionResponse::Message(
-                CreateInteractionResponseMessage::new()
-                    .content("❌ Provide a YouTube URL or attach an audio file.")
-                    .ephemeral(true)
-            )).await;
-            return;
-        }
-        if url_arg.is_some() && attachment_arg.is_some() {
-            let _ = cmd.create_response(ctx, CreateInteractionResponse::Message(
-                CreateInteractionResponseMessage::new()
-                    .content("❌ Provide either a URL or a file, not both.")
-                    .ephemeral(true)
-            )).await;
-            return;
-        }
-
-        let discord_name = cmd.user.global_name.clone().unwrap_or_else(|| cmd.user.name.clone());
-        let discord_id = cmd.user.id.get();
-
         // Defer response
         let _ = cmd.create_response(ctx, CreateInteractionResponse::Defer(
             CreateInteractionResponseMessage::new().ephemeral(true)
         )).await;
 
-        // Build QueueItem
-        let queue_item = if let Some(url) = url_arg {
-            match fetch_youtube_metadata(&url).await {
-                Ok(meta) => QueueItem {
-                    source: MediaSource::YouTube {
-                        url: meta.webpage_url.clone(),
-                        video_id: meta.video_id,
-                        title: meta.title,
-                        channel: meta.channel,
-                        thumbnail_url: meta.thumbnail_url,
-                        duration_secs: meta.duration_secs,
-                    },
-                    queued_by: discord_name.clone(),
-                    queued_by_id: discord_id,
-                },
-                Err(e) => {
-                    let _ = cmd.edit_response(ctx, EditInteractionResponse::new()
-                        .content(format!("❌ {}", e))
-                    ).await;
-                    return;
-                }
+        let queue_item = match Self::build_media_queue_item(url_arg, attachment_arg, &discord_name, discord_id).await {
+            Ok(item) => item,
+            Err(e) => {
+                let _ = cmd.edit_response(ctx, EditInteractionResponse::new()
+                    .content(format!("❌ {}", e))
+                ).await;
+                return;
             }
-        } else {
-            let att = attachment_arg.unwrap();
-            match validate_attachment(&att.filename, att.size as u64) {
-                Ok(_ext) => QueueItem {
-                    source: MediaSource::File {
-                        filename: att.filename.clone(),
-                        attachment_url: att.url.clone(),
-                    },
-                    queued_by: discord_name.clone(),
-                    queued_by_id: discord_id,
-                },
-                Err(e) => {
-                    let _ = cmd.edit_response(ctx, EditInteractionResponse::new()
-                        .content(format!("❌ {}", e))
-                    ).await;
-                    return;
-                }
-            }
-        };
-
-        let title = queue_item.source.display_title().to_string();
-
-        let is_priority_playing = {
-            let lock = self.active_priority_item.lock();
-            lock.is_some()
         };
 
         let (accepted, queue_len) = {
             let mut lock = self.priority_queue.lock();
-            let accepted = lock.push(queue_item.clone());
+            let accepted = if next { lock.push_front(queue_item) } else { lock.push(queue_item) };
             (accepted, lock.len())
         };
 
         let reply = if !accepted {
             format!("Queue is full ({} items) — try again once some have played.", queue_len)
-        } else if is_priority_playing {
-            format!("✅ Added to queue: **{}** · Position #{}", title, queue_len)
+        } else if self.something_is_playing() {
+            // Already playing something — the new item waits its turn and
+            // does not start a drain.
+            if next { "Playing next".to_string() } else { format!("Added to queue #{}", queue_len) }
         } else {
-            // No priority item active — start a drain immediately (Spotify
-            // Connect may still be playing; the drain pauses it).
+            // Nothing playing — start a drain immediately (Spotify Connect
+            // may still be playing; the drain pauses it).
             match self.trigger_priority_queue_drain(Some(discord_id)).await {
                 Err(msg) => format!("❌ {}", msg),
-                Ok(_) => format!("▶ Playing: **{}**", title),
+                Ok(_) => "Playing now".to_string(),
             }
         };
 
@@ -1938,7 +2107,7 @@ impl Handler {
             }
             let queue_empty = {
                 let lock = self.priority_queue.lock();
-                lock.len() == 0
+                lock.is_empty()
             };
             if queue_empty || attempt == 9 {
                 break;
@@ -1988,6 +2157,8 @@ impl Handler {
             controls_message_id: self.controls_message_id.clone(),
             now_playing_message_id: self.now_playing_message_id.clone(),
             track_handle: self.track_handle.clone(),
+            spotify_state: self.spotify_state.clone(),
+            resume_spotify_after_drain: self.resume_spotify_after_drain.clone(),
         };
         tokio::spawn(async move {
             // Clears drain_active on any exit (normal, cancel, or abort).
@@ -2021,8 +2192,9 @@ impl Handler {
                 // The cancelled drain releases the drain flag within moments;
                 // the trigger retries the handoff instead of racing it.
                 let _ = self.trigger_priority_queue_drain(None).await;
-            } else {
-                // No more items — resume Spotify if session exists
+            } else if self.resume_spotify_after_drain.load(Ordering::SeqCst) {
+                // No more items — resume Spotify, but only if it was
+                // actually playing before this drain paused it.
                 let spirc_tx = {
                     let lock = self.spirc_cmd_tx.lock();
                     lock.clone()
@@ -2090,7 +2262,7 @@ impl Handler {
                 };
                 match meta {
                     Some(m) => {
-                        let prefix = if *self.spotify_paused.lock() { "⏸ Paused" } else { "🎵 Now playing" };
+                        let prefix = if *self.spotify_state.lock() == SpotifyState::Paused { "⏸ Paused" } else { "🎵 Now playing" };
                         format!("{}: **{}** — {} (Spotify session: {})", prefix, m.title, m.artist, name)
                     }
                     None => format!("Spotify session: {} — nothing played yet.", name),
@@ -2386,40 +2558,111 @@ impl Handler {
         }
     }
 
-    async fn handle_queue(&self, url_arg: Option<&str>) -> String {
-        let url_str = match url_arg {
-            Some(u) => u,
-            None => return "Please provide a Spotify track URL or URI.".to_string(),
-        };
+    /// `/queue`: adds to the queue without starting playback. A Spotify
+    /// track link goes to the Spotify queue directly (bypassing the
+    /// priority queue); a YouTube/SoundCloud URL or attachment is pushed
+    /// onto the priority queue's tail — never jumps the line, never starts
+    /// a drain. No arguments shows the current queue listing.
+    async fn handle_queue(
+        &self,
+        cmd: &serenity::model::application::CommandInteraction,
+        ctx: &Context,
+    ) {
+        let (url_arg, attachment_arg, _next) = Self::parse_play_queue_options(cmd);
 
-        let track_id = match parse_track_id_from_url(url_str) {
-            Some(id) => id,
-            None => return "Couldn't parse a Spotify track from that input. Use a URL like `https://open.spotify.com/track/...` or `spotify:track:...`".to_string(),
-        };
+        if url_arg.is_none() && attachment_arg.is_none() {
+            let content = self.format_queue_listing();
+            let _ = cmd.create_response(ctx, CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new().content(content).ephemeral(true)
+            )).await;
+            return;
+        }
+        if url_arg.is_some() && attachment_arg.is_some() {
+            let _ = cmd.create_response(ctx, CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content("❌ Provide either a URL or a file, not both.")
+                    .ephemeral(true)
+            )).await;
+            return;
+        }
 
-        let spirc_tx = {
-            let lock = self.spirc_cmd_tx.lock();
-            lock.clone()
-        };
+        // Spotify track link: straight to the Spotify queue, no defer needed.
+        if let Some(url) = &url_arg {
+            if let LinkKind::Spotify(spotify_uri) = classify_link(url) {
+                let reply = if !self.has_spotify_session() {
+                    "Run `/login` first.".to_string()
+                } else {
+                    let tx = { let lock = self.spirc_cmd_tx.lock(); lock.clone() };
+                    match tx {
+                        Some(tx) => match tx.send(SpircCommand::AddToQueue(spotify_uri)) {
+                            Ok(()) => {
+                                let mut msg = "Queued on Spotify.".to_string();
+                                if *self.spotify_state.lock() == SpotifyState::Idle {
+                                    msg.push_str(" Nothing is playing — press ▶ or use `/play` to start.");
+                                }
+                                msg
+                            }
+                            Err(_) => "No active Spotify session.".to_string(),
+                        },
+                        None => "No active Spotify session.".to_string(),
+                    }
+                };
+                let _ = cmd.create_response(ctx, CreateInteractionResponse::Message(
+                    CreateInteractionResponseMessage::new().content(reply).ephemeral(true)
+                )).await;
+                return;
+            }
+        }
 
-        let tx = match spirc_tx {
-            Some(t) => t,
-            None => return "No active Spotify session.".to_string(),
-        };
+        // YouTube/SoundCloud URL, or a file attachment: goes on the priority
+        // queue's tail via the same metadata probe /play uses.
+        if url_arg.is_some() && !self.ytdlp_available {
+            let _ = cmd.create_response(ctx, CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content("❌ YouTube playback is not available (yt-dlp not installed).")
+                    .ephemeral(true)
+            )).await;
+            return;
+        }
 
-        let uri = format!("spotify:track:{}", track_id);
-        let spotify_uri = match librespot_core::SpotifyUri::from_uri(&uri) {
-            Ok(u) => u,
+        let discord_name = cmd.user.global_name.clone().unwrap_or_else(|| cmd.user.name.clone());
+        let discord_id = cmd.user.id.get();
+
+        let _ = cmd.create_response(ctx, CreateInteractionResponse::Defer(
+            CreateInteractionResponseMessage::new().ephemeral(true)
+        )).await;
+
+        let queue_item = match Self::build_media_queue_item(url_arg, attachment_arg, &discord_name, discord_id).await {
+            Ok(item) => item,
             Err(e) => {
-                tracing::warn!(error = %e, uri = %uri, "failed to parse Spotify track URI");
-                return "Couldn't parse that as a Spotify track.".to_string();
+                let _ = cmd.edit_response(ctx, EditInteractionResponse::new()
+                    .content(format!("❌ {}", e))
+                ).await;
+                return;
             }
         };
 
-        match tx.send(SpircCommand::AddToQueue(spotify_uri)) {
-            Ok(()) => format!("✅ Queued on Spotify: {}", uri),
-            Err(_) => "No active Spotify session.".to_string(),
-        }
+        let was_empty = {
+            let lock = self.priority_queue.lock();
+            lock.is_empty()
+        };
+        let (accepted, queue_len) = {
+            let mut lock = self.priority_queue.lock();
+            let accepted = lock.push(queue_item);
+            (accepted, lock.len())
+        };
+
+        let reply = if !accepted {
+            format!("Queue is full ({} items) — try again once some have played.", queue_len)
+        } else if !self.something_is_playing() && was_empty {
+            "Queued. Nothing is playing right now — press ▶ or use `/play` to start.".to_string()
+        } else {
+            format!("Added to queue #{}", queue_len)
+        };
+
+        let _ = cmd.edit_response(ctx, EditInteractionResponse::new()
+            .content(reply)
+        ).await;
     }
 }
 
@@ -2503,7 +2746,8 @@ impl DiscordBot {
                 announce_persisted.as_deref() == Some("1"),
             )),
             last_spotify_meta: Arc::new(Mutex::new(None)),
-            spotify_paused: Arc::new(Mutex::new(false)),
+            spotify_state: Arc::new(Mutex::new(SpotifyState::Idle)),
+            resume_spotify_after_drain: Arc::new(AtomicBool::new(false)),
             play_cooldowns: Arc::new(Mutex::new(HashMap::new())),
             auto_start_attempted: AtomicBool::new(false),
         };
