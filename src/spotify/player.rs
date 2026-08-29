@@ -29,7 +29,7 @@ pub enum SpircCommand {
 }
 
 fn extract_track_id(uri: &SpotifyUri) -> String {
-    uri.to_id().unwrap_or_default()
+    uri.to_id()
 }
 
 /// Aborts the wrapped task when dropped. Dropping a bare `JoinHandle` only
@@ -101,6 +101,7 @@ impl SpotifyPlayer {
             initial_volume: 32767,
             disable_volume: false,
             volume_steps: 64,
+            emit_set_queue_events: false,
         }
     }
 

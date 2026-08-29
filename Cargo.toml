@@ -16,10 +16,10 @@ songbird = { version = "0.6", features = ["serenity", "gateway", "driver", "rust
 symphonia = { version = "0.5", default-features = false, features = ["pcm"] }
 
 # Spotify Connect (OAuth-only — discovery/mDNS was removed in v0.5)
-librespot-core = "0.8"
-librespot-connect = "0.8"
-librespot-metadata = "0.8"
-librespot-playback = "0.8"
+librespot-core = { git = "https://github.com/librespot-org/librespot", rev = "1599145bf2c98660d35b17817b3386767a7e4b42" }
+librespot-connect = { git = "https://github.com/librespot-org/librespot", rev = "1599145bf2c98660d35b17817b3386767a7e4b42" }
+librespot-metadata = { git = "https://github.com/librespot-org/librespot", rev = "1599145bf2c98660d35b17817b3386767a7e4b42" }
+librespot-playback = { git = "https://github.com/librespot-org/librespot", rev = "1599145bf2c98660d35b17817b3386767a7e4b42" }
 
 # HTTP client for OAuth
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
@@ -49,8 +49,3 @@ tokio-util = "0.7"  # CancellationToken (sync module is unconditional)
 uuid = { version = "1", features = ["v4"] }
 thiserror = "1"
 
-# Force vergen 9.0.6 to fix librespot build (vergen-lib version conflict)
-# See: https://github.com/librespot-org/librespot/issues/1681
-[build-dependencies]
-vergen = "=9.0.6"
-vergen-gitcl = "=1.0.5"
