@@ -25,9 +25,8 @@ librespot-playback = "0.8"
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-base64 = "0.22"
 url = "2"
-sha2 = "0.10"            # PKCE code challenge (already compiled via songbird/DAVE)
+sha2 = "0.10"            # credential hashing (already compiled via songbird/DAVE)
 chacha20poly1305 = "0.10"  # credential-at-rest encryption (already compiled via songbird/DAVE)
 pbkdf2 = "0.12"          # key stretching for TOKEN_ENC_KEY (already in tree)
 

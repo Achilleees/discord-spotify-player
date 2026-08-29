@@ -4,7 +4,7 @@ use crate::audio::generate_join_sound;
 use crate::audio::dj::DJAnnouncer;
 use crate::audio_bridge::AudioBridge;
 use crate::config::Config;
-use crate::oauth::{new_pkce, parse_redirect, PkceChallenge, SpotifyOAuth};
+use crate::oauth::{DeviceAuthorization, SpotifyOAuth};
 use crate::presence::PresenceUpdate;
 use crate::queue::{PriorityQueue, QueueItem, MediaSource};
 use crate::spotify::metadata::{fetch_track_metadata, TrackMetadata};
@@ -55,6 +55,8 @@ const TOKEN_REFRESH_RETRY_SECS: u64 = 30;
 const MAX_SESSION_RESTARTS: u32 = 10;
 /// Fallback token lifetime when the real `expires_in` is unknown.
 const DEFAULT_TOKEN_LIFETIME_SECS: u64 = 3600;
+/// How long to poll Spotify for a device-code pairing before giving up.
+const DEVICE_LOGIN_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(600);
 
 pub struct ActiveSession {
     pub discord_user_id: u64,
@@ -90,8 +92,10 @@ struct Handler {
     prebuffer_wait: std::time::Duration,
     user_store: Arc<UserStore>,
     oauth: Arc<SpotifyOAuth>,
-    /// Pending PKCE challenges keyed by Discord user, awaiting paste-back.
-    pending_auth: Arc<Mutex<HashMap<u64, (PkceChallenge, Instant)>>>,
+    /// Pending device-code pairings keyed by Discord user; notifying cancels
+    /// that user's poll. In-memory only: a restart drops pending pairings and
+    /// the user re-runs `/login`.
+    pending_auth: Arc<Mutex<HashMap<u64, Arc<tokio::sync::Notify>>>>,
     active_session: Arc<Mutex<Option<ActiveSession>>>,
     /// Serializes spawn_session so two concurrent logins can't orphan a task.
     spawn_lock: Arc<tokio::sync::Mutex<()>>,
@@ -126,15 +130,7 @@ struct Handler {
 fn register_commands(ytdlp_available: bool) -> Vec<CreateCommand> {
     let mut cmds = vec![
         CreateCommand::new("login")
-            .description("Connect your Spotify account (or reactivate existing session)")
-            .add_option(
-                CreateCommandOption::new(
-                    CommandOptionType::String,
-                    "code",
-                    "Paste the redirect URL (or code) after authorizing",
-                )
-                .required(false),
-            ),
+            .description("Connect your Spotify account (or reactivate existing session)"),
         CreateCommand::new("logout")
             .description("Deactivate your Spotify session (credentials kept for quick re-login)"),
         CreateCommand::new("forget")
@@ -1244,19 +1240,6 @@ impl EventHandler for Handler {
         };
         tracing::debug!(command = %cmd.data.name, "processing slash command");
 
-        let code_arg: Option<String> = cmd
-            .data
-            .options
-            .iter()
-            .find(|o| o.name == "code")
-            .and_then(|o| {
-                if let serenity::model::application::CommandDataOptionValue::String(s) = &o.value {
-                    Some(s.clone())
-                } else {
-                    None
-                }
-            });
-
         let user_id = cmd.user.id.to_string();
         let user_id_u64 = cmd.user.id.get();
         let username = cmd.user.global_name.clone().unwrap_or_else(|| cmd.user.name.clone());
@@ -1279,8 +1262,26 @@ impl EventHandler for Handler {
         // Defer login immediately — OAuth + session startup takes >3s
         if cmd.data.name.as_str() == "login" {
             let _ = cmd.defer_ephemeral(&ctx).await;
-            let reply = self.handle_login(&user_id, user_id_u64, &username, code_arg.as_deref(), in_voice).await;
-            let _ = cmd.edit_response(&ctx, serenity::builder::EditInteractionResponse::new().content(reply)).await;
+            match self.handle_login(&user_id, user_id_u64, &username, in_voice).await {
+                LoginOutcome::Reply(s) => {
+                    let _ = cmd.edit_response(&ctx, serenity::builder::EditInteractionResponse::new().content(s)).await;
+                }
+                LoginOutcome::Pair(auth) => {
+                    let _ = cmd.edit_response(
+                        &ctx,
+                        serenity::builder::EditInteractionResponse::new().content(format!(
+                            "Go to <{}> and enter code **{}**.\nThis code expires in 10 minutes.",
+                            auth.url(),
+                            auth.user_code
+                        )),
+                    ).await;
+                    // Serenity dispatches each interaction in its own task, so
+                    // this long await (up to DEVICE_LOGIN_MAX_WAIT) doesn't
+                    // block other events.
+                    let reply = self.finish_device_login(&user_id, user_id_u64, &username, &ctx, auth).await;
+                    let _ = cmd.edit_response(&ctx, serenity::builder::EditInteractionResponse::new().content(reply)).await;
+                }
+            }
             return;
         }
 
@@ -1300,7 +1301,7 @@ impl EventHandler for Handler {
         let reply = match cmd.data.name.as_str() {
             "login" => unreachable!(),
             "logout" => self.handle_logout(&user_id, user_id_u64).await,
-            "forget" => self.handle_forget(&user_id).await,
+            "forget" => self.handle_forget(&user_id, user_id_u64).await,
             "who" => self.handle_who().await,
             "queue" => {
                 let url_arg: Option<String> = cmd
@@ -1334,33 +1335,11 @@ impl EventHandler for Handler {
     }
 }
 
-/// Outcome of validating a pasted redirect against the stashed PKCE challenge.
-#[derive(Debug, PartialEq, Eq)]
-enum PendingLoginCheck {
-    Ok,
-    /// The 10-minute pending window has elapsed; the challenge must be burned.
-    Expired,
-    /// The redirect carried a state that doesn't match the stashed one (CSRF).
-    StateMismatch,
-}
-
-/// Pure policy for a pending login attempt. A redirect with NO state (a bare
-/// pasted code) deliberately skips the CSRF comparison: state defends the
-/// URL-paste path against swapped links, while a bare code is useless without
-/// this user's stashed PKCE verifier — the token exchange itself enforces
-/// that binding.
-fn check_pending_login(
-    age: std::time::Duration,
-    expected_state: &str,
-    returned_state: Option<&str>,
-) -> PendingLoginCheck {
-    if age > std::time::Duration::from_secs(600) {
-        return PendingLoginCheck::Expired;
-    }
-    match returned_state {
-        Some(returned) if returned != expected_state => PendingLoginCheck::StateMismatch,
-        _ => PendingLoginCheck::Ok,
-    }
+/// Outcome of `/login`: either a plain reply, or a freshly issued device-code
+/// pairing that the caller must show the user and then poll to completion.
+enum LoginOutcome {
+    Reply(String),
+    Pair(DeviceAuthorization),
 }
 
 /// Pure voice-gate policy (PORT.md locked decision 4): with the bot in a
@@ -2153,53 +2132,29 @@ impl Handler {
         user_id: &str,
         user_id_u64: u64,
         discord_username: &str,
-        code_arg: Option<&str>,
         in_voice: bool,
-    ) -> String {
+    ) -> LoginOutcome {
         // Taking over an active session owned by someone else requires being in
         // the bot's voice channel — you can't evict the current DJ from outside.
         if let Some(owner) = self.active_owner() {
             if owner != user_id_u64 && !in_voice {
-                return "Someone else is the active DJ. Join the bot's voice channel to take over.".to_string();
+                return LoginOutcome::Reply("Someone else is the active DJ. Join the bot's voice channel to take over.".to_string());
             }
         }
 
-        // Paste-back of a redirect URL / code completes a pending PKCE auth.
-        if let Some(raw) = code_arg {
-            return self
-                .complete_login(user_id, user_id_u64, discord_username, raw)
-                .await;
-        }
-
-        // No code, but stored creds exist: quick re-login by refreshing.
+        // Stored creds exist: quick re-login by refreshing, no new pairing needed.
         if let Some(existing) = self.user_store.load(user_id) {
-            return self
-                .reactivate_login(user_id, user_id_u64, discord_username, existing)
-                .await;
+            return LoginOutcome::Reply(
+                self.reactivate_login(user_id, user_id_u64, discord_username, existing)
+                    .await,
+            );
         }
 
-        // Fresh login: issue a PKCE challenge and the authorize URL.
-        self.issue_login_url(user_id_u64)
-    }
-
-    /// Issue a fresh PKCE challenge for this user and return the authorize-URL
-    /// instructions. Replaces any prior pending challenge for the same user.
-    fn issue_login_url(&self, user_id_u64: u64) -> String {
-        let pkce = new_pkce();
-        let url = self.oauth.auth_url(&pkce);
-        {
-            let mut pending = self.pending_auth.lock();
-            // Reap challenges older than their 10-min validity so abandoned
-            // logins don't accumulate.
-            pending.retain(|_, (_, started)| started.elapsed() < std::time::Duration::from_secs(600));
-            pending.insert(user_id_u64, (pkce, Instant::now()));
+        // Fresh login: start a device-code pairing.
+        match self.oauth.request_device_code().await {
+            Ok(auth) => LoginOutcome::Pair(auth),
+            Err(e) => LoginOutcome::Reply(format!("Couldn't start a Spotify login: {e}. Try again.")),
         }
-        format!(
-            "Connect your Spotify account:\n\n<{url}>\n\nClick the link and authorize. \
-             Your browser will then try to open a page that fails to load \
-             (connection refused) — that's expected. Copy that full URL from the \
-             address bar and run `/login code:<that URL>` to finish."
-        )
     }
 
     /// Quick re-login for a user who already authorized once: refresh their
@@ -2240,72 +2195,32 @@ impl Handler {
                 )
             }
             Err(e) => {
-                tracing::warn!(error = %e, "token refresh failed on reactivation; issuing fresh authorize URL");
+                tracing::warn!(error = %e, "token refresh failed on reactivation; re-authorization required");
                 // The stored refresh token is dead. Deactivate it so
-                // auto-start stops retrying it, and go straight to a fresh
+                // auto-start stops retrying it, and prompt a fresh
                 // authorization instead of dead-ending the user into a
                 // /forget + /login round-trip.
                 let _ = self.user_store.deactivate(user_id);
                 format!(
-                    "Your stored Spotify session for **{}** can't be refreshed — let's re-authorize.\n\n{}",
-                    existing.spotify_username,
-                    self.issue_login_url(user_id_u64)
+                    "Your stored Spotify session for **{}** can't be refreshed — run `/login` again to re-authorize.",
+                    existing.spotify_username
                 )
             }
         }
     }
 
-    /// Complete a login by exchanging the pasted authorization code, using the
-    /// PKCE verifier stashed when `/login` was first invoked.
-    async fn complete_login(
+    /// Fetch the Spotify display name and persist device-flow tokens for this
+    /// user with the given active flag. Returns `(display_name, refresh_token)`,
+    /// or the reply to send when the tokens can't be stored.
+    async fn save_device_creds(
         &self,
         user_id: &str,
-        user_id_u64: u64,
         discord_username: &str,
-        raw: &str,
-    ) -> String {
-        let params = match parse_redirect(raw) {
-            Ok(p) => p,
-            Err(e) => return format!("Couldn't read that redirect: {e}. Paste the full URL from your browser."),
-        };
-
-        // Read the pending challenge without consuming it: a bad paste must
-        // not burn the challenge and force a full re-authorization. It is
-        // removed on success (used codes can't be replayed) and on expiry.
-        let pending = {
-            let lock = self.pending_auth.lock();
-            lock.get(&user_id_u64).cloned()
-        };
-        let (pkce, started) = match pending {
-            Some(p) => p,
-            None => return "No pending login — run `/login` first to get an authorize link.".to_string(),
-        };
-        match check_pending_login(started.elapsed(), &pkce.state, params.state.as_deref()) {
-            PendingLoginCheck::Expired => {
-                let mut lock = self.pending_auth.lock();
-                lock.remove(&user_id_u64);
-                return "That login link expired. Run `/login` again.".to_string();
-            }
-            PendingLoginCheck::StateMismatch => {
-                tracing::warn!(user = %user_id, "OAuth state mismatch");
-                return "Login state mismatch — for safety, run `/login` again.".to_string();
-            }
-            PendingLoginCheck::Ok => {}
-        }
-
-        let token = match self.oauth.exchange_code(&params.code, &pkce.verifier).await {
-            Ok(t) => {
-                let mut lock = self.pending_auth.lock();
-                lock.remove(&user_id_u64);
-                t
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "oauth code exchange failed");
-                return "Failed to exchange the code with Spotify. Check the pasted URL and try again, or run `/login` to start over.".to_string();
-            }
-        };
+        token: &crate::oauth::TokenResponse,
+        active: bool,
+    ) -> Result<(String, String), String> {
         let Some(refresh_token) = token.refresh_token.clone() else {
-            return "Spotify didn't return a refresh token. Run `/login` again.".to_string();
+            return Err("Spotify didn't return a refresh token. Run `/login` again.".to_string());
         };
         let display_name = match self.oauth.get_user_profile(&token.access_token).await {
             Ok(name) => name,
@@ -2319,20 +2234,93 @@ impl Handler {
             discord_name: discord_username.to_string(),
             spotify_username: display_name.clone(),
             access_token: token.access_token.clone(),
-            refresh_token,
-            active: true,
+            refresh_token: refresh_token.clone(),
+            active,
         };
         if let Err(e) = self.user_store.save(&creds) {
             tracing::error!(error = %e, "failed to save credentials");
-            return "Failed to save credentials. Please try again.".to_string();
+            return Err("Failed to save credentials. Please try again.".to_string());
         }
-        tracing::info!(user = %user_id, spotify = %display_name, "oauth login successful");
+        Ok((display_name, refresh_token))
+    }
+
+    /// Poll Spotify for the device-code pairing issued by `handle_login`,
+    /// cancellably: a newer `/login` or a `/logout`/`/forget` for this user
+    /// notifies the stashed `Notify`, which aborts this poll in place of the
+    /// old one.
+    async fn finish_device_login(
+        &self,
+        user_id: &str,
+        user_id_u64: u64,
+        discord_username: &str,
+        ctx: &Context,
+        auth: DeviceAuthorization,
+    ) -> String {
+        let cancel = Arc::new(Notify::new());
+        {
+            let mut pending = self.pending_auth.lock();
+            if let Some(old) = pending.insert(user_id_u64, cancel.clone()) {
+                // A newer /login replaces (and cancels) any prior pairing poll.
+                old.notify_one();
+            }
+        }
+
+        let outcome = tokio::select! {
+            r = self.oauth.poll_device_token(&auth, DEVICE_LOGIN_MAX_WAIT) => Some(r),
+            _ = cancel.notified() => None,
+        };
+
+        {
+            let mut pending = self.pending_auth.lock();
+            // Only clear our own entry — a newer login may have already
+            // replaced it with its own pending pairing.
+            if let Some(current) = pending.get(&user_id_u64) {
+                if Arc::ptr_eq(current, &cancel) {
+                    pending.remove(&user_id_u64);
+                }
+            }
+        }
+
+        let token = match outcome {
+            None => return "This login was cancelled by a newer `/login` or a logout.".to_string(),
+            Some(Ok(t)) => t,
+            Some(Err(crate::oauth::OAuthError::Denied)) => {
+                return "Spotify login was declined.".to_string();
+            }
+            Some(Err(crate::oauth::OAuthError::Expired)) => {
+                return "That code expired. Run `/login` again.".to_string();
+            }
+            Some(Err(e)) => {
+                return format!("Spotify login failed: {e}. Run `/login` again.");
+            }
+        };
+
+        // Taking over an active session owned by someone else requires being in
+        // the bot's voice channel — you can't evict the current DJ from
+        // outside. Re-checked here since the poll can take minutes. The
+        // tokens are stored inactive so the retry is a quick re-login and the
+        // current DJ's row stays the only active one.
+        if let Some(owner) = self.active_owner() {
+            if owner != user_id_u64 && !self.user_in_bot_voice_channel(ctx, UserId::new(user_id_u64)) {
+                return match self.save_device_creds(user_id, discord_username, &token, false).await {
+                    Ok(_) => "Saved your Spotify login. Join the bot's voice channel and run `/login` again to take over.".to_string(),
+                    Err(msg) => msg,
+                };
+            }
+        }
+
+        let (display_name, refresh_token) =
+            match self.save_device_creds(user_id, discord_username, &token, true).await {
+                Ok(v) => v,
+                Err(msg) => return msg,
+            };
+        tracing::info!(user = %user_id, spotify = %display_name, "device login successful");
         self.spawn_session(
             user_id_u64,
             display_name.clone(),
             discord_username.to_string(),
             token.access_token,
-            creds.refresh_token.clone(),
+            refresh_token,
             token.expires_in,
         )
         .await;
@@ -2345,6 +2333,11 @@ impl Handler {
     }
 
     async fn handle_logout(&self, user_id: &str, user_id_u64: u64) -> String {
+        // A pending device-code pairing for this user is now moot — cancel its poll.
+        if let Some(cancel) = self.pending_auth.lock().remove(&user_id_u64) {
+            cancel.notify_one();
+        }
+
         // Serialize against spawn_session so a logout landing in the spawn
         // window can't miss the not-yet-stored session (and then deactivate the
         // DB row while a live session keeps running).
@@ -2388,7 +2381,12 @@ impl Handler {
         }
     }
 
-    async fn handle_forget(&self, user_id: &str) -> String {
+    async fn handle_forget(&self, user_id: &str, user_id_u64: u64) -> String {
+        // A pending device-code pairing for this user is now moot — cancel its poll.
+        if let Some(cancel) = self.pending_auth.lock().remove(&user_id_u64) {
+            cancel.notify_one();
+        }
+
         match self.user_store.remove(user_id) {
             Ok(true) => { tracing::info!(user = %user_id, "credentials forgotten"); "Credentials permanently deleted. Run `/login` to connect again.".to_string() }
             Ok(false) => "No stored credentials to delete.".to_string(),
@@ -2565,13 +2563,12 @@ impl DiscordBot {
 #[cfg(test)]
 mod tests {
     use super::{
-        check_pending_login, is_valid_track_id, parse_track_id_from_url, voice_gate,
-        DrainGuard, PendingLoginCheck,
+        is_valid_track_id, parse_track_id_from_url, voice_gate,
+        DrainGuard,
     };
     use serenity::all::ChannelId;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
-    use std::time::Duration;
 
     const ID: &str = "4cOdK2wGLETKBW3PvgPWqT"; // 22 base62 chars
 
@@ -2595,49 +2592,6 @@ mod tests {
         assert!(!voice_gate(None, Some(ChannelId::new(10)), false));
         assert!(voice_gate(None, Some(ChannelId::new(10)), true));
         assert!(!voice_gate(None, None, true), "follow still needs the user in voice");
-    }
-
-    // --- check_pending_login: the /login paste-back policy ---
-
-    #[test]
-    fn pending_login_expires_after_ten_minutes() {
-        assert_eq!(
-            check_pending_login(Duration::from_secs(600), "s", Some("s")),
-            PendingLoginCheck::Ok,
-            "at the boundary the link still works"
-        );
-        assert_eq!(
-            check_pending_login(Duration::from_secs(601), "s", Some("s")),
-            PendingLoginCheck::Expired
-        );
-    }
-
-    #[test]
-    fn pending_login_rejects_state_mismatch() {
-        assert_eq!(
-            check_pending_login(Duration::ZERO, "expected", Some("tampered")),
-            PendingLoginCheck::StateMismatch
-        );
-        assert_eq!(
-            check_pending_login(Duration::ZERO, "expected", Some("expected")),
-            PendingLoginCheck::Ok
-        );
-    }
-
-    #[test]
-    fn bare_code_paste_skips_the_state_check_by_design() {
-        // Pinned as intended: a bare code carries no state to compare, and it
-        // cannot be exchanged without this user's stashed PKCE verifier — the
-        // exchange enforces the binding the state check would have.
-        assert_eq!(
-            check_pending_login(Duration::ZERO, "expected", None),
-            PendingLoginCheck::Ok
-        );
-        // Expiry still applies to bare codes.
-        assert_eq!(
-            check_pending_login(Duration::from_secs(601), "expected", None),
-            PendingLoginCheck::Expired
-        );
     }
 
     // --- DrainGuard: the single-flight drain flag ---

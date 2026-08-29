@@ -168,28 +168,6 @@ pub async fn run_setup_wizard() -> Result<Config, SetupError> {
     })
     .await?;
 
-    // Step 5b: Spotify app client id. Required at startup (OAuth is the only
-    // session path), so a wizard that skipped it wrote a .env that couldn't
-    // boot without a manual edit.
-    println!();
-    println!("Spotify app client id — create an app at https://developer.spotify.com/dashboard");
-    println!("and add http://127.0.0.1:8766/callback as its redirect URI (PKCE, no client secret).");
-    let spotify_client_id: String = blocking(|| {
-        Input::<String>::new()
-            .with_prompt("Spotify client id")
-            .validate_with(|input: &String| {
-                let t = input.trim();
-                if t.len() >= 16 && t.bytes().all(|b| b.is_ascii_alphanumeric()) {
-                    Ok(())
-                } else {
-                    Err("that doesn't look like a Spotify client id (letters/digits only)")
-                }
-            })
-            .interact_text()
-    })
-    .await?;
-    let spotify_client_id = spotify_client_id.trim().to_string();
-
     // Step 6: Summary + confirm.
     println!();
     println!("--- Configuration Summary ---");
@@ -210,8 +188,6 @@ pub async fn run_setup_wizard() -> Result<Config, SetupError> {
         "(invalid?)".to_string()
     };
     println!("  Token:          {masked_token}");
-    let client_id_prefix: String = spotify_client_id.chars().take(8).collect();
-    println!("  Spotify app:    {client_id_prefix}…");
     println!();
 
     let confirmed = blocking(|| {
@@ -228,7 +204,7 @@ pub async fn run_setup_wizard() -> Result<Config, SetupError> {
     // Step 7: Write .env.
     let guild_id_u64 = guild_id.get();
     let channel_id_u64 = channel_id.get();
-    write_env_file(&token, guild_id_u64, channel_id_u64, &device_name, &spotify_client_id)?;
+    write_env_file(&token, guild_id_u64, channel_id_u64, &device_name)?;
     println!();
     println!(".env written successfully!");
 
@@ -239,7 +215,6 @@ pub async fn run_setup_wizard() -> Result<Config, SetupError> {
     std::env::set_var("DISCORD_GUILD_ID", guild_id_u64.to_string());
     std::env::set_var("DISCORD_CHANNEL_ID", channel_id_u64.to_string());
     std::env::set_var("DEVICE_NAME", &device_name);
-    std::env::set_var("SPOTIFY_CLIENT_ID", &spotify_client_id);
 
     // Step 8: Load config and return.
     let config =
@@ -292,17 +267,15 @@ fn write_env_file(
     guild_id: u64,
     channel_id: u64,
     device_name: &str,
-    spotify_client_id: &str,
 ) -> Result<(), SetupError> {
     let env_path = Path::new(".env");
     let guild_id_str = guild_id.to_string();
     let channel_id_str = channel_id.to_string();
-    let wizard_keys: [(&str, &str); 5] = [
+    let wizard_keys: [(&str, &str); 4] = [
         ("DISCORD_TOKEN", token),
         ("DISCORD_GUILD_ID", &guild_id_str),
         ("DISCORD_CHANNEL_ID", &channel_id_str),
         ("DEVICE_NAME", device_name),
-        ("SPOTIFY_CLIENT_ID", spotify_client_id),
     ];
 
     if env_path.exists() {
@@ -354,10 +327,6 @@ DISCORD_CHANNEL_ID={channel_id}
 
 # Device name shown in Spotify Connect
 DEVICE_NAME={device_name}
-
-# Spotify app client id (required for /login). Redirect URI:
-# http://127.0.0.1:8766/callback. PKCE flow — no client secret needed.
-SPOTIFY_CLIENT_ID={spotify_client_id}
 
 # Encryption key for stored OAuth tokens (any long random string).
 # Unset = tokens stored unencrypted (startup warning).

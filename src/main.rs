@@ -81,22 +81,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         youtube::sweep_tmp_dir();
     }
 
-    // OAuth (Authorization Code + PKCE) is the only session path; PKCE needs
-    // the client id only.
-    let oauth: Arc<SpotifyOAuth> = match config.spotify_client_id.clone() {
-        Some(id) => {
-            // chars(), not a byte slice: a multi-byte char straddling the
-            // cut would panic on a non-char boundary.
-            let prefix: String = id.chars().take(8).collect();
-            tracing::info!(client_id_prefix = %prefix, "spotify oauth enabled");
-            Arc::new(SpotifyOAuth::new(id))
-        }
-        None => {
-            println!("Spotify OAuth is not configured — set SPOTIFY_CLIENT_ID in .env.");
-            println!("Spotify playback requires /login; discovery mode was removed in v0.5.");
-            return Err(io::Error::other("missing SPOTIFY_CLIENT_ID").into());
-        }
-    };
+    // OAuth (Authorization Code + PKCE, desktop client id) is the only
+    // session path.
+    let oauth: Arc<SpotifyOAuth> = Arc::new(SpotifyOAuth::new());
+    tracing::info!("spotify oauth enabled (device authorization)");
 
     let db_path = std::env::var("SPOTIBOT_DB").unwrap_or_else(|_| "spotibot.db".to_string());
     let user_store = Arc::new(

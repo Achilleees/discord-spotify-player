@@ -798,7 +798,6 @@ dependencies = [
 name = "discord-spotify-player"
 version = "0.5.0-rc2"
 dependencies = [
- "base64",
  "chacha20poly1305",
  "dialoguer",
  "dotenvy",
