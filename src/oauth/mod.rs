@@ -19,8 +19,6 @@ pub struct SpotifyOAuth {
     /// Base URL for accounts.spotify.com endpoints (device auth/token exchange/refresh).
     /// Overridable so tests can point at a local mock server.
     accounts_base: String,
-    /// Base URL for api.spotify.com endpoints (profile fetch).
-    api_base: String,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -62,12 +60,6 @@ struct TokenErrorBody {
     error: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
-struct UserProfile {
-    display_name: Option<String>,
-    id: String,
-}
-
 #[derive(Debug)]
 pub enum OAuthError {
     Http(reqwest::Error),
@@ -107,16 +99,14 @@ impl SpotifyOAuth {
                 .build()
                 .unwrap_or_default(),
             accounts_base: "https://accounts.spotify.com".to_string(),
-            api_base: "https://api.spotify.com".to_string(),
         }
     }
 
-    /// Test-only constructor pointing both endpoint families at a mock server.
+    /// Test-only constructor pointing the endpoint family at a mock server.
     #[cfg(test)]
-    fn with_base_urls(accounts_base: &str, api_base: &str) -> Self {
+    fn with_base_urls(accounts_base: &str) -> Self {
         let mut o = Self::new();
         o.accounts_base = accounts_base.trim_end_matches('/').to_string();
-        o.api_base = api_base.trim_end_matches('/').to_string();
         o
     }
 
@@ -238,53 +228,11 @@ impl SpotifyOAuth {
 
         Ok(resp.json::<TokenResponse>().await?)
     }
-
-    pub async fn get_user_profile(&self, access_token: &str) -> Result<String, OAuthError> {
-        let resp = self
-            .http
-            .get(format!("{}/v1/me", self.api_base))
-            .header("Authorization", format!("Bearer {}", access_token))
-            .send()
-            .await?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(OAuthError::Api(format!(
-                "Profile fetch failed ({}): {}",
-                status, body
-            )));
-        }
-
-        let profile: UserProfile = resp.json().await?;
-        Ok(profile.display_name.unwrap_or(profile.id))
-    }
-}
-
-pub fn pct_encode(input: &str) -> String {
-    let mut out = String::with_capacity(input.len() * 3);
-    for byte in input.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(byte as char);
-            }
-            _ => {
-                out.push_str(&format!("%{:02X}", byte));
-            }
-        }
-    }
-    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn pct_encode_leaves_unreserved_and_escapes_the_rest() {
-        assert_eq!(pct_encode("aZ0-_.~"), "aZ0-_.~");
-        assert_eq!(pct_encode("a b/c:d"), "a%20b%2Fc%3Ad");
-    }
 
     // --- Network methods against a local one-shot mock server ---
 
@@ -378,27 +326,10 @@ mod tests {
         // Spotify often omits refresh_token on refresh; the caller keeps the
         // old one, so this must parse as None rather than fail.
         let base = mock_http_repeating("200 OK", r#"{"access_token":"AT2","expires_in":3600}"#);
-        let oauth = SpotifyOAuth::with_base_urls(&base, &base);
+        let oauth = SpotifyOAuth::with_base_urls(&base);
         let tok = oauth.refresh_access_token("rt").await.unwrap();
         assert_eq!(tok.access_token, "AT2");
         assert!(tok.refresh_token.is_none());
-    }
-
-    #[tokio::test]
-    async fn profile_falls_back_to_id_when_display_name_is_null() {
-        let base = mock_http_repeating("200 OK", r#"{"id":"user-id-1","display_name":null}"#);
-        let oauth = SpotifyOAuth::with_base_urls(&base, &base);
-        assert_eq!(oauth.get_user_profile("at").await.unwrap(), "user-id-1");
-    }
-
-    #[tokio::test]
-    async fn profile_non_2xx_is_api_error() {
-        let base = mock_http_repeating("401 Unauthorized", r#"{"error":"expired"}"#);
-        let oauth = SpotifyOAuth::with_base_urls(&base, &base);
-        assert!(matches!(
-            oauth.get_user_profile("at").await,
-            Err(OAuthError::Api(_))
-        ));
     }
 
     #[tokio::test]
@@ -407,7 +338,7 @@ mod tests {
             "200 OK",
             r#"{"device_code":"DC","user_code":"ABCD-EFGH","verification_uri":"https://spotify.com/device","verification_uri_complete":"https://spotify.com/device?code=ABCD-EFGH","expires_in":600,"interval":0}"#,
         );
-        let oauth = SpotifyOAuth::with_base_urls(&base, &base);
+        let oauth = SpotifyOAuth::with_base_urls(&base);
         let auth = oauth.request_device_code().await.unwrap();
         assert_eq!(auth.device_code, "DC");
         assert_eq!(auth.user_code, "ABCD-EFGH");
@@ -423,7 +354,7 @@ mod tests {
                 r#"{"access_token":"AT","refresh_token":"RT","expires_in":3600}"#,
             ),
         ]);
-        let oauth = SpotifyOAuth::with_base_urls(&base, &base);
+        let oauth = SpotifyOAuth::with_base_urls(&base);
         let auth = DeviceAuthorization {
             device_code: "DC".to_string(),
             user_code: "UC".to_string(),
@@ -448,7 +379,7 @@ mod tests {
                 r#"{"access_token":"AT","refresh_token":"RT","expires_in":3600}"#,
             ),
         ]);
-        let oauth = SpotifyOAuth::with_base_urls(&base, &base);
+        let oauth = SpotifyOAuth::with_base_urls(&base);
         let auth = DeviceAuthorization {
             device_code: "DC".to_string(),
             user_code: "UC".to_string(),
@@ -467,7 +398,7 @@ mod tests {
     #[tokio::test]
     async fn poll_access_denied_maps_to_denied() {
         let base = mock_http_repeating("400 Bad Request", r#"{"error":"access_denied"}"#);
-        let oauth = SpotifyOAuth::with_base_urls(&base, &base);
+        let oauth = SpotifyOAuth::with_base_urls(&base);
         let auth = DeviceAuthorization {
             device_code: "DC".to_string(),
             user_code: "UC".to_string(),
@@ -487,7 +418,7 @@ mod tests {
     #[tokio::test]
     async fn poll_expired_maps_to_expired() {
         let base = mock_http_repeating("400 Bad Request", r#"{"error":"authorization_pending"}"#);
-        let oauth = SpotifyOAuth::with_base_urls(&base, &base);
+        let oauth = SpotifyOAuth::with_base_urls(&base);
         let auth = DeviceAuthorization {
             device_code: "DC".to_string(),
             user_code: "UC".to_string(),

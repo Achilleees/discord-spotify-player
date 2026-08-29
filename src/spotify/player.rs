@@ -7,6 +7,7 @@ use librespot_core::authentication::Credentials;
 use librespot_core::config::{DeviceType, SessionConfig};
 use librespot_core::session::Session;
 use librespot_core::SpotifyUri;
+use librespot_metadata::audio::item::{AudioItem, UniqueFields};
 use librespot_metadata::{Episode, Metadata, Track};
 use librespot_playback::config::PlayerConfig;
 use librespot_playback::mixer::softmixer::SoftMixer;
@@ -26,10 +27,46 @@ const MIN_STABLE_SESSION_SECS: u64 = 60;
 pub enum SpircCommand {
     Pause,
     Play,
+    Next,
+    Previous,
+    AddToQueue(SpotifyUri),
 }
 
 fn extract_track_id(uri: &SpotifyUri) -> String {
     uri.to_id()
+}
+
+/// Info about the current track, kept in the event loop so `Playing`/
+/// `Paused` events (which only carry a bare `track_id`) can be turned into
+/// full presence updates without calling any Web API.
+struct CurrentTrack {
+    track_id: SpotifyUri,
+    title: String,
+    artist: String,
+    album_art_url: Option<String>,
+}
+
+fn track_info_from_audio_item(audio_item: &AudioItem) -> CurrentTrack {
+    let artist = match &audio_item.unique_fields {
+        UniqueFields::Track { artists, .. } => {
+            let names: Vec<_> = artists.iter().map(|a| a.name.clone()).collect();
+            names.join(", ")
+        }
+        UniqueFields::Local { artists, .. } => artists.clone().unwrap_or_default(),
+        UniqueFields::Episode { .. } => String::new(),
+    };
+    let album_art_url = audio_item
+        .covers
+        .iter()
+        .max_by_key(|c| c.width)
+        .map(|c| c.url.clone());
+
+    CurrentTrack {
+        track_id: audio_item.track_id.clone(),
+        title: audio_item.name.clone(),
+        artist,
+        album_art_url,
+    }
 }
 
 /// Aborts the wrapped task when dropped. Dropping a bare `JoinHandle` only
@@ -139,54 +176,62 @@ impl SpotifyPlayer {
         session_for_meta: Session,
         bridge_for_events: Arc<AudioBridge>,
         presence_tx_events: mpsc::UnboundedSender<PresenceUpdate>,
-        access_token: String,
         end_of_track_tx: Option<mpsc::UnboundedSender<()>>,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let mut rx = rx;
-            let mut last_track: Option<SpotifyUri> = None;
-            let mut last_title = String::new();
-            let mut last_artist = String::new();
-            let mut last_track_id = String::new();
+            // Set by TrackChanged, consumed by the next Playing/Paused for
+            // that same track_id. Nothing here ever calls api.spotify.com.
+            let mut current: Option<CurrentTrack> = None;
+            let mut last_sent_track: Option<SpotifyUri> = None;
 
             while let Some(event) = rx.recv().await {
                 match event {
+                    PlayerEvent::TrackChanged { audio_item } => {
+                        current = Some(track_info_from_audio_item(&audio_item));
+                    }
                     PlayerEvent::Playing { track_id, .. } => {
-                        let is_new_track = last_track.as_ref() != Some(&track_id);
-                        if is_new_track {
-                            last_track_id = extract_track_id(&track_id);
-                            if let Some((title, artist)) =
-                                Self::fetch_track_info(&session_for_meta, &track_id).await
-                            {
-                                println!("Playing: {} - {}", title, artist);
-                                last_title = title;
-                                last_artist = artist;
-                            } else {
-                                println!("Playing: (unknown track)");
-                                last_title.clear();
-                                last_artist.clear();
+                        let is_new_track = last_sent_track.as_ref() != Some(&track_id);
+
+                        let (title, artist, album_art_url) = match &current {
+                            Some(c) if c.track_id == track_id => {
+                                (c.title.clone(), c.artist.clone(), c.album_art_url.clone())
                             }
-                            last_track = Some(track_id);
+                            _ => {
+                                // No TrackChanged remembered for this id (or it
+                                // doesn't match) — fall back to metadata lookup,
+                                // without album art.
+                                match Self::fetch_track_info(&session_for_meta, &track_id).await {
+                                    Some((title, artist)) => (title, artist, None),
+                                    None => ("Unknown track".to_string(), "Unknown artist".to_string(), None),
+                                }
+                            }
+                        };
+
+                        if is_new_track {
+                            println!("Playing: {} - {}", title, artist);
                         }
-                        let title = if last_title.is_empty() {
-                            "Unknown track".to_string()
-                        } else {
-                            last_title.clone()
-                        };
-                        let artist = if last_artist.is_empty() {
-                            "Unknown artist".to_string()
-                        } else {
-                            last_artist.clone()
-                        };
+                        last_sent_track = Some(track_id.clone());
                         let _ = presence_tx_events.send(PresenceUpdate::Playing {
                             title,
                             artist,
-                            track_id: last_track_id.clone(),
-                            access_token: access_token.clone(),
+                            track_id: extract_track_id(&track_id),
+                            album_art_url,
                         });
                     }
-                    PlayerEvent::Paused { .. } => {
-                        let _ = presence_tx_events.send(PresenceUpdate::Paused);
+                    PlayerEvent::Paused { track_id, .. } => {
+                        let (title, artist) = match &current {
+                            Some(c) if c.track_id == track_id => (c.title.clone(), c.artist.clone()),
+                            _ => match Self::fetch_track_info(&session_for_meta, &track_id).await {
+                                Some((title, artist)) => (title, artist),
+                                None => ("Unknown track".to_string(), "Unknown artist".to_string()),
+                            },
+                        };
+                        let _ = presence_tx_events.send(PresenceUpdate::Paused {
+                            title,
+                            artist,
+                            track_id: extract_track_id(&track_id),
+                        });
                         bridge_for_events.clear();
                         tracing::debug!("playback paused");
                     }
@@ -194,9 +239,6 @@ impl SpotifyPlayer {
                         let _ = presence_tx_events.send(PresenceUpdate::Idle);
                         bridge_for_events.clear();
                         tracing::debug!("playback stopped");
-                    }
-                    PlayerEvent::TrackChanged { .. } => {
-                        last_track = None;
                     }
                     PlayerEvent::Loading { .. } => {
                         tracing::debug!("loading track");
@@ -207,6 +249,7 @@ impl SpotifyPlayer {
                         // stop is handled by PlayerEvent::Stopped, and a priority
                         // item's drain clears the bridge itself before playing.
                         let _ = presence_tx_events.send(PresenceUpdate::Idle);
+                        last_sent_track = None;
                         if let Some(ref tx) = end_of_track_tx {
                             let _ = tx.send(());
                         }
@@ -274,7 +317,6 @@ impl SpotifyPlayer {
                 session.clone(),
                 bridge_for_events,
                 presence_tx.clone(),
-                access_token.clone(),
                 end_of_track_tx.clone(),
             ));
 
@@ -315,6 +357,21 @@ impl SpotifyPlayer {
                         match maybe_cmd {
                             Some(SpircCommand::Pause) => { let _ = spirc.pause(); }
                             Some(SpircCommand::Play)  => { let _ = spirc.play();  }
+                            Some(SpircCommand::Next) => {
+                                if let Err(e) = spirc.next() {
+                                    tracing::warn!(error = ?e, "spirc next failed");
+                                }
+                            }
+                            Some(SpircCommand::Previous) => {
+                                if let Err(e) = spirc.prev() {
+                                    tracing::warn!(error = ?e, "spirc previous failed");
+                                }
+                            }
+                            Some(SpircCommand::AddToQueue(uri)) => {
+                                if let Err(e) = spirc.add_to_queue(uri) {
+                                    tracing::warn!(error = ?e, "spirc add_to_queue failed");
+                                }
+                            }
                             None => *spirc_cmd_rx = None, // all senders dropped; poll the task only
                         }
                     }

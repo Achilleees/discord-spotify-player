@@ -7,7 +7,6 @@ use crate::config::Config;
 use crate::oauth::{DeviceAuthorization, SpotifyOAuth};
 use crate::presence::PresenceUpdate;
 use crate::queue::{PriorityQueue, QueueItem, MediaSource};
-use crate::spotify::metadata::{fetch_track_metadata, TrackMetadata};
 use crate::spotify::SpotifyPlayer;
 use crate::spotify::SpircCommand;
 use crate::youtube::metadata::{fetch_youtube_metadata, validate_attachment};
@@ -57,6 +56,15 @@ const MAX_SESSION_RESTARTS: u32 = 10;
 const DEFAULT_TOKEN_LIFETIME_SECS: u64 = 3600;
 /// How long to poll Spotify for a device-code pairing before giving up.
 const DEVICE_LOGIN_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Track metadata as delivered by the librespot session itself (no Web API
+/// calls — those all 429 under the desktop client ID).
+#[derive(Clone)]
+struct SpotifyTrackInfo {
+    title: String,
+    artist: String,
+    album_art_url: Option<String>,
+}
 
 pub struct ActiveSession {
     pub discord_user_id: u64,
@@ -119,7 +127,10 @@ struct Handler {
     announce_enabled: Arc<AtomicBool>,
     /// Metadata of the current Spotify track, kept fresh by the presence
     /// loop so /np can answer for the Spotify baseline too.
-    last_spotify_meta: Arc<Mutex<Option<TrackMetadata>>>,
+    last_spotify_meta: Arc<Mutex<Option<SpotifyTrackInfo>>>,
+    /// True while the Spotify baseline session is paused, kept fresh by the
+    /// presence loop so /np can report pause state without a Web API call.
+    spotify_paused: Arc<Mutex<bool>>,
     /// Last /play per user, for the metadata-probe cooldown.
     play_cooldowns: Arc<Mutex<HashMap<u64, Instant>>>,
     auto_start_attempted: AtomicBool,
@@ -247,12 +258,12 @@ async fn play_join_sound_then_bridge(
 
 // --- Embed builders ---
 
-fn build_now_playing_embed(meta: &TrackMetadata, spotify_name: &str) -> CreateEmbed {
+fn build_now_playing_embed(meta: &SpotifyTrackInfo, track_id: &str, spotify_name: &str) -> CreateEmbed {
     let mut embed = CreateEmbed::new()
         .color(0x1DB954u32)
         .author(CreateEmbedAuthor::new("Now Playing"))
         .title(format!("{} — {}", meta.title, meta.artist))
-        .url(format!("https://open.spotify.com/track/{}", meta.spotify_track_id))
+        .url(format!("https://open.spotify.com/track/{}", track_id))
         .timestamp(Timestamp::now());
 
     if !spotify_name.is_empty() {
@@ -266,7 +277,7 @@ fn build_now_playing_embed(meta: &TrackMetadata, spotify_name: &str) -> CreateEm
     embed
 }
 
-fn build_history_embed(meta: &TrackMetadata, spotify_name: &str) -> CreateEmbed {
+fn build_history_embed(meta: &SpotifyTrackInfo, track_id: &str, spotify_name: &str) -> CreateEmbed {
     let footer_text = if spotify_name.is_empty() {
         String::new()
     } else {
@@ -277,7 +288,7 @@ fn build_history_embed(meta: &TrackMetadata, spotify_name: &str) -> CreateEmbed 
         .color(0x2B2D31u32)
         .description(format!(
             "[{} — {}](https://open.spotify.com/track/{})",
-            meta.title, meta.artist, meta.spotify_track_id
+            meta.title, meta.artist, track_id
         ));
 
     if !footer_text.is_empty() {
@@ -432,37 +443,6 @@ fn parse_track_id_from_url(input: &str) -> Option<String> {
 /// else keeps user input out of the query string of authenticated API calls.
 fn is_valid_track_id(id: &str) -> bool {
     id.len() == 22 && id.bytes().all(|b| b.is_ascii_alphanumeric())
-}
-
-/// Fire a Spotify Web API player command. Returns whether it succeeded so the
-/// caller can surface failures to the user.
-async fn spotify_playback_command(access_token: &str, method: &str, endpoint: &str) -> bool {
-    let client = crate::spotify::webapi::client();
-    let url = format!("https://api.spotify.com/v1/me/player/{}", endpoint);
-    let req = match method {
-        "POST" => client.post(&url),
-        "PUT" => client.put(&url),
-        _ => return false,
-    };
-    match req
-        .header("Authorization", format!("Bearer {}", access_token))
-        .header("Content-Length", "0")
-        .send()
-        .await
-    {
-        Ok(r) if r.status().is_success() => {
-            tracing::debug!(status = r.status().as_u16(), endpoint, "spotify API call ok");
-            true
-        }
-        Ok(r) => {
-            tracing::warn!(status = r.status().as_u16(), endpoint, "spotify API call failed");
-            false
-        }
-        Err(e) => {
-            tracing::warn!(error = ?e, endpoint, "spotify API request failed");
-            false
-        }
-    }
 }
 
 // --- Priority queue embed posting helpers ---
@@ -775,7 +755,8 @@ async fn run_presence_loop_with_track(
     announce_enabled: Arc<AtomicBool>,
     bridge: Arc<AudioBridge>,
     active_priority_item: Arc<Mutex<Option<QueueItem>>>,
-    last_meta_store: Arc<Mutex<Option<TrackMetadata>>>,
+    last_meta_store: Arc<Mutex<Option<SpotifyTrackInfo>>>,
+    spotify_paused: Arc<Mutex<bool>>,
 ) {
     let (fwd_tx, fwd_rx) = mpsc::unbounded_channel::<PresenceUpdate>();
     let ctx_presence = ctx.clone();
@@ -784,7 +765,8 @@ async fn run_presence_loop_with_track(
     });
 
     let mut last_track_key: Option<String> = None;
-    let mut last_meta: Option<TrackMetadata> = None;
+    let mut last_meta: Option<SpotifyTrackInfo> = None;
+    let mut last_track_id: String = String::new();
     let mut last_spotify_name: String = String::new();
     let mut is_paused: bool = false;
 
@@ -803,7 +785,7 @@ async fn run_presence_loop_with_track(
             if let Some(handle) = lock.as_ref() {
                 match &update {
                     PresenceUpdate::Playing { .. } => { let _ = handle.play(); }
-                    PresenceUpdate::Paused | PresenceUpdate::Idle => {
+                    PresenceUpdate::Paused { .. } | PresenceUpdate::Idle => {
                         if !priority_active { let _ = handle.pause(); }
                     }
                 }
@@ -812,7 +794,7 @@ async fn run_presence_loop_with_track(
 
         let was_paused = is_paused;
         match &update {
-            PresenceUpdate::Paused => { is_paused = true; }
+            PresenceUpdate::Paused { .. } => { is_paused = true; }
             PresenceUpdate::Playing { .. } => { is_paused = false; }
             _ => {}
         }
@@ -828,7 +810,15 @@ async fn run_presence_loop_with_track(
             }
         }
 
-        if let PresenceUpdate::Playing { title, artist, track_id, access_token } = &update {
+        // Keep the /np pause flag in sync with every update, not only the
+        // ones that flip the controls buttons.
+        {
+            let paused_now = matches!(update, PresenceUpdate::Paused { .. });
+            let mut lock = spotify_paused.lock();
+            *lock = paused_now;
+        }
+
+        if let PresenceUpdate::Playing { title, artist, track_id, album_art_url } = &update {
             // Dedup on the track id (stable across replays of the same title);
             // fall back to title — artist only when the id is missing.
             let track_key = if track_id.is_empty() {
@@ -839,12 +829,9 @@ async fn run_presence_loop_with_track(
             if last_track_key.as_deref() != Some(&track_key) {
                 last_track_key = Some(track_key.clone());
 
-                let (spotify_name, fresh_token) = {
+                let spotify_name = {
                     let lock = active_session.lock();
-                    match lock.as_ref() {
-                        Some(s) => (s.discord_name.clone(), Some(s.access_token.clone())),
-                        None => (String::new(), None),
-                    }
+                    lock.as_ref().map(|s| s.discord_name.clone()).unwrap_or_default()
                 };
 
                 let prev_msg_id = {
@@ -854,31 +841,21 @@ async fn run_presence_loop_with_track(
                 if let Some(mid) = prev_msg_id {
                     let _ = text_channel_id.delete_message(&ctx, mid).await;
                     if let Some(ref meta) = last_meta {
-                        let history_embed = build_history_embed(meta, &last_spotify_name);
+                        let history_embed = build_history_embed(meta, &last_track_id, &last_spotify_name);
                         let msg = CreateMessage::new().embed(history_embed);
                         let _ = text_channel_id.send_message(&ctx, msg).await;
                     }
                 }
 
-                // The token inside the PresenceUpdate was captured once when
-                // the librespot task started and expires after ~1h; the
-                // refresher keeps ActiveSession.access_token fresh, so prefer
-                // that and fall back to the update's copy.
-                let token = fresh_token.as_deref().unwrap_or(access_token.as_str());
-                let meta = if !track_id.is_empty() && !token.is_empty() {
-                    fetch_track_metadata(track_id, token).await
-                } else {
-                    None
-                };
-
-                let meta = meta.unwrap_or(TrackMetadata {
+                // Metadata now comes straight from the librespot session
+                // (the PresenceUpdate); there is no Web API fallback fetch.
+                let meta = SpotifyTrackInfo {
                     title: title.clone(),
                     artist: artist.clone(),
-                    album_art_url: None,
-                    spotify_track_id: track_id.clone(),
-                });
+                    album_art_url: album_art_url.clone(),
+                };
 
-                let embed = build_now_playing_embed(&meta, &spotify_name);
+                let embed = build_now_playing_embed(&meta, track_id, &spotify_name);
                 let buttons = build_controls_buttons(false);
                 let msg = CreateMessage::new().embed(embed).components(vec![buttons]);
 
@@ -908,6 +885,7 @@ async fn run_presence_loop_with_track(
                     *lock = Some(meta.clone());
                 }
                 last_meta = Some(meta);
+                last_track_id = track_id.clone();
                 last_spotify_name = spotify_name;
 
                 // DJ announcement AFTER embed (non-blocking, only if enabled)
@@ -929,10 +907,24 @@ async fn run_presence_loop_with_track(
                 });
                 } // end announce_enabled check
             }
-        } else if matches!(update, PresenceUpdate::Idle | PresenceUpdate::Paused) {
+        } else if matches!(update, PresenceUpdate::Idle | PresenceUpdate::Paused { .. }) {
             // Clear the dedup key on pause/stop so resuming the same track
             // reposts the now-playing card instead of being swallowed.
             last_track_key = None;
+            // A session that comes up already paused (bot restart mid-pause)
+            // never sends Playing, so /np would show nothing — seed it here.
+            if let PresenceUpdate::Paused { title, artist, track_id } = &update {
+                if last_meta.is_none() {
+                    let meta = SpotifyTrackInfo {
+                        title: title.clone(),
+                        artist: artist.clone(),
+                        album_art_url: None,
+                    };
+                    *last_meta_store.lock() = Some(meta.clone());
+                    last_meta = Some(meta);
+                    last_track_id = track_id.clone();
+                }
+            }
         }
     }
 }
@@ -1017,13 +1009,14 @@ impl EventHandler for Handler {
             let announce_presence = self.announce_enabled.clone();
             let priority_item = self.active_priority_item.clone();
             let last_meta_store = self.last_spotify_meta.clone();
+            let spotify_paused = self.spotify_paused.clone();
             tokio::spawn(async move {
                 run_presence_loop_with_track(
                     ctx_presence, rx, track_handle_store, active_session,
                     text_channel_id, controls_id, np_id,
                     dj_presence, announce_presence,
                     bridge_presence, priority_item,
-                    last_meta_store,
+                    last_meta_store, spotify_paused,
                 ).await;
             });
         }
@@ -1109,6 +1102,11 @@ impl EventHandler for Handler {
                 lock.as_ref().map(|s| s.access_token.clone())
             };
 
+            let spirc_tx = {
+                let lock = self.spirc_cmd_tx.lock();
+                lock.clone()
+            };
+
             let priority_playing = {
                 let lock = self.active_priority_item.lock();
                 lock.is_some()
@@ -1133,14 +1131,14 @@ impl EventHandler for Handler {
                         // Sending Spotify "previous" here would silently move
                         // the paused baseline session under the active item.
                         "⏮ Previous isn't available during queue playback.".to_string()
-                    } else if let Some(token) = &access_token {
-                        if spotify_playback_command(token, "POST", "previous").await {
+                    } else if let Some(tx) = &spirc_tx {
+                        if tx.send(SpircCommand::Previous).is_ok() {
                             "⏮ Previous".to_string()
                         } else {
                             "⚠ Spotify didn't accept that — try again.".to_string()
                         }
                     } else {
-                        "No active session".to_string()
+                        "No active Spotify session.".to_string()
                     }
                 }
                 // Same semantics as /skip: cancel the current priority item
@@ -1162,28 +1160,15 @@ impl EventHandler for Handler {
                             let _ = self.text_channel_id.edit_message(&ctx, mid, edit).await;
                         }
                         if current { "▶ Resumed".to_string() } else { "⏸ Paused".to_string() }
-                    } else if let Some(token) = &access_token {
-                        let handle_clone = {
-                            let lock = self.track_handle.lock();
-                            lock.as_ref().cloned()
-                        };
-                        let is_paused = if let Some(h) = handle_clone {
-                            h.get_info().await
-                                .map(|info| info.playing == songbird::tracks::PlayMode::Pause)
-                                .unwrap_or(false)
-                        } else {
-                            false
-                        };
-                        let ok = if is_paused {
-                            spotify_playback_command(token, "PUT", "play").await
-                        } else {
-                            spotify_playback_command(token, "PUT", "pause").await
-                        };
+                    } else if let Some(tx) = &spirc_tx {
+                        let is_paused = *self.spotify_paused.lock();
+                        let cmd = if is_paused { SpircCommand::Play } else { SpircCommand::Pause };
+                        let ok = tx.send(cmd).is_ok();
                         if !ok { "⚠ Spotify didn't accept that — try again.".to_string() }
                         else if is_paused { "▶ Resumed".to_string() }
                         else { "⏸ Paused".to_string() }
                     } else {
-                        "No active session".to_string()
+                        "No active Spotify session.".to_string()
                     }
                 }
                 "ctrl_queue_hint" => {
@@ -2048,19 +2033,19 @@ impl Handler {
             }
             "⏭ Skipped.".to_string()
         } else {
-            let access_token = {
-                let lock = self.active_session.lock();
-                lock.as_ref().map(|s| s.access_token.clone())
+            let spirc_tx = {
+                let lock = self.spirc_cmd_tx.lock();
+                lock.clone()
             };
-            match access_token {
-                Some(token) => {
-                    if spotify_playback_command(&token, "POST", "next").await {
+            match spirc_tx {
+                Some(tx) => {
+                    if tx.send(SpircCommand::Next).is_ok() {
                         "⏭ Skipped.".to_string()
                     } else {
                         "⚠ Spotify didn't accept the skip — try again.".to_string()
                     }
                 }
-                None => "Nothing is playing.".to_string()
+                None => "No active Spotify session.".to_string()
             }
         }
     }
@@ -2104,7 +2089,10 @@ impl Handler {
                     lock.clone()
                 };
                 match meta {
-                    Some(m) => format!("🎵 Now playing: **{}** — {} (Spotify session: {})", m.title, m.artist, name),
+                    Some(m) => {
+                        let prefix = if *self.spotify_paused.lock() { "⏸ Paused" } else { "🎵 Now playing" };
+                        format!("{}: **{}** — {} (Spotify session: {})", prefix, m.title, m.artist, name)
+                    }
                     None => format!("Spotify session: {} — nothing played yet.", name),
                 }
             }
@@ -2209,9 +2197,11 @@ impl Handler {
         }
     }
 
-    /// Fetch the Spotify display name and persist device-flow tokens for this
-    /// user with the given active flag. Returns `(display_name, refresh_token)`,
-    /// or the reply to send when the tokens can't be stored.
+    /// Persist device-flow tokens for this user with the given active flag,
+    /// using the Discord display name as the shown Spotify name (the Web API
+    /// profile lookup is gone — it 429s under the desktop client ID). Returns
+    /// `(display_name, refresh_token)`, or the reply to send when the tokens
+    /// can't be stored.
     async fn save_device_creds(
         &self,
         user_id: &str,
@@ -2222,13 +2212,7 @@ impl Handler {
         let Some(refresh_token) = token.refresh_token.clone() else {
             return Err("Spotify didn't return a refresh token. Run `/login` again.".to_string());
         };
-        let display_name = match self.oauth.get_user_profile(&token.access_token).await {
-            Ok(name) => name,
-            Err(e) => {
-                tracing::warn!(error = %e, "profile fetch failed");
-                "Unknown".to_string()
-            }
-        };
+        let display_name = discord_username.to_string();
         let creds = UserCredentials {
             discord_user_id: user_id.to_string(),
             discord_name: discord_username.to_string(),
@@ -2413,44 +2397,28 @@ impl Handler {
             None => return "Couldn't parse a Spotify track from that input. Use a URL like `https://open.spotify.com/track/...` or `spotify:track:...`".to_string(),
         };
 
-        let access_token = {
-            let lock = self.active_session.lock();
-            lock.as_ref().map(|s| s.access_token.clone())
+        let spirc_tx = {
+            let lock = self.spirc_cmd_tx.lock();
+            lock.clone()
         };
 
-        let token = match access_token {
+        let tx = match spirc_tx {
             Some(t) => t,
-            None => return "No active Spotify session. Use /login first.".to_string(),
+            None => return "No active Spotify session.".to_string(),
         };
 
         let uri = format!("spotify:track:{}", track_id);
-        let client = crate::spotify::webapi::client();
-        let url = format!(
-            "https://api.spotify.com/v1/me/player/queue?uri={}",
-            crate::oauth::pct_encode(&uri)
-        );
-
-        match client
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", token))
-            .header("Content-Length", "0")
-            .send()
-            .await
-        {
-            Ok(resp) => {
-                let status = resp.status().as_u16();
-                if status == 204 || status == 200 {
-                    "✅ Added to queue!".to_string()
-                } else {
-                    let body = resp.text().await.unwrap_or_default();
-                    tracing::warn!(status, body = %body, "queue API error");
-                    format!("Failed to add to queue (HTTP {})", status)
-                }
-            }
+        let spotify_uri = match librespot_core::SpotifyUri::from_uri(&uri) {
+            Ok(u) => u,
             Err(e) => {
-                tracing::warn!(error = ?e, "queue API request failed");
-                "Failed to reach Spotify API.".to_string()
+                tracing::warn!(error = %e, uri = %uri, "failed to parse Spotify track URI");
+                return "Couldn't parse that as a Spotify track.".to_string();
             }
+        };
+
+        match tx.send(SpircCommand::AddToQueue(spotify_uri)) {
+            Ok(()) => format!("✅ Queued on Spotify: {}", uri),
+            Err(_) => "No active Spotify session.".to_string(),
         }
     }
 }
@@ -2535,6 +2503,7 @@ impl DiscordBot {
                 announce_persisted.as_deref() == Some("1"),
             )),
             last_spotify_meta: Arc::new(Mutex::new(None)),
+            spotify_paused: Arc::new(Mutex::new(false)),
             play_cooldowns: Arc::new(Mutex::new(HashMap::new())),
             auto_start_attempted: AtomicBool::new(false),
         };
