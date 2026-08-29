@@ -11,7 +11,7 @@ what NOT to bring across.
 2. **YouTube branch** — merged into v0.5 (yt-dlp/ffmpeg, mixed queue, DJ TTS).
 3. **Quality bar** — full audit burn-down (2 audits, 8 lenses each).
 4. **Authorization** — nob's rule: sharing the bot's voice channel is required
-   to control playback (buttons, `/queue`, `/play`, `/skip`, `/stop`, and
+   to control playback (buttons, `/play`, `/queue`, `/skip`, `/stop`, and
    taking over a session via `/login`). Deliberate exceptions: when the bot is
    not yet in voice, `/play` accepts a requester in any voice channel and the
    bot joins them (fresh-boot path); `/announce` is a guild-level toggle, not
@@ -35,7 +35,7 @@ what NOT to bring across.
 7. **Discovery (mDNS)** — deleted. OAuth-only, like nob.
 8. **Token refresh** — proactive (single-owner task, `expires_in` − 5 min) plus
    an early-refresh Notify signal from the librespot task on session death.
-9. **Tests** — nob-style, portable (101 unit tests).
+9. **Tests** — nob-style, portable (103 unit tests).
 10. **Docs** — full rewrite + this file.
 11. **Songbird/DAVE** — songbird 0.6 stable (same as nob), not the fork.
 12. **Kickoff** — plan → merge → burn down by slice, each slice deployable.
@@ -49,6 +49,15 @@ what NOT to bring across.
     (rev `1599145`, 2026-08-22) instead of crates.io `0.8`. Bump to the next
     crates.io release (0.9+) once `add_to_queue` and the device-auth fixes
     ship there; drop the git pin at the same time.
+14. **Unified `/play` + `/queue`; priority items wait for track end** — one
+    verb per intent: `/play` starts playback if nothing is playing and
+    otherwise enqueues (`next:true` jumps the queue); `/queue` always
+    enqueues and never starts playback. Both accept Spotify, YouTube,
+    SoundCloud, and file attachments. A queued item interrupting a track
+    mid-playback surprised users, so the priority-queue manager now waits
+    for `EndOfTrack` before draining a queued item, and resumes Spotify
+    afterwards only if it was playing before (`SpotifyState`: `Idle` /
+    `Playing` / `Paused`, fed by `PresenceUpdate`).
 
 ## Module map: spotibot → nob-music
 
@@ -58,7 +67,7 @@ nob-music's internal modules are laid out in nob's `ARCHITECTURE.md`. The mappin
 |---|---|---|
 | `src/oauth/mod.rs` | `spotify` (OAuth client) | device flow: `request_device_code` / `poll_device_token` / `refresh` — port as-is. |
 | `src/users/mod.rs` + `crypto.rs` | `spotify` (credential store) + nob-core db | Table schema already matches nob's `spotify_credentials`. See "storage" below. |
-| `src/spotify/player.rs` | `spotify` (session lifecycle) | `run_with_token` = the Spirc lifecycle. Drop `SpotifyPlayer` struct-of-statics for a module. Also owns playback control: a `SpircCommand` channel (`Play`/`Pause`/`Next`/`Previous`/`AddToQueue`) is applied to the live `Spirc` — port this channel, not a Web API client. |
+| `src/spotify/player.rs` | `spotify` (session lifecycle) | `run_with_token` = the Spirc lifecycle. Drop `SpotifyPlayer` struct-of-statics for a module. Also owns playback control: a `SpircCommand` channel (`Play`/`Pause`/`Next`/`Previous`/`AddToQueue`/`Load`) is applied to the live `Spirc` — port this channel, not a Web API client. |
 | `src/spotify/sink.rs` | nob-audio (DSP) + `spotify` (sink) | Biquad/DSP belongs in nob-audio (already has DSP); the `Sink` impl stays in music. |
 | `src/spotify/metadata.rs` | *(deleted)* | Was a raw reqwest Web API track fetch; removed — track metadata now comes from librespot's `PlayerEvent::TrackChanged` (see decision #13). Nothing to port. |
 | `src/audio_bridge.rs` | nob-audio (ring buffer) | nob-audio already has a tested ring buffer — reconcile, keep nob's, port the even-frame parity guard if missing. |
@@ -67,8 +76,8 @@ nob-music's internal modules are laid out in nob's `ARCHITECTURE.md`. The mappin
 | `src/discord/voice.rs` | `voice` | `SimpleBridgeReader` = the Songbird source adapter. |
 | `src/presence.rs` | `presence` (or a shared-types module) | The shared `PresenceUpdate` enum (`Idle` / `Paused { title, artist, track_id }` / `Playing { title, artist, track_id, album_art_url }`, sourced from `PlayerEvent::TrackChanged` — no `access_token`) — both the player-event side and `src/discord/presence.rs` depend on it; give it an explicit home. |
 | `src/discord/presence.rs` | `presence` | Bot status text. |
-| `src/discord/bot.rs` | **split across `commands`/`actions`/`panel`/`player`** | **Do NOT port wholesale** — see below. |
-| `src/queue.rs` | `queue` | Priority queue (DJ overlay > queue interrupts > Spotify baseline). Capped at `MAX_QUEUE_LEN = 500` (matches nob's unified-queue cap); `push()` is fallible (`-> bool`), rejecting at capacity. |
+| `src/discord/bot.rs` | **split across `commands`/`actions`/`panel`/`player`** | **Do NOT port wholesale** — see below. `handle_play`/`handle_queue` implement decision #14; the priority-queue manager reads `SpotifyState` off the handler (kept fresh by the presence loop) to decide whether a drain should resume Spotify afterwards. |
+| `src/queue.rs` | `queue` | Priority queue (DJ overlay > queue > Spotify baseline; queue items wait for `EndOfTrack`, see decision #14). Capped at `MAX_QUEUE_LEN = 500` (matches nob's unified-queue cap); `push()` is fallible (`-> bool`), rejecting at capacity; `push_front()` inserts at the head for `/play next:true`. |
 | `src/youtube/*` | `youtube` | yt-dlp feeder + metadata. Cookies/age-gate contract: `--cookies` is passed only when the file exists on disk (both metadata and feeder paths); after metadata succeeds there is NO `age_limit` reject (reaching metadata means cookies already unlocked the video); the no-cookie age-gate failure is classified from stderr into an actionable `AgeRestricted` error pointing the admin at `YOUTUBE_COOKIES`. |
 | `src/config.rs` | nob-core config | Merge the Spotify/token keys into nob's config struct. Also capture the five module-local env reads that bypass `config.rs`: `YOUTUBE_COOKIES` (default `/var/lib/spotibot/youtube-cookies.txt`) and `YOUTUBE_TMP_DIR` (default `/tmp/spotibot-youtube`) in `youtube/mod.rs`, `DJ_CLIPS_DIR` / `DJ_CACHE_DIR` and `KOKORO_SOCKET` in `audio/dj.rs`. |
 | `src/setup.rs` | (drop) | The CLI wizard is a spotibot-local convenience; nob is VPS-deployed. |

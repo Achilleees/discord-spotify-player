@@ -13,7 +13,7 @@ channel. This repo is the hardened reference for nob's music stack — see
 
 ## Build and run
 - `cargo build --release`; binary is `target\release\discord-spotify-player.exe`.
-- `cargo check` for fast feedback; `cargo test` (101 unit tests); `cargo clippy`.
+- `cargo check` for fast feedback; `cargo test` (103 unit tests); `cargo clippy`.
 - First-run setup: `--setup` writes `.env`. OAuth needs no config.
 - `.cargo/config.toml` (tracked) carries the cmake fix; MSVC toolchain on Windows.
 
@@ -48,7 +48,7 @@ channel. This repo is the hardened reference for nob's music stack — see
   don't add others.
 
 ## Authorization
-- Controlling playback (buttons, `/queue`, `/play`, `/skip`, `/stop`, session
+- Controlling playback (buttons, `/play`, `/queue`, `/skip`, `/stop`, session
   takeover) requires sharing the bot's voice channel. Exceptions: `/play` with
   the bot out of voice needs only *some* voice channel (the bot follows the
   requester in); `/announce` is a guild-level toggle, not gated.

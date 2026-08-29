@@ -21,7 +21,10 @@ DJ TTS (Kokoro) ── overlay ───────────┘ (mixes on to
   for Songbird. Prebuffers on first read (honors `PREBUFFER_SECONDS`), then
   pulls from the bridge.
 - **Priority model** (`src/queue.rs`, managed in `bot.rs`): DJ overlay > queue
-  items (YouTube/SoundCloud/files) interrupt > Spotify Connect baseline.
+  items (YouTube/SoundCloud/files) > Spotify Connect baseline. A queued item
+  never interrupts a playing Spotify track — the priority-queue manager waits
+  for `EndOfTrack` before draining, then resumes Spotify afterwards only if it
+  was playing before.
 
 ## Spotify path (librespot + OAuth)
 
@@ -33,8 +36,8 @@ DJ TTS (Kokoro) ── overlay ───────────┘ (mixes on to
   `src/spotify/player.rs`: `run_with_token` drives the Spirc
   session lifecycle (15s `Spirc::new` timeout, reconnect loop, event → presence).
   It also owns playback control: `SpircCommand`
-  (`Play`/`Pause`/`Next`/`Previous`/`AddToQueue`) arrives over a channel and is
-  applied to the live `Spirc` — no calls to api.spotify.com.
+  (`Play`/`Pause`/`Next`/`Previous`/`AddToQueue`/`Load`) arrives over a
+  channel and is applied to the live `Spirc` — no calls to api.spotify.com.
 - Track metadata comes from librespot itself: `PlayerEvent::TrackChanged`
   carries the `AudioItem` (title, artist, track_id, album art), which feeds
   `PresenceUpdate` directly. There is no separate metadata fetch.
@@ -43,7 +46,7 @@ DJ TTS (Kokoro) ── overlay ───────────┘ (mixes on to
 ## Discord path (serenity + songbird)
 
 - `src/discord/bot.rs`: gateway handler, slash commands (`/login`, `/logout`,
-  `/forget`, `/who`, `/queue`, `/play`, `/skip`, `/stop`, `/np`, `/announce`),
+  `/forget`, `/who`, `/play`, `/queue`, `/skip`, `/stop`, `/np`, `/announce`),
   button interactions, now-playing/controls embeds, priority-queue manager, the
   voice-join + auto-leave logic, and `spawn_session`.
 - `src/discord/voice.rs`: bridge reader + Songbird track events.

@@ -25,7 +25,7 @@ playback is controlled from Spotify clients or from buttons in Discord.
   follows the user into their channel.
 - A now-playing text channel: rich embeds with album art, plus prev/pause/next
   buttons and a queue view.
-- `/queue`, `/play` (YouTube/SoundCloud/file), `/skip`, `/stop`, `/np`.
+- `/play`, `/queue` (Spotify, YouTube/SoundCloud/file), `/skip`, `/stop`, `/np`.
 - Optional DJ track announcements via a Kokoro TTS backend, toggled with
   `/announce` (persists across restarts).
 - Auto-starts the last active user's session on boot; auto-leaves and
@@ -39,16 +39,17 @@ playback is controlled from Spotify clients or from buttons in Discord.
 | `/logout` | Stop and deactivate your session (credentials kept) | no |
 | `/forget` | Delete your stored credentials | no |
 | `/who` | Show the active DJ | no |
-| `/queue <url>` | Add a Spotify track to the queue (via Spotify Connect, sent straight to the session) | yes |
-| `/play <url>` | Queue a YouTube/SoundCloud/file track (priority queue, separate from Spotify Connect) | yes (see below) |
+| `/play <url \| file> [next]` | Spotify/YouTube/SoundCloud URL or an audio attachment. Starts playback if nothing is playing; otherwise enqueues (`next:true` puts it at the front — Spotify links reject `next` since Spotify's own queue already plays it next) | yes (see below) |
+| `/queue [url \| file]` | Always enqueues, never starts playback; with no argument, shows the queue | yes |
 | `/skip` `/stop` | Skip / stop playback | yes |
 | `/np` | Now playing (or "Paused" if the active session isn't playing) | no |
 | `/announce` | Toggle DJ track announcements | no |
 
-Playback control (buttons, `/queue`, `/play`, `/skip`, `/stop`) requires sharing
+Playback control (buttons, `/play`, `/queue`, `/skip`, `/stop`) requires sharing
 the bot's voice channel. Exception: when the bot isn't in voice yet, `/play`
 only requires the requester to be in *some* voice channel — the bot joins them
-(the fresh-boot path).
+(the fresh-boot path). Queued YouTube/SoundCloud/file items never interrupt a
+playing Spotify track — they play once the current track ends.
 
 ## Requirements
 
@@ -95,6 +96,6 @@ pipeline stats emit at `debug` on the `audio_stream` target every 5s.
 
 ## Development
 
-`cargo check` for fast feedback, `cargo test` (101 unit tests), `cargo clippy`.
+`cargo check` for fast feedback, `cargo test` (103 unit tests), `cargo clippy`.
 `.cargo/config.toml` carries a cmake fix required by native deps; the MSVC
 toolchain is required on Windows.

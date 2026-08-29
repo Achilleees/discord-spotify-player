@@ -7,7 +7,7 @@ Guidance for Claude Code when working in this repository.
 A Rust Discord music bot (v0.5). It runs a per-user Spotify Connect session
 (librespot + OAuth device authorization) and also plays YouTube/SoundCloud/uploaded files, all
 streamed into one Discord voice channel. Control happens from Spotify clients,
-from Discord slash commands (`/login`, `/queue`, `/play`, `/skip`, `/stop`,
+from Discord slash commands (`/login`, `/play`, `/queue`, `/skip`, `/stop`,
 `/who`, `/np`, `/announce`, `/logout`, `/forget`), and from now-playing buttons.
 
 This repo is the hardened reference for the music stack of `never-off-beat`
@@ -22,7 +22,7 @@ target/release/discord-spotify-player.exe          # normal
 target/release/discord-spotify-player.exe --setup  # first-run wizard
 ```
 
-`cargo check` for fast feedback, `cargo test` (101 unit tests), `cargo clippy`.
+`cargo check` for fast feedback, `cargo test` (103 unit tests), `cargo clippy`.
 
 ### Prerequisites
 - MSVC toolchain (native deps: opus, cmake). `.cargo/config.toml` (tracked)
@@ -57,8 +57,11 @@ Spotify / YouTube / files / DJ ─> AudioBridge ─> SimpleBridgeReader ─> Son
   stereo; drains/drops on even stereo frames.
 - **SimpleBridgeReader** (`src/discord/voice.rs`): Songbird source; prebuffers
   per `PREBUFFER_SECONDS`.
-- Priority: DJ overlay > queue (YT/SC/files) > Spotify Connect baseline
-  (`src/queue.rs` + the priority-queue manager in `bot.rs`).
+- Priority: DJ overlay > queue (YT/SC/files) > Spotify Connect baseline. A
+  queued item never interrupts a playing Spotify track — it waits for the
+  track to end (EndOfTrack-driven drain), then resumes Spotify afterwards
+  only if Spotify was playing before (`src/queue.rs` + the priority-queue
+  manager in `bot.rs`).
 
 ### Startup (`src/main.rs`)
 1. Init logging from `RUST_LOG`.
@@ -73,9 +76,9 @@ Spotify / YouTube / files / DJ ─> AudioBridge ─> SimpleBridgeReader ─> Son
   manager, spawns the librespot task (`run_with_token`) and a proactive
   token-refresher (single owner of the refresh cycle). One active DJ; takeover
   requires being in the bot's voice channel. Playback control (buttons,
-  `/skip`, `/queue` for Spotify tracks) goes straight to the live Spirc via
-  `SpircCommand` (`Play`/`Pause`/`Next`/`Previous`/`AddToQueue`) — no calls to
-  api.spotify.com.
+  `/skip`, `/play`/`/queue` for Spotify tracks) goes straight to the live
+  Spirc via `SpircCommand` (`Play`/`Pause`/`Next`/`Previous`/`AddToQueue`/
+  `Load`) — no calls to api.spotify.com.
 
 ### OAuth + storage
 - `src/oauth/mod.rs`: device authorization grant (RFC 8628) on Spotify's
