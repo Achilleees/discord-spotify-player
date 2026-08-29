@@ -430,6 +430,12 @@ impl SpotifyPlayer {
                                 }
                             }
                             Some(SpircCommand::Load(uri)) => {
+                                // Loading is ignored unless this device is
+                                // the active Connect device; claim it first
+                                // (a no-op when already active).
+                                if let Err(e) = spirc.activate() {
+                                    tracing::warn!(error = ?e, "spirc activate failed");
+                                }
                                 let req = LoadRequest::from_tracks(
                                     vec![uri.to_uri()],
                                     LoadRequestOptions {

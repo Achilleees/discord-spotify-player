@@ -24,6 +24,8 @@ pub enum YoutubeError {
     AgeRestricted,
     #[error("This track is unavailable.")]
     Unavailable,
+    #[error("This track is DRM-protected and can't be played.")]
+    DrmProtected,
     #[error("Track too long (max {0} min). Use Spotify for long content.")]
     TooLong(u64),
     #[error("Live streams aren't supported.")]
@@ -100,6 +102,9 @@ fn classify_ytdlp_stderr(stderr: &str) -> YoutubeError {
     let s = stderr.to_lowercase();
     if s.contains("age") && (s.contains("sign in") || s.contains("confirm your age")) {
         return YoutubeError::AgeRestricted;
+    }
+    if s.contains("drm protected") {
+        return YoutubeError::DrmProtected;
     }
     if s.contains("unavailable") || s.contains("private") || s.contains("removed") {
         return YoutubeError::Unavailable;
@@ -267,6 +272,14 @@ mod tests {
         assert!(matches!(
             classify_ytdlp_stderr("ERROR: something about age"),
             YoutubeError::Network(_)
+        ));
+    }
+
+    #[test]
+    fn classifies_drm_protected() {
+        assert!(matches!(
+            classify_ytdlp_stderr("ERROR: [soundcloud] 2119293606: This video is DRM protected"),
+            YoutubeError::DrmProtected
         ));
     }
 
