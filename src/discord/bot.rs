@@ -1506,8 +1506,8 @@ impl Handler {
             return;
         };
 
-        tracing::info!(spotify = %user.spotify_username, "auto-starting stored session");
-        println!("Auto-starting Spotify session for {}...", user.spotify_username);
+        tracing::info!(spotify = %user.discord_name, "auto-starting stored session");
+        println!("Auto-starting Spotify session for {}...", user.discord_name);
 
         // A refresh failure at boot means the stored credentials are stale or
         // revoked; retrying with the expired token would just burn reconnect
@@ -1536,7 +1536,7 @@ impl Handler {
                     if let Some(ctx) = ctx {
                         let msg = CreateMessage::new().content(format!(
                             "⚠️ Couldn't restore **{}**'s Spotify session (stored credentials expired). Run `/login` to reconnect.",
-                            user.spotify_username
+                            user.discord_name
                         ));
                         let _ = self.text_channel_id.send_message(&ctx, msg).await;
                     }
@@ -1546,7 +1546,7 @@ impl Handler {
 
         self.spawn_session(
             discord_user_id,
-            user.spotify_username,
+            user.discord_name.clone(),
             user.discord_name,
             access_token,
             refresh_token,
@@ -2169,17 +2169,17 @@ impl Handler {
                 }
                 self.spawn_session(
                     user_id_u64,
-                    existing.spotify_username.clone(),
+                    existing.discord_name.clone(),
                     discord_username.to_string(),
                     new_token.access_token,
                     creds.refresh_token.clone(),
                     expires_in,
                 )
                 .await;
-                tracing::info!(user = %user_id, spotify = %existing.spotify_username, "session reactivated");
+                tracing::info!(user = %user_id, spotify = %existing.discord_name, "session reactivated");
                 format!(
                     "Session (re)started for **{}**! Pick **{}** in Spotify's device list to play.",
-                    existing.spotify_username, self.config.device_name
+                    existing.discord_name, self.config.device_name
                 )
             }
             Err(e) => {
@@ -2191,7 +2191,7 @@ impl Handler {
                 let _ = self.user_store.deactivate(user_id);
                 format!(
                     "Your stored Spotify session for **{}** can't be refreshed — run `/login` again to re-authorize.",
-                    existing.spotify_username
+                    existing.discord_name
                 )
             }
         }
