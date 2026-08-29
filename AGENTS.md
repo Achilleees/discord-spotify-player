@@ -1,8 +1,9 @@
 # AGENTS.md
 
-A Discord music bot: per-user Spotify (via librespot + OAuth PKCE), plus
-YouTube/SoundCloud/files, streamed into one voice channel. This repo is the
-hardened reference for nob's music stack — see `PORT.md` before large changes.
+A Discord music bot: per-user Spotify (via librespot + OAuth device
+authorization), plus YouTube/SoundCloud/files, streamed into one voice
+channel. This repo is the hardened reference for nob's music stack — see
+`PORT.md` before large changes.
 
 ## Safety and secrets
 - Never print or paste values from `.env`, `spotibot.db`, or `.spotify_cache/`.
@@ -12,8 +13,8 @@ hardened reference for nob's music stack — see `PORT.md` before large changes.
 
 ## Build and run
 - `cargo build --release`; binary is `target\release\discord-spotify-player.exe`.
-- `cargo check` for fast feedback; `cargo test` (111 unit tests); `cargo clippy`.
-- First-run setup: `--setup` writes `.env`. OAuth also needs `SPOTIFY_CLIENT_ID`.
+- `cargo check` for fast feedback; `cargo test` (105 unit tests); `cargo clippy`.
+- First-run setup: `--setup` writes `.env`. OAuth needs no config.
 - `.cargo/config.toml` (tracked) carries the cmake fix; MSVC toolchain on Windows.
 
 ## Architecture (see `docs/components.md`)

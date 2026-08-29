@@ -1,3 +1,7 @@
+> **2026-08-29:** decision #5 (OAuth PKCE + paste-back) is superseded by the
+> device authorization flow — see PORT.md. The rest of this document is a
+> historical record.
+
 # Spotibot v0.5 — Hardening & Port-Readiness Plan
 
 **Written:** 2026-07-10 · **Basis:** full 8-lens audit of `main@9ae78db` (124 confirmed findings, ~30 unique issues) + 12 locked design decisions.

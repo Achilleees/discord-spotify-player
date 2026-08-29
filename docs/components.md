@@ -25,9 +25,11 @@ DJ TTS (Kokoro) ── overlay ───────────┘ (mixes on to
 
 ## Spotify path (librespot + OAuth)
 
-- OAuth-only (Authorization Code + PKCE); mDNS discovery was removed in v0.5.
-- `src/oauth/mod.rs`: PKCE flow, `parse_redirect`, `new_pkce`, token refresh,
-  profile fetch. `src/spotify/player.rs`: `run_with_token` drives the Spirc
+- OAuth-only (device authorization grant, RFC 8628); mDNS discovery was
+  removed in v0.5.
+- `src/oauth/mod.rs`: `request_device_code`, `poll_device_token`, token
+  refresh, profile fetch — all against Spotify's desktop client id.
+  `src/spotify/player.rs`: `run_with_token` drives the Spirc
   session lifecycle (15s `Spirc::new` timeout, reconnect loop, event → presence).
 - `src/spotify/metadata.rs`: Spotify Web API track metadata for embeds.
 - Sessions: one active DJ; a proactive refresher task keeps the token fresh.

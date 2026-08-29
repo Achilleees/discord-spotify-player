@@ -16,8 +16,18 @@ what NOT to bring across.
    not yet in voice, `/play` accepts a requester in any voice channel and the
    bot joins them (fresh-boot path); `/announce` is a guild-level toggle, not
    playback control, and is ungated so it can be set before the bot joins.
-5. **OAuth** — Authorization Code + PKCE (no client secret). Paste-back UX,
-   hardened: validated `state`, tolerant parser, 10-min pending expiry.
+5. **OAuth** — device authorization grant (RFC 8628) on Spotify's desktop
+   client id (no app of our own, no client secret). Since 2026-08-10 Spotify
+   rejects playback for tokens minted by third-party client IDs
+   (librespot#1737); the desktop client id is what Spotify's own clients use,
+   so tokens from it play. `/login` requests a device code, replies with a
+   link to spotify.com/pair and the short code, then polls
+   `accounts.spotify.com` inline inside the deferred interaction (10-min cap,
+   `DEVICE_LOGIN_MAX_WAIT`). The poll is cancellable by a newer `/login`,
+   `/logout`, or `/forget` via a per-user `Notify` (`Handler.pending_auth`).
+   After the poll succeeds, the take-over rule (must share the bot's voice
+   channel to evict the active DJ) is re-checked; on failure the tokens are
+   stored inactive and the user re-runs `/login` to activate.
 6. **Token storage** — SQLite `spotify_credentials` table, tokens in an
    encrypted `auth_blob` (XChaCha20-Poly1305; key = PBKDF2-HMAC-SHA256 of
    `TOKEN_ENC_KEY`, 600,000 iterations, fixed app salt
@@ -36,7 +46,7 @@ nob-music's internal modules are laid out in nob's `ARCHITECTURE.md`. The mappin
 
 | spotibot file | nob-music target | Notes |
 |---|---|---|
-| `src/oauth/mod.rs` | `spotify` (OAuth client) | PKCE flow + `parse_redirect` + `new_pkce` port as-is. |
+| `src/oauth/mod.rs` | `spotify` (OAuth client) | device flow: `request_device_code` / `poll_device_token` / `refresh` — port as-is. |
 | `src/users/mod.rs` + `crypto.rs` | `spotify` (credential store) + nob-core db | Table schema already matches nob's `spotify_credentials`. See "storage" below. |
 | `src/spotify/player.rs` | `spotify` (session lifecycle) | `run_with_token` = the Spirc lifecycle. Drop `SpotifyPlayer` struct-of-statics for a module. |
 | `src/spotify/sink.rs` | nob-audio (DSP) + `spotify` (sink) | Biquad/DSP belongs in nob-audio (already has DSP); the `Sink` impl stays in music. |
@@ -79,13 +89,13 @@ nob-music's internal modules are laid out in nob's `ARCHITECTURE.md`. The mappin
   forever on `cmd_rx.recv()` while the session died underneath it. After a
   session, `spirc.shutdown()` then drop.
 - **Unrefreshable stored tokens must self-heal.** Some stored refresh tokens
-  can never refresh under PKCE (revoked, or minted pre-PKCE with the client
-  secret — the v0.4→v0.5 live-VPS failure). On auto-start refresh failure:
-  deactivate the stored row and post a `/login` prompt to the text channel.
-  On reactivation failure: deactivate and fall through to a fresh PKCE
-  authorize URL (`issue_login_url`) instead of dead-ending the user into
-  `/forget` + `/login`. Never leave a dead row active and silently retry it
-  every boot.
+  can never refresh (revoked, or minted before a client-id change — the
+  v0.4→v0.5 live-VPS failure, and again the 2026-08-10 third-party-client-ID
+  crackdown that forced the PKCE→device-flow switch). On auto-start refresh
+  failure: deactivate the stored row and post a `/login` prompt to the text
+  channel. On reactivation failure: deactivate and fall through to
+  `/login → pair code` instead of dead-ending the user into `/forget` +
+  `/login`. Never leave a dead row active and silently retry it every boot.
 - **Never clear the bridge on `EndOfTrack`.** It is a natural track boundary —
   clearing there trims the tail of every auto-advancing track. Real stops are
   handled by `PlayerEvent::Stopped`; a priority-item drain clears the bridge
@@ -103,12 +113,13 @@ nob-music's internal modules are laid out in nob's `ARCHITECTURE.md`. The mappin
   healthy >1h Spirc session keeps streaming, but its captured access token
   expires — so metadata/buttons/queue 401 silently. Proactive refresh + reading
   the token fresh from `ActiveSession` at call time both matter.
-- **OAuth on a VPS.** Spotify redirects to `127.0.0.1` on the *user's* machine,
-  where nothing listens — hence the paste-back UX. The parser must handle the
-  schemeless URL the browser shows (`Url::parse` rejects a scheme starting with
-  a digit — prepend `http://`) and reject `?error=access_denied` instead of
-  treating the whole URL as a code. If nob ever gets a public HTTPS callback,
-  this whole dance goes away.
+- **Device flow needs no callback.** The old Authorization Code + PKCE flow
+  redirected to `127.0.0.1` on the *user's* machine, where nothing listens on
+  a headless box — hence the old paste-back UX. The device authorization
+  grant (RFC 8628) sidesteps that entirely: the bot requests a code, the user
+  enters it at spotify.com/pair on any device, and the bot polls for the
+  token. No listener, no redirect URI, no URL parsing, works the same on a VPS
+  as on a desktop.
 - **Pacing lives in the sink, not the reader.** `DiscordSink::write` sleeps/spins
   to real time; the reader's 10 ms sleep only fires on starvation. Don't move
   pacing to the reader.
@@ -141,7 +152,8 @@ audit's atomicity/corruption concerns are already handled by SQLite upserts).
 
 - Phase 1c credential storage: change "SQLite, encrypted" to name the scheme
   (XChaCha20-Poly1305, `TOKEN_ENC_KEY`).
-- OAuth: record the PKCE + paste-back UX decision and the schemeless-URL parse.
+- OAuth: record the device authorization grant (RFC 8628) decision and the
+  desktop-client-id rationale.
 - Refresh: record the single-owner proactive + Notify architecture.
 - Amend "Spotibot is reference only; everything from scratch" → "hardened
   spotibot modules transplant with adaptation" (the from-scratch doctrine
