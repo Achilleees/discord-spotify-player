@@ -8,7 +8,8 @@ use librespot_core::config::{DeviceType, SessionConfig};
 use librespot_core::session::Session;
 use librespot_core::SpotifyUri;
 use librespot_metadata::audio::item::{AudioItem, UniqueFields};
-use librespot_metadata::{Episode, Metadata, Track};
+use librespot_metadata::image::Images;
+use librespot_metadata::{Artist, Episode, Metadata, Track};
 use librespot_playback::config::PlayerConfig;
 use librespot_playback::mixer::softmixer::SoftMixer;
 use librespot_playback::mixer::{Mixer, MixerConfig};
@@ -22,8 +23,9 @@ const DEVICE_ID_FILE: &str = "device_id";
 const MAX_FAST_RECONNECTS: usize = 5;
 const MIN_STABLE_SESSION_SECS: u64 = 60;
 
-/// Commands the Discord layer (queue drains, /skip, /stop) sends to the
-/// active Spirc instance.
+/// Commands the Discord layer (queue drains, /skip, /stop, /np) sends to the
+/// active Spirc instance. Not `Debug`: `Lookup`'s reply channel is a
+/// `oneshot::Sender`, which isn't `Debug`.
 pub enum SpircCommand {
     Pause,
     Play,
@@ -32,6 +34,18 @@ pub enum SpircCommand {
     AddToQueue(SpotifyUri),
     /// Start playing this track now, replacing the current context.
     Load(SpotifyUri),
+    /// Resolve a track's title/artist/art through the live session; replies
+    /// `None` if unavailable.
+    Lookup(SpotifyUri, tokio::sync::oneshot::Sender<Option<TrackLookup>>),
+}
+
+/// Track metadata resolved through the live librespot session, for
+/// describing a track (e.g. `/np`) without calling any Web API.
+#[derive(Debug, Clone)]
+pub struct TrackLookup {
+    pub title: String,
+    pub artist: String,
+    pub album_art_url: Option<String>,
 }
 
 fn extract_track_id(uri: &SpotifyUri) -> String {
@@ -144,6 +158,32 @@ impl SpotifyPlayer {
         }
     }
 
+    /// All artists' names, joined — matching the Web API path the embeds
+    /// use, so bot status and embed can't disagree. Shared by
+    /// `fetch_track_info` and `lookup_track`.
+    fn join_artist_names<'a>(artists: impl IntoIterator<Item = &'a Artist>) -> String {
+        let names: Vec<_> = artists.into_iter().map(|a| a.name.clone()).collect();
+        if names.is_empty() {
+            "Unknown artist".to_string()
+        } else {
+            names.join(", ")
+        }
+    }
+
+    /// Largest-resolution cover art URL for a track/album's cover set.
+    /// Replicates the `{file_id}` template substitution
+    /// `librespot_metadata::audio::item::AudioItem::get_file` does
+    /// internally — that path isn't used here, so it has to be redone.
+    fn largest_cover_url(session: &Session, covers: &Images) -> Option<String> {
+        let template = session
+            .get_user_attribute("image-url")
+            .unwrap_or_else(|| String::from("https://i.scdn.co/image/{file_id}"));
+        covers
+            .iter()
+            .max_by_key(|c| c.width)
+            .map(|c| template.replace("{file_id}", &c.id.to_string()))
+    }
+
     async fn fetch_track_info(
         session: &Session,
         track_uri: &SpotifyUri,
@@ -151,23 +191,38 @@ impl SpotifyPlayer {
         match track_uri {
             SpotifyUri::Track { .. } => {
                 let track = Track::get(session, track_uri).await.ok()?;
-                // All artists, joined — matching the Web API path the embeds
-                // use, so bot status and embed can't disagree.
-                let artist_names: Vec<_> = track
-                    .artists
-                    .iter()
-                    .map(|a| a.name.clone())
-                    .collect();
-                let artist = if artist_names.is_empty() {
-                    "Unknown artist".to_string()
-                } else {
-                    artist_names.join(", ")
-                };
+                let artist = Self::join_artist_names(track.artists.iter());
                 Some((track.name, artist))
             }
             SpotifyUri::Episode { .. } => {
                 let episode = Episode::get(session, track_uri).await.ok()?;
                 Some((episode.name, "Podcast".to_string()))
+            }
+            _ => None,
+        }
+    }
+
+    /// Resolves title/artist/art for a track or episode through the live
+    /// session, backing `SpircCommand::Lookup`. No Web API call.
+    async fn lookup_track(session: &Session, uri: &SpotifyUri) -> Option<TrackLookup> {
+        match uri {
+            SpotifyUri::Track { .. } => {
+                let track = Track::get(session, uri).await.ok()?;
+                let artist = Self::join_artist_names(track.artists.iter());
+                let album_art_url = Self::largest_cover_url(session, &track.album.covers);
+                Some(TrackLookup {
+                    title: track.name,
+                    artist,
+                    album_art_url,
+                })
+            }
+            SpotifyUri::Episode { .. } => {
+                let episode = Episode::get(session, uri).await.ok()?;
+                Some(TrackLookup {
+                    title: episode.name,
+                    artist: "Podcast".to_string(),
+                    album_art_url: None,
+                })
             }
             _ => None,
         }
@@ -385,6 +440,10 @@ impl SpotifyPlayer {
                                 if let Err(e) = spirc.load(req) {
                                     tracing::warn!(error = ?e, "spirc load failed");
                                 }
+                            }
+                            Some(SpircCommand::Lookup(uri, reply)) => {
+                                let result = Self::lookup_track(&session, &uri).await;
+                                let _ = reply.send(result);
                             }
                             None => *spirc_cmd_rx = None, // all senders dropped; poll the task only
                         }

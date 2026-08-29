@@ -9,6 +9,7 @@ use crate::presence::PresenceUpdate;
 use crate::queue::{PriorityQueue, QueueItem, MediaSource};
 use crate::spotify::SpotifyPlayer;
 use crate::spotify::SpircCommand;
+use librespot_core::SpotifyUri;
 use crate::youtube::metadata::{fetch_youtube_metadata, validate_attachment};
 use crate::youtube::feeder::{feed_youtube_to_bridge, feed_file_to_bridge, FeederError};
 use crate::users::{UserCredentials, UserStore};
@@ -141,6 +142,10 @@ struct Handler {
     /// Last /play per user, for the metadata-probe cooldown.
     play_cooldowns: Arc<Mutex<HashMap<u64, Instant>>>,
     auto_start_attempted: AtomicBool,
+    /// The Spotify track (if any) already pre-armed via `AddToQueue` for
+    /// gap-free handoff at the head of `priority_queue` — see
+    /// `try_arm_head`/`head_action`. `None` when nothing is armed.
+    armed_spotify: Arc<Mutex<Option<SpotifyUri>>>,
 }
 
 /// The Spotify Connect baseline session's playback state, as last reported by
@@ -152,7 +157,352 @@ enum SpotifyState {
     Paused,
 }
 
+// --- Unified-queue head decision table (see PORT.md decision #15) ---
 
+/// What sits at the head of the priority queue: a Spotify track (and
+/// whether it's already pre-armed via `AddToQueue`), a media (YouTube/file)
+/// item, or nothing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum HeadKind {
+    Spotify { armed: bool },
+    Media,
+    Empty,
+}
+
+/// What provoked a `head_action`/`Handler::reconcile` check.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Trigger {
+    /// A `/play` or `/queue` push landed a new item (possibly at the head).
+    Enqueue,
+    /// The Spotify baseline's own `EndOfTrack` fired.
+    TrackEnd,
+    /// A priority-queue drain (YouTube/file item) just finished.
+    MediaEnd,
+    /// ⏭ / `/skip` with no media item actively playing.
+    Skip,
+    /// ▶ pressed while the Spotify baseline isn't playing.
+    PlayButton,
+}
+
+/// What `Handler::reconcile` should do about the current queue head.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum HeadAction {
+    /// Pre-arm the head via `AddToQueue` (see `try_arm_head`).
+    Arm,
+    /// Hand the head straight to Spotify (`AddToQueue`+`Next`, +`Play` if
+    /// paused), pop it, clear armed, then arm whatever's next.
+    Handoff,
+    /// `Load` the head now (Spotify is idle — no context to lose).
+    Load,
+    /// Run/continue a priority-queue drain of the media item at the head.
+    Drain,
+    /// Resume the Spotify baseline (`Play`).
+    ResumeSpotify,
+    /// Skip to the already-armed track (`Next`).
+    NextSpotify,
+    /// Resume the paused baseline without hijacking it, then try to arm.
+    ResumeThenArm,
+    /// Nothing to do.
+    Nothing,
+}
+
+/// Pure decision table mapping the queue head, the Spotify baseline's
+/// playback state, whether a media item is mid-playback, and what triggered
+/// the check, to the action to take. This is the single place unified-queue
+/// ordering behaviour is decided — every playback-affecting command and
+/// event funnels through it via `Handler::reconcile` (or the free-fn
+/// equivalents used where `&self` isn't available).
+fn head_action(head: HeadKind, spotify: SpotifyState, media_active: bool, trigger: Trigger) -> HeadAction {
+    use HeadAction::*;
+    match (trigger, head) {
+        (Trigger::Enqueue, HeadKind::Spotify { armed: false }) => {
+            if spotify == SpotifyState::Playing && !media_active { Arm } else { Nothing }
+        }
+        (Trigger::Enqueue, _) => Nothing,
+
+        (Trigger::TrackEnd, _) if media_active => Nothing,
+        (Trigger::TrackEnd, HeadKind::Spotify { armed: true }) => Nothing,
+        (Trigger::TrackEnd, HeadKind::Spotify { armed: false }) => Handoff,
+        (Trigger::TrackEnd, HeadKind::Media) => Drain,
+        (Trigger::TrackEnd, HeadKind::Empty) => Nothing,
+
+        (Trigger::MediaEnd, HeadKind::Spotify { armed: true }) => ResumeSpotify,
+        (Trigger::MediaEnd, HeadKind::Spotify { armed: false }) => Handoff,
+        (Trigger::MediaEnd, HeadKind::Media) => Nothing,
+        (Trigger::MediaEnd, HeadKind::Empty) => Nothing,
+
+        (Trigger::Skip, HeadKind::Spotify { armed: true }) => NextSpotify,
+        (Trigger::Skip, HeadKind::Spotify { armed: false }) => Handoff,
+        (Trigger::Skip, HeadKind::Media) => Drain,
+        (Trigger::Skip, HeadKind::Empty) => NextSpotify,
+
+        (Trigger::PlayButton, HeadKind::Spotify { armed: true }) => ResumeSpotify,
+        (Trigger::PlayButton, HeadKind::Spotify { armed: false }) => {
+            if spotify == SpotifyState::Idle { Load } else { ResumeThenArm }
+        }
+        (Trigger::PlayButton, HeadKind::Media) => Drain,
+        (Trigger::PlayButton, HeadKind::Empty) => ResumeSpotify,
+    }
+}
+
+#[cfg(test)]
+mod head_action_tests {
+    use super::{head_action, HeadAction, HeadKind, SpotifyState, Trigger};
+
+    const PLAYING: SpotifyState = SpotifyState::Playing;
+    const PAUSED: SpotifyState = SpotifyState::Paused;
+    const IDLE: SpotifyState = SpotifyState::Idle;
+    const SPOT_ARMED: HeadKind = HeadKind::Spotify { armed: true };
+    const SPOT_UNARMED: HeadKind = HeadKind::Spotify { armed: false };
+
+    #[test]
+    fn enqueue_arms_a_playing_idle_spotify_head() {
+        assert_eq!(head_action(SPOT_UNARMED, PLAYING, false, Trigger::Enqueue), HeadAction::Arm);
+    }
+
+    #[test]
+    fn enqueue_never_arms_while_media_is_active() {
+        assert_eq!(head_action(SPOT_UNARMED, PLAYING, true, Trigger::Enqueue), HeadAction::Nothing);
+    }
+
+    #[test]
+    fn enqueue_does_nothing_for_any_other_head() {
+        assert_eq!(head_action(SPOT_UNARMED, PAUSED, false, Trigger::Enqueue), HeadAction::Nothing);
+        assert_eq!(head_action(SPOT_UNARMED, IDLE, false, Trigger::Enqueue), HeadAction::Nothing);
+        assert_eq!(head_action(SPOT_ARMED, PLAYING, false, Trigger::Enqueue), HeadAction::Nothing);
+        assert_eq!(head_action(HeadKind::Media, PLAYING, false, Trigger::Enqueue), HeadAction::Nothing);
+        assert_eq!(head_action(HeadKind::Empty, PLAYING, false, Trigger::Enqueue), HeadAction::Nothing);
+    }
+
+    #[test]
+    fn track_end_leaves_an_armed_spotify_head_alone() {
+        assert_eq!(head_action(SPOT_ARMED, PLAYING, false, Trigger::TrackEnd), HeadAction::Nothing);
+    }
+
+    #[test]
+    fn track_end_hands_off_an_unarmed_spotify_head() {
+        assert_eq!(head_action(SPOT_UNARMED, PAUSED, false, Trigger::TrackEnd), HeadAction::Handoff);
+    }
+
+    #[test]
+    fn track_end_drains_a_media_head() {
+        assert_eq!(head_action(HeadKind::Media, PLAYING, false, Trigger::TrackEnd), HeadAction::Drain);
+    }
+
+    #[test]
+    fn track_end_does_nothing_while_media_is_active_racing_a_drain() {
+        assert_eq!(head_action(SPOT_UNARMED, PLAYING, true, Trigger::TrackEnd), HeadAction::Nothing);
+        assert_eq!(head_action(HeadKind::Media, PLAYING, true, Trigger::TrackEnd), HeadAction::Nothing);
+    }
+
+    #[test]
+    fn track_end_does_nothing_on_an_empty_queue() {
+        assert_eq!(head_action(HeadKind::Empty, PLAYING, false, Trigger::TrackEnd), HeadAction::Nothing);
+    }
+
+    #[test]
+    fn media_end_resumes_an_armed_spotify_head() {
+        assert_eq!(head_action(SPOT_ARMED, PAUSED, false, Trigger::MediaEnd), HeadAction::ResumeSpotify);
+    }
+
+    #[test]
+    fn media_end_hands_off_an_unarmed_spotify_head() {
+        assert_eq!(head_action(SPOT_UNARMED, PAUSED, false, Trigger::MediaEnd), HeadAction::Handoff);
+    }
+
+    #[test]
+    fn media_end_does_nothing_on_an_empty_queue() {
+        assert_eq!(head_action(HeadKind::Empty, PLAYING, false, Trigger::MediaEnd), HeadAction::Nothing);
+    }
+
+    #[test]
+    fn skip_jumps_to_an_armed_spotify_head() {
+        assert_eq!(head_action(SPOT_ARMED, PLAYING, false, Trigger::Skip), HeadAction::NextSpotify);
+    }
+
+    #[test]
+    fn skip_hands_off_an_unarmed_spotify_head() {
+        assert_eq!(head_action(SPOT_UNARMED, PLAYING, false, Trigger::Skip), HeadAction::Handoff);
+    }
+
+    #[test]
+    fn skip_drains_a_media_head() {
+        assert_eq!(head_action(HeadKind::Media, PLAYING, false, Trigger::Skip), HeadAction::Drain);
+    }
+
+    #[test]
+    fn skip_on_an_empty_queue_skips_the_spotify_baseline() {
+        assert_eq!(head_action(HeadKind::Empty, PLAYING, false, Trigger::Skip), HeadAction::NextSpotify);
+    }
+
+    #[test]
+    fn play_button_resumes_an_armed_spotify_head() {
+        assert_eq!(head_action(SPOT_ARMED, PAUSED, false, Trigger::PlayButton), HeadAction::ResumeSpotify);
+    }
+
+    #[test]
+    fn play_button_loads_an_unarmed_spotify_head_while_idle() {
+        assert_eq!(head_action(SPOT_UNARMED, IDLE, false, Trigger::PlayButton), HeadAction::Load);
+    }
+
+    #[test]
+    fn play_button_never_hijacks_a_paused_baseline() {
+        assert_eq!(head_action(SPOT_UNARMED, PAUSED, false, Trigger::PlayButton), HeadAction::ResumeThenArm);
+    }
+
+    #[test]
+    fn play_button_drains_a_media_head() {
+        assert_eq!(head_action(HeadKind::Media, PAUSED, false, Trigger::PlayButton), HeadAction::Drain);
+    }
+
+    #[test]
+    fn play_button_on_an_empty_queue_resumes_the_baseline() {
+        assert_eq!(head_action(HeadKind::Empty, PAUSED, false, Trigger::PlayButton), HeadAction::ResumeSpotify);
+    }
+}
+
+/// Classifies the current head of `priority_queue` into a `HeadKind`,
+/// comparing a Spotify head's URI against `armed` to decide `armed: bool`.
+/// Locks `armed` first, then `priority_queue` — same order as
+/// `try_arm_head`/`handoff_head`, and never holds both at once.
+fn classify_head(priority_queue: &Mutex<PriorityQueue>, armed: &Mutex<Option<SpotifyUri>>) -> HeadKind {
+    let armed_uri = { armed.lock().clone() };
+    let lock = priority_queue.lock();
+    match lock.peek() {
+        None => HeadKind::Empty,
+        Some(item) => match &item.source {
+            MediaSource::Spotify { uri, .. } => HeadKind::Spotify { armed: armed_uri.as_ref() == Some(uri) },
+            _ => HeadKind::Media,
+        },
+    }
+}
+
+/// The armed-head critical section (invariant: an armed head is never
+/// `AddToQueue`'d again). If nothing is currently armed, the queue's head
+/// is an un-armed Spotify item, Spotify is playing, and no media item is
+/// mid-playback, hands that track to Spotify's own queue and remembers it
+/// as armed. Returns whether it armed something.
+///
+/// Lock order: `armed` first, then `priority_queue` — callers must not
+/// already hold `priority_queue` when calling this.
+fn try_arm_head(
+    priority_queue: &Mutex<PriorityQueue>,
+    armed: &Mutex<Option<SpotifyUri>>,
+    spirc_tx: Option<&mpsc::UnboundedSender<SpircCommand>>,
+    spotify: SpotifyState,
+    media_active: bool,
+) -> bool {
+    let mut armed_lock = armed.lock();
+    if armed_lock.is_some() || spotify != SpotifyState::Playing || media_active {
+        return false;
+    }
+    let tx = match spirc_tx {
+        Some(tx) => tx,
+        None => return false,
+    };
+    let uri = {
+        let queue_lock = priority_queue.lock();
+        match queue_lock.peek() {
+            Some(item) => match &item.source {
+                MediaSource::Spotify { uri, .. } => Some(uri.clone()),
+                _ => None,
+            },
+            None => None,
+        }
+    };
+    let uri = match uri {
+        Some(u) => u,
+        None => return false,
+    };
+    if tx.send(SpircCommand::AddToQueue(uri.clone())).is_err() {
+        return false;
+    }
+    *armed_lock = Some(uri);
+    true
+}
+
+/// `HeadAction::Handoff`: hand the queue head straight to Spotify
+/// (`AddToQueue` + `Next`, plus `Play` if Spotify was paused — it sits
+/// paused on its context's next track after a queue exhausts), pop it from
+/// our queue, clear `armed`, then immediately try to arm whatever is now
+/// the new head so chained Spotify items stay gap-free. Free function (not
+/// a `Handler` method) so it's usable from contexts without `&self`, such
+/// as `priority_queue_manager`.
+fn handoff_head(
+    priority_queue: &Mutex<PriorityQueue>,
+    armed: &Mutex<Option<SpotifyUri>>,
+    spirc_tx: Option<&mpsc::UnboundedSender<SpircCommand>>,
+    spotify: SpotifyState,
+    media_active: bool,
+) {
+    let uri = {
+        let lock = priority_queue.lock();
+        match lock.peek() {
+            Some(item) => match &item.source {
+                MediaSource::Spotify { uri, .. } => Some(uri.clone()),
+                _ => None,
+            },
+            None => None,
+        }
+    };
+    let uri = match uri {
+        Some(u) => u,
+        None => return,
+    };
+    if let Some(tx) = spirc_tx {
+        if spotify == SpotifyState::Idle {
+            // Nothing loaded: there is no context to queue behind, and none
+            // to lose — load the track directly.
+            let _ = tx.send(SpircCommand::Load(uri.clone()));
+        } else {
+            let _ = tx.send(SpircCommand::AddToQueue(uri.clone()));
+            let _ = tx.send(SpircCommand::Next);
+            if spotify == SpotifyState::Paused {
+                let _ = tx.send(SpircCommand::Play);
+            }
+        }
+    }
+    {
+        let mut lock = priority_queue.lock();
+        lock.pop_if(|item| matches!(&item.source, MediaSource::Spotify { uri: u, .. } if *u == uri));
+    }
+    {
+        let mut lock = armed.lock();
+        *lock = None;
+    }
+    try_arm_head(priority_queue, armed, spirc_tx, spotify, media_active);
+}
+
+/// After a queue drain returns — naturally finished, or (per
+/// `run_queue_drain`) broke off having handed a Spotify item straight to
+/// Spotify's own queue — decides what, if anything, happens to whatever is
+/// now at the head of our queue. Implements the `MediaEnd` rows of
+/// `head_action`. `media_active` is not read here: a drain always clears
+/// `active_priority_item` before returning, so it is always false at this
+/// point. Free function so the drain owners (`priority_queue_manager`, and
+/// the task `trigger_priority_queue_drain` spawns) can call it without
+/// `&self`.
+fn after_media_end(
+    priority_queue: &Mutex<PriorityQueue>,
+    armed: &Mutex<Option<SpotifyUri>>,
+    spirc_tx: Option<&mpsc::UnboundedSender<SpircCommand>>,
+    spotify_state: &Mutex<SpotifyState>,
+    resume_spotify_after_drain: &AtomicBool,
+) {
+    let head = classify_head(priority_queue, armed);
+    let spotify = *spotify_state.lock();
+    match head_action(head, spotify, false, Trigger::MediaEnd) {
+        HeadAction::ResumeSpotify => {
+            if resume_spotify_after_drain.load(Ordering::SeqCst) {
+                if let Some(tx) = spirc_tx {
+                    let _ = tx.send(SpircCommand::Play);
+                }
+            }
+        }
+        HeadAction::Handoff => handoff_head(priority_queue, armed, spirc_tx, spotify, false),
+        _ => {}
+    }
+}
 
 fn register_commands(ytdlp_available: bool) -> Vec<CreateCommand> {
     let mut cmds = vec![
@@ -335,6 +685,7 @@ fn build_priority_now_playing_embed(item: &QueueItem) -> CreateEmbed {
     let footer_icon = match &item.source {
         MediaSource::YouTube { .. } => "🎬",
         MediaSource::File { .. } => "📎",
+        MediaSource::Spotify { .. } => "🎵",
     };
 
     let footer_text = match item.source.display_duration() {
@@ -354,6 +705,8 @@ fn build_priority_now_playing_embed(item: &QueueItem) -> CreateEmbed {
         if let Some(thumb) = thumbnail_url {
             embed = embed.image(thumb);
         }
+    } else if let MediaSource::Spotify { album_art_url: Some(art), .. } = &item.source {
+        embed = embed.image(art);
     }
 
     embed
@@ -371,6 +724,9 @@ fn build_priority_history_embed(item: &QueueItem) -> CreateEmbed {
         MediaSource::File { filename, .. } => {
             format!("📎 {}", filename)
         }
+        MediaSource::Spotify { title, artist, .. } => {
+            format!("🎵 {} — {}", title, artist)
+        }
     };
 
     let mut embed = CreateEmbed::new()
@@ -380,6 +736,8 @@ fn build_priority_history_embed(item: &QueueItem) -> CreateEmbed {
 
     if let MediaSource::YouTube { thumbnail_url: Some(thumb), .. } = &item.source {
         embed = embed.thumbnail(thumb);
+    } else if let MediaSource::Spotify { album_art_url: Some(art), .. } = &item.source {
+        embed = embed.thumbnail(art);
     }
 
     embed
@@ -595,8 +953,36 @@ struct QueueDrainCtx {
     resume_spotify_after_drain: Arc<AtomicBool>,
 }
 
-/// Drain the priority queue until it is empty or the current item is
-/// cancelled. The caller must already own the drain-active flag (DrainGuard).
+/// Deletes the current Now-Playing card (unless it's also the controls
+/// message) and reposts the idle controls card. Used both when a queue item
+/// fails outright, so its dead buttons don't linger, and when a natural
+/// drain end has nothing to hand playback to.
+async fn clear_now_playing_card(d: &QueueDrainCtx) {
+    let ctx = {
+        let lock = d.ctx.lock();
+        lock.clone()
+    };
+    if let Some(ctx) = ctx {
+        let np = {
+            let mut lock = d.now_playing_message_id.lock();
+            lock.take()
+        };
+        let ctrl = {
+            let lock = d.controls_message_id.lock();
+            *lock
+        };
+        if let Some(mid) = np {
+            if ctrl != Some(mid) {
+                let _ = d.text_channel_id.delete_message(&ctx, mid).await;
+            }
+        }
+        delete_and_repost_controls(&ctx, d.text_channel_id, &d.controls_message_id, None).await;
+    }
+}
+
+/// Drain the priority queue until it is empty, the current item is
+/// cancelled, or the head is a Spotify item (handed off directly, see
+/// below). The caller must already own the drain-active flag (DrainGuard).
 ///
 /// Semantics decided once for both owners: no history embed for cancelled or
 /// failed items (failures get a user-facing error message instead); Spotify
@@ -611,6 +997,7 @@ async fn run_queue_drain(d: &QueueDrainCtx) {
     let resume_spotify = *d.spotify_state.lock() == SpotifyState::Playing;
     d.resume_spotify_after_drain.store(resume_spotify, Ordering::SeqCst);
     let mut cancelled = false;
+    let mut handed_to_spotify = false;
     loop {
         let item = {
             let mut lock = d.priority_queue.lock();
@@ -620,6 +1007,27 @@ async fn run_queue_drain(d: &QueueDrainCtx) {
             Some(i) => i,
             None => break,
         };
+
+        // A Spotify item at the head never runs through the feeder: hand it
+        // straight to Spotify's own queue/context and let Spotify's presence
+        // path post its own card. No active_priority_item, no pause, no
+        // priority now-playing card — this drain's job here is done.
+        if let MediaSource::Spotify { uri, .. } = &item.source {
+            let state = *d.spotify_state.lock();
+            if let Some(tx) = &d.spirc_cmd_tx {
+                if state == SpotifyState::Idle {
+                    let _ = tx.send(SpircCommand::Load(uri.clone()));
+                } else {
+                    let _ = tx.send(SpircCommand::AddToQueue(uri.clone()));
+                    let _ = tx.send(SpircCommand::Next);
+                    if state == SpotifyState::Paused {
+                        let _ = tx.send(SpircCommand::Play);
+                    }
+                }
+            }
+            handed_to_spotify = true;
+            break;
+        }
 
         // Mark the item active BEFORE pausing Spotify: the pause lands as a
         // Paused/Idle player event, and the presence loop pauses the shared
@@ -679,6 +1087,9 @@ async fn run_queue_drain(d: &QueueDrainCtx) {
                 let ext = filename.rsplit('.').next().unwrap_or("mp3");
                 feed_file_to_bridge(attachment_url, ext, d.bridge.clone(), token, d.feeder_paused.clone()).await
             }
+            // Unreachable: the Spotify branch above breaks out of the loop
+            // before an item of this source ever reaches the feeder.
+            MediaSource::Spotify { .. } => unreachable!("Spotify items are handed off and never fed"),
         };
 
         {
@@ -710,11 +1121,17 @@ async fn run_queue_drain(d: &QueueDrainCtx) {
                     ));
                     let _ = d.text_channel_id.send_message(&ctx, msg).await;
                 }
+                // A failed item's card must not linger with dead buttons —
+                // the next item's post_priority_now_playing would otherwise
+                // be the only thing to clean it up, and never runs if this
+                // was the last item in the queue.
+                clear_now_playing_card(d).await;
+                continue;
             }
         }
     }
 
-    if cancelled {
+    if cancelled || handed_to_spotify {
         return;
     }
 
@@ -729,26 +1146,7 @@ async fn run_queue_drain(d: &QueueDrainCtx) {
             .map(|tx| tx.send(SpircCommand::Play).is_ok())
             .unwrap_or(false);
     if !resumed {
-        let ctx = {
-            let lock = d.ctx.lock();
-            lock.clone()
-        };
-        if let Some(ctx) = ctx {
-            let np = {
-                let mut lock = d.now_playing_message_id.lock();
-                lock.take()
-            };
-            let ctrl = {
-                let lock = d.controls_message_id.lock();
-                *lock
-            };
-            if let Some(mid) = np {
-                if ctrl != Some(mid) {
-                    let _ = d.text_channel_id.delete_message(&ctx, mid).await;
-                }
-            }
-            delete_and_repost_controls(&ctx, d.text_channel_id, &d.controls_message_id, None).await;
-        }
+        clear_now_playing_card(d).await;
     }
 }
 
@@ -772,7 +1170,11 @@ async fn priority_queue_manager(
     track_handle: Arc<Mutex<Option<TrackHandle>>>,
     spotify_state: Arc<Mutex<SpotifyState>>,
     resume_spotify_after_drain: Arc<AtomicBool>,
+    armed_spotify: Arc<Mutex<Option<SpotifyUri>>>,
 ) {
+    // Kept alongside drain_ctx (which owns a clone) so the TrackEnd handoff
+    // path below can send commands without a drain running.
+    let spirc_cmd_tx_direct = spirc_cmd_tx.clone();
     let drain_ctx = QueueDrainCtx {
         priority_queue,
         bridge,
@@ -799,13 +1201,36 @@ async fn priority_queue_manager(
             }
         }
 
-        // Only one drain runs at a time. If a /play-triggered drain already
-        // owns it, that drain will pick up whatever is queued — skip.
-        if drain_active.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
-            continue;
+        // The Spotify baseline's own EndOfTrack fired: decide what (if
+        // anything) our queue head should do about it, instead of blindly
+        // draining. An armed head does nothing (Spotify plays it itself); a
+        // media head drains; an un-armed Spotify head is handed off directly.
+        let head = classify_head(&drain_ctx.priority_queue, &armed_spotify);
+        let spotify = *drain_ctx.spotify_state.lock();
+        let media_active = { drain_ctx.active_priority_item.lock().is_some() };
+        match head_action(head, spotify, media_active, Trigger::TrackEnd) {
+            HeadAction::Drain => {
+                // Only one drain runs at a time. If a /play-triggered drain
+                // already owns it, that drain will pick up whatever is
+                // queued — skip.
+                if drain_active.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+                    continue;
+                }
+                let _drain_guard = DrainGuard(drain_active.clone());
+                run_queue_drain(&drain_ctx).await;
+                after_media_end(
+                    &drain_ctx.priority_queue,
+                    &armed_spotify,
+                    Some(&spirc_cmd_tx_direct),
+                    &drain_ctx.spotify_state,
+                    &drain_ctx.resume_spotify_after_drain,
+                );
+            }
+            HeadAction::Handoff => {
+                handoff_head(&drain_ctx.priority_queue, &armed_spotify, Some(&spirc_cmd_tx_direct), spotify, media_active);
+            }
+            _ => {}
         }
-        let _drain_guard = DrainGuard(drain_active.clone());
-        run_queue_drain(&drain_ctx).await;
     }
 }
 
@@ -824,6 +1249,9 @@ async fn run_presence_loop_with_track(
     active_priority_item: Arc<Mutex<Option<QueueItem>>>,
     last_meta_store: Arc<Mutex<Option<SpotifyTrackInfo>>>,
     spotify_state: Arc<Mutex<SpotifyState>>,
+    priority_queue: Arc<Mutex<PriorityQueue>>,
+    armed_spotify: Arc<Mutex<Option<SpotifyUri>>>,
+    spirc_cmd_tx: Arc<Mutex<Option<mpsc::UnboundedSender<SpircCommand>>>>,
 ) {
     let (fwd_tx, fwd_rx) = mpsc::unbounded_channel::<PresenceUpdate>();
     let ctx_presence = ctx.clone();
@@ -888,6 +1316,37 @@ async fn run_presence_loop_with_track(
             };
             let mut lock = spotify_state.lock();
             *lock = new_state;
+        }
+
+        // Armed-head bookkeeping: on every Playing event, if it matches the
+        // track we pre-armed, pop it from our queue and clear armed; then —
+        // whether it matched or not — try to arm whatever the head now is,
+        // so chained Spotify items (and a DJ resuming a paused queue from
+        // their phone) stay gap-free. Idle means Spotify's own device queue
+        // is gone, so nothing is armed anymore.
+        match &update {
+            PresenceUpdate::Playing { track_id, .. } => {
+                let matched = {
+                    let mut armed_lock = armed_spotify.lock();
+                    let is_match = armed_lock.as_ref().map(|u| u.to_id()).as_deref() == Some(track_id.as_str());
+                    if is_match {
+                        *armed_lock = None;
+                    }
+                    is_match
+                };
+                if matched {
+                    let mut lock = priority_queue.lock();
+                    lock.pop_if(|item| matches!(&item.source, MediaSource::Spotify { uri, .. } if uri.to_id() == *track_id));
+                }
+                let media_active = { active_priority_item.lock().is_some() };
+                let tx = { spirc_cmd_tx.lock().clone() };
+                try_arm_head(&priority_queue, &armed_spotify, tx.as_ref(), SpotifyState::Playing, media_active);
+            }
+            PresenceUpdate::Idle => {
+                let mut lock = armed_spotify.lock();
+                *lock = None;
+            }
+            _ => {}
         }
 
         if let PresenceUpdate::Playing { title, artist, track_id, album_art_url } = &update {
@@ -1090,6 +1549,9 @@ impl EventHandler for Handler {
             let priority_item = self.active_priority_item.clone();
             let last_meta_store = self.last_spotify_meta.clone();
             let spotify_state = self.spotify_state.clone();
+            let priority_queue_presence = self.priority_queue.clone();
+            let armed_spotify_presence = self.armed_spotify.clone();
+            let spirc_cmd_tx_presence = self.spirc_cmd_tx.clone();
             tokio::spawn(async move {
                 run_presence_loop_with_track(
                     ctx_presence, rx, track_handle_store, active_session,
@@ -1097,6 +1559,7 @@ impl EventHandler for Handler {
                     dj_presence, announce_presence,
                     bridge_presence, priority_item,
                     last_meta_store, spotify_state,
+                    priority_queue_presence, armed_spotify_presence, spirc_cmd_tx_presence,
                 ).await;
             });
         }
@@ -1249,9 +1712,9 @@ impl EventHandler for Handler {
                                 !lock.is_empty()
                             };
                             if queue_non_empty {
-                                match self.trigger_priority_queue_drain(None).await {
-                                    Ok(_) => "▶ Playing from queue".to_string(),
-                                    Err(msg) => format!("⚠ {}", msg),
+                                match self.reconcile(Trigger::PlayButton, None).await {
+                                    Some(msg) => msg,
+                                    None => "▶ Playing from queue".to_string(),
                                 }
                             } else {
                                 let ok = tx.send(SpircCommand::Play).is_ok();
@@ -1457,6 +1920,93 @@ impl Handler {
         self.spirc_cmd_tx.lock().is_some()
     }
 
+    /// Resolves a Spotify track's title/artist/art through the live session
+    /// (`SpircCommand::Lookup`), returning `None` if there is no session or
+    /// the lookup itself fails — both cases the caller reports identically.
+    async fn lookup_spotify_track(&self, uri: &SpotifyUri) -> Option<(String, String, Option<String>)> {
+        let tx = { self.spirc_cmd_tx.lock().clone() }?;
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        if tx.send(SpircCommand::Lookup(uri.clone(), reply_tx)).is_err() {
+            return None;
+        }
+        match reply_rx.await {
+            Ok(Some(lookup)) => Some((lookup.title, lookup.artist, lookup.album_art_url)),
+            Ok(None) | Err(_) => None,
+        }
+    }
+
+    /// The single entry point every playback-affecting command and event
+    /// funnels through: classifies the current queue head, looks up
+    /// `head_action` for `trigger`, executes it, and returns the reply text
+    /// (if any) the caller should show the user. `requester_id` is only used
+    /// by the `Drain` action (so `/play`'s cold-start join follows the
+    /// requesting user rather than falling back to the configured channel);
+    /// pass `None` from contexts with no requesting user (buttons, /skip).
+    async fn reconcile(&self, trigger: Trigger, requester_id: Option<u64>) -> Option<String> {
+        let head = classify_head(&self.priority_queue, &self.armed_spotify);
+        let spotify = *self.spotify_state.lock();
+        let media_active = { self.active_priority_item.lock().is_some() };
+        let action = head_action(head, spotify, media_active, trigger);
+        let spirc_tx = { self.spirc_cmd_tx.lock().clone() };
+
+        match action {
+            HeadAction::Nothing => None,
+            HeadAction::Arm => {
+                let armed = try_arm_head(&self.priority_queue, &self.armed_spotify, spirc_tx.as_ref(), spotify, media_active);
+                if armed {
+                    Some("Queued on Spotify — plays after the current track.".to_string())
+                } else {
+                    None
+                }
+            }
+            HeadAction::Load => {
+                let popped = {
+                    let mut lock = self.priority_queue.lock();
+                    lock.pop_if(|item| matches!(item.source, MediaSource::Spotify { .. }))
+                };
+                if let Some(QueueItem { source: MediaSource::Spotify { uri, .. }, .. }) = popped {
+                    if let Some(tx) = &spirc_tx {
+                        let _ = tx.send(SpircCommand::Load(uri));
+                    }
+                }
+                Some("Playing now on Spotify.".to_string())
+            }
+            HeadAction::Handoff => {
+                handoff_head(&self.priority_queue, &self.armed_spotify, spirc_tx.as_ref(), spotify, media_active);
+                None
+            }
+            HeadAction::Drain => {
+                match self.trigger_priority_queue_drain(requester_id).await {
+                    Ok(_) => None,
+                    Err(msg) => Some(format!("⚠ {}", msg)),
+                }
+            }
+            HeadAction::ResumeSpotify => {
+                if let Some(tx) = &spirc_tx {
+                    let _ = tx.send(SpircCommand::Play);
+                }
+                None
+            }
+            HeadAction::NextSpotify => {
+                if let Some(tx) = &spirc_tx {
+                    let _ = tx.send(SpircCommand::Next);
+                }
+                None
+            }
+            HeadAction::ResumeThenArm => {
+                if let Some(tx) = &spirc_tx {
+                    let _ = tx.send(SpircCommand::Play);
+                }
+                // Spotify hasn't actually reported Playing yet (that arrives
+                // asynchronously via the presence loop, which retries this
+                // same arm step on every Playing event) — this call is a
+                // no-op today and a safety net if that ordering ever changes.
+                try_arm_head(&self.priority_queue, &self.armed_spotify, spirc_tx.as_ref(), spotify, media_active);
+                None
+            }
+        }
+    }
+
     /// The queue listing shown by the `ctrl_queue_hint` button and by
     /// `/queue` with no arguments: how to add tracks, the current Spotify
     /// playback state, and the first few priority-queue items.
@@ -1480,12 +2030,23 @@ impl Handler {
         };
         lines.push(spotify_line.to_string());
         if !pq_snapshot.is_empty() {
+            let armed_uri = { self.armed_spotify.lock().clone() };
             lines.push(format!("\nPriority queue ({} item(s)):", pq_snapshot.len()));
             for (i, item) in pq_snapshot.iter().enumerate().take(5) {
-                let duration = item.source.display_duration()
-                    .map(|d| format!(" ({d})"))
-                    .unwrap_or_default();
-                lines.push(format!("  {}. {}{} — queued by {}", i + 1, item.source.display_title(), duration, item.queued_by));
+                let line = match &item.source {
+                    MediaSource::Spotify { uri, title, artist, .. } => {
+                        let is_armed = armed_uri.as_ref() == Some(uri);
+                        let suffix = if is_armed { " ⏭ next on Spotify" } else { "" };
+                        format!("  {}. 🎵 **{}** — {}{}", i + 1, title, artist, suffix)
+                    }
+                    _ => {
+                        let duration = item.source.display_duration()
+                            .map(|d| format!(" ({d})"))
+                            .unwrap_or_default();
+                        format!("  {}. {}{} — queued by {}", i + 1, item.source.display_title(), duration, item.queued_by)
+                    }
+                };
+                lines.push(line);
             }
         }
         lines.join("\n")
@@ -1694,6 +2255,12 @@ impl Handler {
         // A fresh Spotify session owns the audio path — cancel any active
         // YouTube/file playback before starting it.
         self.stop_priority_playback();
+        // The previous session's Spotify-side device queue is gone with it —
+        // any armed track never plays, so stop treating it as armed.
+        {
+            let mut lock = self.armed_spotify.lock();
+            *lock = None;
+        }
 
         let config = self.config.clone();
         let bridge = self.bridge.clone();
@@ -1773,6 +2340,7 @@ impl Handler {
             self.track_handle.clone(),
             self.spotify_state.clone(),
             self.resume_spotify_after_drain.clone(),
+            self.armed_spotify.clone(),
         ));
 
         // Proactive refresher: the sole owner of the refresh cycle. Wakes on a
@@ -1983,29 +2551,45 @@ impl Handler {
         let discord_id = cmd.user.id.get();
 
         // Spotify track link: no yt-dlp probe, no cooldown — reply
-        // immediately instead of deferring.
+        // immediately instead of deferring. Goes into the same unified
+        // priority queue as YouTube/file items (PORT.md decision #15).
         if let Some(url) = &url_arg {
             if let LinkKind::Spotify(spotify_uri) = classify_link(url) {
                 let reply = if !self.has_spotify_session() {
                     "Run `/login` first.".to_string()
-                } else if next {
-                    "Spotify tracks always play next after the current track — use `/play` without `next`.".to_string()
                 } else {
-                    let tx = { let lock = self.spirc_cmd_tx.lock(); lock.clone() };
-                    match tx {
-                        Some(tx) if self.something_is_playing() => {
-                            match tx.send(SpircCommand::AddToQueue(spotify_uri)) {
-                                Ok(()) => "Queued on Spotify — plays after the current track.".to_string(),
-                                Err(_) => "No active Spotify session.".to_string(),
+                    match self.lookup_spotify_track(&spotify_uri).await {
+                        None => "Couldn't resolve that Spotify track.".to_string(),
+                        Some((title, artist, album_art_url)) => {
+                            let item = QueueItem {
+                                source: MediaSource::Spotify { uri: spotify_uri, title, artist, album_art_url },
+                                queued_by: discord_name.clone(),
+                                queued_by_id: discord_id,
+                            };
+                            let armed_head = { self.armed_spotify.lock().is_some() };
+                            let (accepted, queue_len) = {
+                                let mut lock = self.priority_queue.lock();
+                                let accepted = if next {
+                                    // An armed head is already on Spotify's own
+                                    // queue and can't be un-queued — a "next"
+                                    // item lands right behind it instead of
+                                    // jumping it.
+                                    if armed_head { lock.insert(1, item) } else { lock.push_front(item) }
+                                } else {
+                                    lock.push(item)
+                                };
+                                (accepted, lock.len())
+                            };
+                            if !accepted {
+                                format!("Queue is full ({} items) — try again once some have played.", queue_len)
+                            } else {
+                                let trigger = if !self.something_is_playing() { Trigger::PlayButton } else { Trigger::Enqueue };
+                                match self.reconcile(trigger, Some(discord_id)).await {
+                                    Some(msg) => msg,
+                                    None => if next { "Playing next".to_string() } else { format!("Added to queue #{}", queue_len) },
+                                }
                             }
                         }
-                        Some(tx) => {
-                            match tx.send(SpircCommand::Load(spotify_uri)) {
-                                Ok(()) => "Playing now on Spotify.".to_string(),
-                                Err(_) => "No active Spotify session.".to_string(),
-                            }
-                        }
-                        None => "No active Spotify session.".to_string(),
                     }
                 };
                 let _ = cmd.create_response(ctx, CreateInteractionResponse::Message(
@@ -2076,11 +2660,11 @@ impl Handler {
             // does not start a drain.
             if next { "Playing next".to_string() } else { format!("Added to queue #{}", queue_len) }
         } else {
-            // Nothing playing — start a drain immediately (Spotify Connect
-            // may still be playing; the drain pauses it).
-            match self.trigger_priority_queue_drain(Some(discord_id)).await {
-                Err(msg) => format!("❌ {}", msg),
-                Ok(_) => "Playing now".to_string(),
+            // Nothing playing — start it now (Spotify Connect may still be
+            // playing; a media head's Drain action pauses it).
+            match self.reconcile(Trigger::PlayButton, Some(discord_id)).await {
+                Some(msg) => msg,
+                None => "Playing now".to_string(),
             }
         };
 
@@ -2161,10 +2745,25 @@ impl Handler {
             spotify_state: self.spotify_state.clone(),
             resume_spotify_after_drain: self.resume_spotify_after_drain.clone(),
         };
+        let priority_queue_for_end = self.priority_queue.clone();
+        let armed_for_end = self.armed_spotify.clone();
+        let spirc_cmd_tx_for_end = self.spirc_cmd_tx.clone();
+        let spotify_state_for_end = self.spotify_state.clone();
+        let resume_flag_for_end = self.resume_spotify_after_drain.clone();
         tokio::spawn(async move {
             // Clears drain_active on any exit (normal, cancel, or abort).
             let _drain_guard = drain_guard;
             run_queue_drain(&drain_ctx).await;
+            // MediaEnd: decide what (if anything) happens to whatever is now
+            // at the queue head — arms/hands off a revealed Spotify head.
+            let tx = { spirc_cmd_tx_for_end.lock().clone() };
+            after_media_end(
+                &priority_queue_for_end,
+                &armed_for_end,
+                tx.as_ref(),
+                &spotify_state_for_end,
+                &resume_flag_for_end,
+            );
         });
         Ok(true)
     }
@@ -2206,24 +2805,45 @@ impl Handler {
             }
             "⏭ Skipped.".to_string()
         } else {
-            let spirc_tx = {
-                let lock = self.spirc_cmd_tx.lock();
-                lock.clone()
+            // No media item is mid-playback: let the queue head (armed
+            // Spotify, un-armed Spotify, or media) decide what "skip" means.
+            let queue_non_empty = {
+                let lock = self.priority_queue.lock();
+                !lock.is_empty()
             };
-            match spirc_tx {
-                Some(tx) => {
-                    if tx.send(SpircCommand::Next).is_ok() {
-                        "⏭ Skipped.".to_string()
-                    } else {
-                        "⚠ Spotify didn't accept the skip — try again.".to_string()
-                    }
+            if queue_non_empty {
+                match self.reconcile(Trigger::Skip, None).await {
+                    Some(msg) => msg,
+                    None => "⏭ Skipped.".to_string(),
                 }
-                None => "No active Spotify session.".to_string()
+            } else {
+                let spirc_tx = {
+                    let lock = self.spirc_cmd_tx.lock();
+                    lock.clone()
+                };
+                match spirc_tx {
+                    Some(tx) => {
+                        if tx.send(SpircCommand::Next).is_ok() {
+                            "⏭ Skipped.".to_string()
+                        } else {
+                            "⚠ Spotify didn't accept the skip — try again.".to_string()
+                        }
+                    }
+                    None => "No active Spotify session.".to_string()
+                }
             }
         }
     }
 
     async fn handle_stop(&self) -> String {
+        // Spotify's device-side queue is gone once we stop — an armed track
+        // never plays, so stop treating it as armed, and say so.
+        let was_armed = {
+            let mut lock = self.armed_spotify.lock();
+            let was = lock.is_some();
+            *lock = None;
+            was
+        };
         self.stop_priority_playback();
         self.bridge.clear();
 
@@ -2237,7 +2857,11 @@ impl Handler {
             let _ = tx.send(SpircCommand::Pause);
         }
 
-        "⏹ Stopped. Priority queue cleared.".to_string()
+        let mut reply = "⏹ Stopped. Priority queue cleared.".to_string();
+        if was_armed {
+            reply.push_str(" (a track already handed to Spotify will still play once)");
+        }
+        reply
     }
 
     async fn handle_np(&self) -> String {
@@ -2520,6 +3144,12 @@ impl Handler {
             // empty-channel path — otherwise a queued track keeps playing and
             // posts a history embed after logout.
             self.stop_priority_playback();
+            // The Spotify-side device queue dies with the session — an armed
+            // track never plays, so it's no longer armed.
+            {
+                let mut lock = self.armed_spotify.lock();
+                *lock = None;
+            }
             let _ = self.presence_tx.send(PresenceUpdate::Idle);
             let ctx = {
                 let lock = self.ctx.lock();
@@ -2542,6 +3172,12 @@ impl Handler {
         // A pending device-code pairing for this user is now moot — cancel its poll.
         if let Some(cancel) = self.pending_auth.lock().remove(&user_id_u64) {
             cancel.notify_one();
+        }
+        // Whatever Spotify session that armed track belonged to is being
+        // forgotten — stop treating it as armed.
+        {
+            let mut lock = self.armed_spotify.lock();
+            *lock = None;
         }
 
         match self.user_store.remove(user_id) {
@@ -2587,25 +3223,38 @@ impl Handler {
             return;
         }
 
-        // Spotify track link: straight to the Spotify queue, no defer needed.
+        let discord_name = cmd.user.global_name.clone().unwrap_or_else(|| cmd.user.name.clone());
+        let discord_id = cmd.user.id.get();
+
+        // Spotify track link: goes on the same unified priority queue as
+        // YouTube/file items (PORT.md decision #15), no defer needed.
         if let Some(url) = &url_arg {
             if let LinkKind::Spotify(spotify_uri) = classify_link(url) {
                 let reply = if !self.has_spotify_session() {
                     "Run `/login` first.".to_string()
                 } else {
-                    let tx = { let lock = self.spirc_cmd_tx.lock(); lock.clone() };
-                    match tx {
-                        Some(tx) => match tx.send(SpircCommand::AddToQueue(spotify_uri)) {
-                            Ok(()) => {
-                                let mut msg = "Queued on Spotify.".to_string();
-                                if *self.spotify_state.lock() == SpotifyState::Idle {
-                                    msg.push_str(" Nothing is playing — press ▶ or use `/play` to start.");
+                    match self.lookup_spotify_track(&spotify_uri).await {
+                        None => "Couldn't resolve that Spotify track.".to_string(),
+                        Some((title, artist, album_art_url)) => {
+                            let item = QueueItem {
+                                source: MediaSource::Spotify { uri: spotify_uri, title, artist, album_art_url },
+                                queued_by: discord_name.clone(),
+                                queued_by_id: discord_id,
+                            };
+                            let (accepted, queue_len) = {
+                                let mut lock = self.priority_queue.lock();
+                                let accepted = lock.push(item);
+                                (accepted, lock.len())
+                            };
+                            if !accepted {
+                                format!("Queue is full ({} items) — try again once some have played.", queue_len)
+                            } else {
+                                match self.reconcile(Trigger::Enqueue, None).await {
+                                    Some(msg) => msg,
+                                    None => format!("Added to queue #{}", queue_len),
                                 }
-                                msg
                             }
-                            Err(_) => "No active Spotify session.".to_string(),
-                        },
-                        None => "No active Spotify session.".to_string(),
+                        }
                     }
                 };
                 let _ = cmd.create_response(ctx, CreateInteractionResponse::Message(
@@ -2625,9 +3274,6 @@ impl Handler {
             )).await;
             return;
         }
-
-        let discord_name = cmd.user.global_name.clone().unwrap_or_else(|| cmd.user.name.clone());
-        let discord_id = cmd.user.id.get();
 
         let _ = cmd.create_response(ctx, CreateInteractionResponse::Defer(
             CreateInteractionResponseMessage::new().ephemeral(true)
@@ -2751,6 +3397,7 @@ impl DiscordBot {
             resume_spotify_after_drain: Arc::new(AtomicBool::new(false)),
             play_cooldowns: Arc::new(Mutex::new(HashMap::new())),
             auto_start_attempted: AtomicBool::new(false),
+            armed_spotify: Arc::new(Mutex::new(None)),
         };
 
         let token = config.discord_token.clone();

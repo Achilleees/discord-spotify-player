@@ -58,6 +58,28 @@ what NOT to bring across.
     for `EndOfTrack` before draining a queued item, and resumes Spotify
     afterwards only if it was playing before (`SpotifyState`: `Idle` /
     `Playing` / `Paused`, fed by `PresenceUpdate`).
+15. **Unified queue; Spotify handoff by pre-armed `add_to_queue`; `load`
+    only when idle** — decision #14 still routed Spotify links straight into
+    Spotify Connect's own queue (`add_to_queue`), invisible to the bot: two
+    queues, `/queue` showing half the truth, and ⏭ behaving inconsistently
+    depending on which queue a "next" item actually lived in. Now there is
+    one queue (`MediaSource::Spotify` joins `YouTube`/`File` in
+    `src/queue.rs`); every `/play`/`/queue` push goes there and `/queue`
+    lists true order. A Spotify track only reaches Spotify Connect's queue
+    when it's at the *head* and Spotify is playing — the bot arms it
+    (`add_to_queue`) right then, so it plays gap-free at track end, and pops
+    it from the bot queue when the matching `Playing` event confirms Spotify
+    actually started it (also catches the DJ skipping from their phone).
+    `load` is used only when Spotify is idle, because `load` replaces
+    Spotify's context and stops (or autoplays) — using it while a context is
+    live would wipe the DJ's playlist/album position, and librespot's queue
+    has no remove operation to undo a wrong `add_to_queue`. The decision
+    logic is one pure function, `head_action(head, spotify_state,
+    media_active, trigger) -> HeadAction`, unit-tested per row of the
+    trigger × head-kind table (see the plan at commit time); the only
+    mutating critical section is `try_arm_head`, which the presence loop
+    also drives on every Spotify `Playing` event so a chain of queued
+    Spotify tracks stays gap-free without a fresh `/queue` each time.
 
 ## Module map: spotibot → nob-music
 
@@ -67,7 +89,7 @@ nob-music's internal modules are laid out in nob's `ARCHITECTURE.md`. The mappin
 |---|---|---|
 | `src/oauth/mod.rs` | `spotify` (OAuth client) | device flow: `request_device_code` / `poll_device_token` / `refresh` — port as-is. |
 | `src/users/mod.rs` + `crypto.rs` | `spotify` (credential store) + nob-core db | Table schema already matches nob's `spotify_credentials`. See "storage" below. |
-| `src/spotify/player.rs` | `spotify` (session lifecycle) | `run_with_token` = the Spirc lifecycle. Drop `SpotifyPlayer` struct-of-statics for a module. Also owns playback control: a `SpircCommand` channel (`Play`/`Pause`/`Next`/`Previous`/`AddToQueue`/`Load`) is applied to the live `Spirc` — port this channel, not a Web API client. |
+| `src/spotify/player.rs` | `spotify` (session lifecycle) | `run_with_token` = the Spirc lifecycle. Drop `SpotifyPlayer` struct-of-statics for a module. Also owns playback control: a `SpircCommand` channel (`Play`/`Pause`/`Next`/`Previous`/`AddToQueue`/`Load`/`Lookup`) is applied to the live `Spirc` — port this channel, not a Web API client. `Lookup(uri, oneshot)` resolves queued-Spotify-item metadata via `Track::get(&session, &uri)`, returning `TrackLookup { title, artist, album_art_url }`. |
 | `src/spotify/sink.rs` | nob-audio (DSP) + `spotify` (sink) | Biquad/DSP belongs in nob-audio (already has DSP); the `Sink` impl stays in music. |
 | `src/spotify/metadata.rs` | *(deleted)* | Was a raw reqwest Web API track fetch; removed — track metadata now comes from librespot's `PlayerEvent::TrackChanged` (see decision #13). Nothing to port. |
 | `src/audio_bridge.rs` | nob-audio (ring buffer) | nob-audio already has a tested ring buffer — reconcile, keep nob's, port the even-frame parity guard if missing. |
@@ -76,8 +98,8 @@ nob-music's internal modules are laid out in nob's `ARCHITECTURE.md`. The mappin
 | `src/discord/voice.rs` | `voice` | `SimpleBridgeReader` = the Songbird source adapter. |
 | `src/presence.rs` | `presence` (or a shared-types module) | The shared `PresenceUpdate` enum (`Idle` / `Paused { title, artist, track_id }` / `Playing { title, artist, track_id, album_art_url }`, sourced from `PlayerEvent::TrackChanged` — no `access_token`) — both the player-event side and `src/discord/presence.rs` depend on it; give it an explicit home. |
 | `src/discord/presence.rs` | `presence` | Bot status text. |
-| `src/discord/bot.rs` | **split across `commands`/`actions`/`panel`/`player`** | **Do NOT port wholesale** — see below. `handle_play`/`handle_queue` implement decision #14; the priority-queue manager reads `SpotifyState` off the handler (kept fresh by the presence loop) to decide whether a drain should resume Spotify afterwards. |
-| `src/queue.rs` | `queue` | Priority queue (DJ overlay > queue > Spotify baseline; queue items wait for `EndOfTrack`, see decision #14). Capped at `MAX_QUEUE_LEN = 500` (matches nob's unified-queue cap); `push()` is fallible (`-> bool`), rejecting at capacity; `push_front()` inserts at the head for `/play next:true`. |
+| `src/discord/bot.rs` | **split across `commands`/`actions`/`panel`/`player`** | **Do NOT port wholesale** — see below. `handle_play`/`handle_queue` implement decision #14; the priority-queue manager reads `SpotifyState` off the handler (kept fresh by the presence loop) to decide whether a drain should resume Spotify afterwards. Decision #15's handoff logic lives here too: `Handler.armed_spotify: Arc<Mutex<Option<SpotifyUri>>>` tracks the Spotify track (if any) currently sitting in Spotify Connect's own queue; `head_action(head, spotify_state, media_active, trigger) -> HeadAction` is the pure decision table (`HeadAction`: `Arm`/`Handoff`/`Load`/`Drain`/`ResumeSpotify`/`NextSpotify`/`ResumeThenArm`/`Nothing`); `try_arm_head(...)` is the one critical section that sends `AddToQueue` and sets `armed_spotify`, called from `reconcile` (the trigger → `head_action` → side-effect dispatcher) and from the presence loop on every `Playing` event. Port `head_action` and its table of unit tests verbatim — that table *is* the spec. |
+| `src/queue.rs` | `queue` | One priority queue (DJ overlay > queue > Spotify baseline; `MediaSource::Spotify \| YouTube \| File`, all in true order — see decision #15). Media items wait for `EndOfTrack`; a Spotify item at the head is pre-armed into Spotify's own queue instead (see `bot.rs` row). Capped at `MAX_QUEUE_LEN = 500` (matches nob's unified-queue cap); `push()`/`push_front()` are fallible (`-> bool`), rejecting at capacity; `insert(idx, item)` clamps `idx` to `len` and backs `next:true` behind an armed head; `peek()`/`pop_if(predicate)` back the handoff/pop-on-`Playing` logic. |
 | `src/youtube/*` | `youtube` | yt-dlp feeder + metadata. Cookies/age-gate contract: `--cookies` is passed only when the file exists on disk (both metadata and feeder paths); after metadata succeeds there is NO `age_limit` reject (reaching metadata means cookies already unlocked the video); the no-cookie age-gate failure is classified from stderr into an actionable `AgeRestricted` error pointing the admin at `YOUTUBE_COOKIES`. |
 | `src/config.rs` | nob-core config | Merge the Spotify/token keys into nob's config struct. Also capture the five module-local env reads that bypass `config.rs`: `YOUTUBE_COOKIES` (default `/var/lib/spotibot/youtube-cookies.txt`) and `YOUTUBE_TMP_DIR` (default `/tmp/spotibot-youtube`) in `youtube/mod.rs`, `DJ_CLIPS_DIR` / `DJ_CACHE_DIR` and `KOKORO_SOCKET` in `audio/dj.rs`. |
 | `src/setup.rs` | (drop) | The CLI wizard is a spotibot-local convenience; nob is VPS-deployed. |
@@ -142,6 +164,16 @@ nob-music's internal modules are laid out in nob's `ARCHITECTURE.md`. The mappin
   enters it at spotify.com/pair on any device, and the bot polls for the
   token. No listener, no redirect URI, no URL parsing, works the same on a VPS
   as on a desktop.
+- **An armed head must never be `add_to_queue`'d twice.** librespot's queue
+  has no remove operation, so a double-arm plays a track twice with no way
+  to undo it. `try_arm_head` is the only writer of `armed_spotify` and treats
+  checking-`None`-then-arming as one critical section (lock the mutex, check,
+  send `AddToQueue`, set, unlock) — never arm outside it.
+- **Armed state goes stale the moment Spotify's own queue is gone.** Spotify
+  loses its pending `add_to_queue` entry on `Idle`, a fresh `spawn_session`,
+  `/logout`, `/forget`, and `/stop` — clear `armed_spotify` in all five, or
+  the bot will wait forever for a `Playing` event that's never coming and
+  leave the (still-queued, un-armed) track stuck behind a phantom lock.
 - **Pacing lives in the sink, not the reader.** `DiscordSink::write` sleeps/spins
   to real time; the reader's 10 ms sleep only fires on starvation. Don't move
   pacing to the reader.

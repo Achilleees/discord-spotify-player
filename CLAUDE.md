@@ -57,11 +57,14 @@ Spotify / YouTube / files / DJ ─> AudioBridge ─> SimpleBridgeReader ─> Son
   stereo; drains/drops on even stereo frames.
 - **SimpleBridgeReader** (`src/discord/voice.rs`): Songbird source; prebuffers
   per `PREBUFFER_SECONDS`.
-- Priority: DJ overlay > queue (YT/SC/files) > Spotify Connect baseline. A
-  queued item never interrupts a playing Spotify track — it waits for the
-  track to end (EndOfTrack-driven drain), then resumes Spotify afterwards
-  only if Spotify was playing before (`src/queue.rs` + the priority-queue
-  manager in `bot.rs`).
+- Priority: DJ overlay > the one bot-owned queue (Spotify tracks, YT/SC,
+  files, in order) > Spotify Connect baseline. A media item at the head never
+  interrupts a playing Spotify track — it waits for `EndOfTrack`
+  (EndOfTrack-driven drain), then resumes Spotify afterwards only if Spotify
+  was playing before. A Spotify item at the head is instead pre-armed into
+  Spotify Connect's own queue (`add_to_queue`) while Spotify is playing, so
+  it plays gap-free at track end; idle Spotify gets a direct `load` instead
+  (`src/queue.rs` + the priority-queue manager in `bot.rs`).
 
 ### Startup (`src/main.rs`)
 1. Init logging from `RUST_LOG`.
@@ -76,9 +79,18 @@ Spotify / YouTube / files / DJ ─> AudioBridge ─> SimpleBridgeReader ─> Son
   manager, spawns the librespot task (`run_with_token`) and a proactive
   token-refresher (single owner of the refresh cycle). One active DJ; takeover
   requires being in the bot's voice channel. Playback control (buttons,
-  `/skip`, `/play`/`/queue` for Spotify tracks) goes straight to the live
-  Spirc via `SpircCommand` (`Play`/`Pause`/`Next`/`Previous`/`AddToQueue`/
-  `Load`) — no calls to api.spotify.com.
+  `/skip`, `/play`/`/queue`) goes straight to the live Spirc via
+  `SpircCommand` (`Play`/`Pause`/`Next`/`Previous`/`AddToQueue`/`Load`/
+  `Lookup`) — no calls to api.spotify.com. `Lookup` resolves title/artist/
+  album art for a Spotify item at enqueue time (`Track::get`), so the queue
+  never needs the Web API either.
+- `Handler.armed_spotify` tracks which Spotify track (if any) has been handed
+  off to Spotify's own queue; `head_action` (pure fn, unit-tested per table
+  row) decides what a trigger (enqueue, track end, skip, ...) does to the
+  queue head, and `try_arm_head` is the single critical section that performs
+  the hand-off and sets `armed_spotify` — called from `reconcile` and from
+  the presence loop on every Spotify `Playing` event. `armed_spotify` is
+  cleared on `Idle`, `spawn_session`, `/logout`, `/forget`, and `/stop`.
 
 ### OAuth + storage
 - `src/oauth/mod.rs`: device authorization grant (RFC 8628) on Spotify's

@@ -20,11 +20,19 @@ DJ TTS (Kokoro) ── overlay ───────────┘ (mixes on to
 - **SimpleBridgeReader** (`src/discord/voice.rs`): `Read + Seek + MediaSource`
   for Songbird. Prebuffers on first read (honors `PREBUFFER_SECONDS`), then
   pulls from the bridge.
-- **Priority model** (`src/queue.rs`, managed in `bot.rs`): DJ overlay > queue
-  items (YouTube/SoundCloud/files) > Spotify Connect baseline. A queued item
-  never interrupts a playing Spotify track — the priority-queue manager waits
-  for `EndOfTrack` before draining, then resumes Spotify afterwards only if it
-  was playing before.
+- **Priority model** (`src/queue.rs`, managed in `bot.rs`): DJ overlay > one
+  bot-owned queue (Spotify tracks and YouTube/SoundCloud/files, in the order
+  they were added — `MediaSource::Spotify | YouTube | File`, YouTube covers
+  SoundCloud via yt-dlp) > Spotify Connect baseline. A media item at the head never interrupts a
+  playing Spotify track — the priority-queue manager waits for `EndOfTrack`
+  before draining, then resumes Spotify afterwards only if it was playing
+  before. A Spotify item at the head is instead pre-armed: while Spotify is
+  playing, `try_arm_head` hands it to Spotify Connect's own queue
+  (`AddToQueue`) so it plays gap-free at track end, tracked in
+  `Handler.armed_spotify` and popped when the matching `Playing` event
+  arrives; while Spotify is idle it's `Load`ed directly. `head_action` (pure
+  fn) maps `(head kind, Spotify state, trigger)` to the action to take —
+  arm, hand off, load, drain, or resume — and is unit-tested per case.
 
 ## Spotify path (librespot + OAuth)
 
@@ -36,11 +44,14 @@ DJ TTS (Kokoro) ── overlay ───────────┘ (mixes on to
   `src/spotify/player.rs`: `run_with_token` drives the Spirc
   session lifecycle (15s `Spirc::new` timeout, reconnect loop, event → presence).
   It also owns playback control: `SpircCommand`
-  (`Play`/`Pause`/`Next`/`Previous`/`AddToQueue`/`Load`) arrives over a
-  channel and is applied to the live `Spirc` — no calls to api.spotify.com.
-- Track metadata comes from librespot itself: `PlayerEvent::TrackChanged`
-  carries the `AudioItem` (title, artist, track_id, album art), which feeds
-  `PresenceUpdate` directly. There is no separate metadata fetch.
+  (`Play`/`Pause`/`Next`/`Previous`/`AddToQueue`/`Load`/`Lookup`) arrives over
+  a channel and is applied to the live `Spirc` — no calls to api.spotify.com.
+- Now-playing track metadata comes from librespot itself:
+  `PlayerEvent::TrackChanged` carries the `AudioItem` (title, artist,
+  track_id, album art), which feeds `PresenceUpdate` directly. Metadata for a
+  Spotify item *queued* ahead of time comes from `SpircCommand::Lookup`
+  (`Track::get(&session, &uri)` on the live session) instead — still no Web
+  API call.
 - Sessions: one active DJ; a proactive refresher task keeps the token fresh.
 
 ## Discord path (serenity + songbird)

@@ -25,7 +25,8 @@ playback is controlled from Spotify clients or from buttons in Discord.
   follows the user into their channel.
 - A now-playing text channel: rich embeds with album art, plus prev/pause/next
   buttons and a queue view.
-- `/play`, `/queue` (Spotify, YouTube/SoundCloud/file), `/skip`, `/stop`, `/np`.
+- `/play`, `/queue` (Spotify, YouTube/SoundCloud/file — one shared, ordered
+  queue), `/skip`, `/stop`, `/np`.
 - Optional DJ track announcements via a Kokoro TTS backend, toggled with
   `/announce` (persists across restarts).
 - Auto-starts the last active user's session on boot; auto-leaves and
@@ -39,8 +40,8 @@ playback is controlled from Spotify clients or from buttons in Discord.
 | `/logout` | Stop and deactivate your session (credentials kept) | no |
 | `/forget` | Delete your stored credentials | no |
 | `/who` | Show the active DJ | no |
-| `/play <url \| file> [next]` | Spotify/YouTube/SoundCloud URL or an audio attachment. Starts playback if nothing is playing; otherwise enqueues (`next:true` puts it at the front — Spotify links reject `next` since Spotify's own queue already plays it next) | yes (see below) |
-| `/queue [url \| file]` | Always enqueues, never starts playback; with no argument, shows the queue | yes |
+| `/play <url \| file> [next]` | Spotify/YouTube/SoundCloud URL or an audio attachment. Starts playback if nothing is playing; otherwise enqueues (`next:true` jumps the queue — behind an already-armed Spotify track if there is one, since Spotify can't be un-queued) | yes (see below) |
+| `/queue [url \| file]` | Same as `/play` but always enqueues, never starts playback; with no argument, lists everything queued, in order | yes |
 | `/skip` `/stop` | Skip / stop playback | yes |
 | `/np` | Now playing (or "Paused" if the active session isn't playing) | no |
 | `/announce` | Toggle DJ track announcements | no |
@@ -48,8 +49,31 @@ playback is controlled from Spotify clients or from buttons in Discord.
 Playback control (buttons, `/play`, `/queue`, `/skip`, `/stop`) requires sharing
 the bot's voice channel. Exception: when the bot isn't in voice yet, `/play`
 only requires the requester to be in *some* voice channel — the bot joins them
-(the fresh-boot path). Queued YouTube/SoundCloud/file items never interrupt a
-playing Spotify track — they play once the current track ends.
+(the fresh-boot path).
+
+## How the queue works
+
+`/play` and `/queue` share one bot-owned queue for Spotify tracks,
+YouTube/SoundCloud links, and files, in the order they were added — `/queue`
+lists all of it, not just one kind.
+
+- **Spotify at the head, Spotify playing:** the bot hands the track to
+  Spotify Connect's own queue right away so it starts gap-free the instant
+  the current track ends (`/queue` shows it as "next on Spotify"). Once
+  handed off, it's locked in — `next:true` can only insert behind it, and
+  `/stop` clears everything else but that track still plays once.
+- **Spotify at the head, Spotify idle:** the track is loaded directly (there's
+  no context to preserve).
+- **YouTube/SoundCloud/file at the head:** Spotify pauses, the item plays,
+  then Spotify resumes only if it was playing before — handing off the next
+  Spotify track from the queue if there is one.
+- **⏭:** advances the bot's queue first (a handed-off Spotify track, or a
+  media item); with the queue empty, it's Spotify's own next. Skipping into a
+  queued video parks the current Spotify track and resumes it afterwards.
+- A failed download removes its card and reposts the controls; the queue
+  continues.
+- The DJ's own phone-side Spotify queue is invisible to the bot — ordering
+  between the two is best-effort.
 
 ## Requirements
 

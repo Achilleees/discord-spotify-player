@@ -1,5 +1,7 @@
 use std::collections::VecDeque;
 
+use librespot_core::SpotifyUri;
+
 #[derive(Clone, Debug)]
 pub enum MediaSource {
     YouTube {
@@ -14,6 +16,12 @@ pub enum MediaSource {
         filename: String,
         attachment_url: String,
     },
+    Spotify {
+        uri: SpotifyUri,
+        title: String,
+        artist: String,
+        album_art_url: Option<String>,
+    },
 }
 
 impl MediaSource {
@@ -21,6 +29,7 @@ impl MediaSource {
         match self {
             MediaSource::YouTube { title, .. } => title,
             MediaSource::File { filename, .. } => filename,
+            MediaSource::Spotify { title, .. } => title,
         }
     }
 
@@ -28,11 +37,13 @@ impl MediaSource {
         match self {
             MediaSource::YouTube { channel, .. } => channel.clone(),
             MediaSource::File { .. } => "File upload".to_string(),
+            MediaSource::Spotify { artist, .. } => artist.clone(),
         }
     }
 
     /// Track length as "M:SS" (or "H:MM:SS"); None for file uploads, whose
-    /// length isn't known until decode.
+    /// length isn't known until decode, and for Spotify tracks, whose
+    /// duration isn't fetched by the queue layer.
     pub fn display_duration(&self) -> Option<String> {
         match self {
             MediaSource::YouTube { duration_secs, .. } => {
@@ -46,6 +57,7 @@ impl MediaSource {
                 })
             }
             MediaSource::File { .. } => None,
+            MediaSource::Spotify { .. } => None,
         }
     }
 
@@ -53,6 +65,7 @@ impl MediaSource {
         match self {
             MediaSource::YouTube { .. } => 0xFF0000,
             MediaSource::File { .. } => 0x5865F2,
+            MediaSource::Spotify { .. } => 0x1DB954,
         }
     }
 }
@@ -98,8 +111,36 @@ impl PriorityQueue {
         true
     }
 
+    /// Enqueue an item at an arbitrary position, clamping `idx` to the
+    /// current length so an out-of-range index appends instead of panicking.
+    /// Returns `false` (rejecting it) when the queue is full, matching
+    /// `push`'s cap semantics.
+    pub fn insert(&mut self, idx: usize, item: QueueItem) -> bool {
+        if self.items.len() >= MAX_QUEUE_LEN {
+            return false;
+        }
+        let idx = idx.min(self.items.len());
+        self.items.insert(idx, item);
+        true
+    }
+
     pub fn pop(&mut self) -> Option<QueueItem> {
         self.items.pop_front()
+    }
+
+    /// Look at the head of the queue without removing it.
+    pub fn peek(&self) -> Option<&QueueItem> {
+        self.items.front()
+    }
+
+    /// Pop the head only if it satisfies `pred`; otherwise leaves the queue
+    /// untouched and returns `None`.
+    pub fn pop_if(&mut self, pred: impl Fn(&QueueItem) -> bool) -> Option<QueueItem> {
+        if self.items.front().is_some_and(&pred) {
+            self.items.pop_front()
+        } else {
+            None
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -205,6 +246,71 @@ mod tests {
         }
         assert!(!q.push_front(item("overflow")), "rejects past the cap");
         assert_eq!(q.len(), MAX_QUEUE_LEN);
+    }
+
+    fn spotify_item(uri: &str, title: &str) -> QueueItem {
+        QueueItem {
+            source: MediaSource::Spotify {
+                uri: librespot_core::SpotifyUri::from_uri(uri).unwrap(),
+                title: title.into(),
+                artist: "artist".into(),
+                album_art_url: None,
+            },
+            queued_by: "me".into(),
+            queued_by_id: 1,
+        }
+    }
+
+    #[test]
+    fn insert_at_one_keeps_head() {
+        let mut q = PriorityQueue::new();
+        assert!(q.push(item("a")));
+        assert!(q.push(item("c")));
+        assert!(q.insert(1, item("b")));
+        let snap = q.snapshot();
+        assert_eq!(snap.len(), 3);
+        assert_eq!(snap[0].source.display_title(), "a");
+        assert_eq!(snap[1].source.display_title(), "b");
+        assert_eq!(snap[2].source.display_title(), "c");
+    }
+
+    #[test]
+    fn insert_rejects_when_full() {
+        let mut q = PriorityQueue::new();
+        for i in 0..MAX_QUEUE_LEN {
+            assert!(q.push(item(&i.to_string())), "should accept up to the cap");
+        }
+        assert!(!q.insert(0, item("overflow")), "rejects past the cap");
+        assert_eq!(q.len(), MAX_QUEUE_LEN);
+    }
+
+    #[test]
+    fn peek_does_not_consume() {
+        let mut q = PriorityQueue::new();
+        assert!(q.peek().is_none());
+        q.push(item("a"));
+        q.push(item("b"));
+        assert_eq!(q.peek().unwrap().source.display_title(), "a");
+        assert_eq!(q.len(), 2, "peek doesn't drain");
+        assert_eq!(q.peek().unwrap().source.display_title(), "a");
+    }
+
+    #[test]
+    fn pop_if_only_pops_matching_head() {
+        let mut q = PriorityQueue::new();
+        q.push(item("a"));
+        q.push(spotify_item("spotify:track:11dFghVXANMlKmJXsNCbNl", "b"));
+
+        assert!(
+            q.pop_if(|i| matches!(i.source, MediaSource::Spotify { .. })).is_none(),
+            "head doesn't match, so nothing pops"
+        );
+        assert_eq!(q.len(), 2);
+
+        let popped = q.pop_if(|i| matches!(i.source, MediaSource::YouTube { .. }));
+        assert_eq!(popped.unwrap().source.display_title(), "a");
+        assert_eq!(q.len(), 1);
+        assert_eq!(q.peek().unwrap().source.display_title(), "b");
     }
 
     #[test]
