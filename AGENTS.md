@@ -13,7 +13,7 @@ channel. This repo is the hardened reference for nob's music stack — see
 
 ## Build and run
 - `cargo build --release`; binary is `target\release\discord-spotify-player.exe`.
-- `cargo check` for fast feedback; `cargo test` (105 unit tests); `cargo clippy`.
+- `cargo check` for fast feedback; `cargo test` (101 unit tests); `cargo clippy`.
 - First-run setup: `--setup` writes `.env`. OAuth needs no config.
 - `.cargo/config.toml` (tracked) carries the cmake fix; MSVC toolchain on Windows.
 
@@ -39,8 +39,8 @@ channel. This repo is the hardened reference for nob's music stack — see
 
 ## Dependency policy
 - serenity 0.12, songbird 0.6 (native DAVE — do NOT reintroduce the git fork).
-- librespot 0.8 with the pinned `vergen`/`vergen-gitcl` build-dep workaround
-  (upstream issue librespot#1681). Check upstream before bumping.
+- librespot pinned to the git `dev` branch (unreleased `add_to_queue` and
+  device-auth fixes). Bump to the next crates.io release (0.9+) once it ships.
 - `rand` 0.10 (`rand::random::<T>()`). `parking_lot::Mutex` for the audio hot
   path; `std::sync::Mutex` elsewhere is fine.
 - `sha2`/`chacha20poly1305` come free via songbird's DAVE — reuse them.
@@ -58,5 +58,5 @@ channel. This repo is the hardened reference for nob's music stack — see
   Add tests for new pure units; write them nob-style so they port.
 
 ## Librespot notes
-- 0.8.0 includes the keepalive fix (PR #1359). Requires Spotify Premium.
-  Reverse-engineered protocol (Spotify ToS gray area); no DRM bypass.
+- Requires Spotify Premium. Reverse-engineered protocol (Spotify ToS gray
+  area); no DRM bypass.

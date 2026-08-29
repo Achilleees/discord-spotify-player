@@ -11,7 +11,8 @@ playback is controlled from Spotify clients or from buttons in Discord.
 ## Stack
 
 - Discord gateway + voice: `serenity` 0.12, `songbird` 0.6 (native DAVE).
-- Spotify Connect + playback: `librespot` 0.8 (core/connect/playback/metadata).
+- Spotify Connect + playback: `librespot` pinned to the git `dev` branch
+  (unreleased `add_to_queue` support; core/connect/playback/metadata).
 - YouTube/SoundCloud/files: `yt-dlp` + `ffmpeg` (external binaries).
 - Storage: SQLite (`rusqlite`, bundled). Runtime: `tokio`. Logs: `tracing`.
 
@@ -38,10 +39,10 @@ playback is controlled from Spotify clients or from buttons in Discord.
 | `/logout` | Stop and deactivate your session (credentials kept) | no |
 | `/forget` | Delete your stored credentials | no |
 | `/who` | Show the active DJ | no |
-| `/queue <url>` | Add a Spotify track to the queue | yes |
-| `/play <url>` | Queue a YouTube/SoundCloud/file track | yes (see below) |
+| `/queue <url>` | Add a Spotify track to the queue (via Spotify Connect, sent straight to the session) | yes |
+| `/play <url>` | Queue a YouTube/SoundCloud/file track (priority queue, separate from Spotify Connect) | yes (see below) |
 | `/skip` `/stop` | Skip / stop playback | yes |
-| `/np` | Now playing | no |
+| `/np` | Now playing (or "Paused" if the active session isn't playing) | no |
 | `/announce` | Toggle DJ track announcements | no |
 
 Playback control (buttons, `/queue`, `/play`, `/skip`, `/stop`) requires sharing
@@ -94,6 +95,6 @@ pipeline stats emit at `debug` on the `audio_stream` target every 5s.
 
 ## Development
 
-`cargo check` for fast feedback, `cargo test` (105 unit tests), `cargo clippy`.
+`cargo check` for fast feedback, `cargo test` (101 unit tests), `cargo clippy`.
 `.cargo/config.toml` carries a cmake fix required by native deps; the MSVC
 toolchain is required on Windows.

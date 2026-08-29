@@ -22,13 +22,11 @@ target/release/discord-spotify-player.exe          # normal
 target/release/discord-spotify-player.exe --setup  # first-run wizard
 ```
 
-`cargo check` for fast feedback, `cargo test` (105 unit tests), `cargo clippy`.
+`cargo check` for fast feedback, `cargo test` (101 unit tests), `cargo clippy`.
 
 ### Prerequisites
 - MSVC toolchain (native deps: opus, cmake). `.cargo/config.toml` (tracked)
   sets `CMAKE_POLICY_VERSION_MINIMUM=3.5`.
-- `vergen = "=9.0.6"` / `vergen-gitcl = "=1.0.5"` pinned in build-deps
-  (librespot#1681).
 - `yt-dlp` + `ffmpeg` on `PATH` for `/play` (optional).
 
 ## Configuration
@@ -74,7 +72,10 @@ Spotify / YouTube / files / DJ ─> AudioBridge ─> SimpleBridgeReader ─> Son
 - `spawn_session` joins voice, posts controls, starts the priority-queue
   manager, spawns the librespot task (`run_with_token`) and a proactive
   token-refresher (single owner of the refresh cycle). One active DJ; takeover
-  requires being in the bot's voice channel.
+  requires being in the bot's voice channel. Playback control (buttons,
+  `/skip`, `/queue` for Spotify tracks) goes straight to the live Spirc via
+  `SpircCommand` (`Play`/`Pause`/`Next`/`Previous`/`AddToQueue`) — no calls to
+  api.spotify.com.
 
 ### OAuth + storage
 - `src/oauth/mod.rs`: device authorization grant (RFC 8628) on Spotify's
@@ -83,12 +84,17 @@ Spotify / YouTube / files / DJ ─> AudioBridge ─> SimpleBridgeReader ─> Son
   `auth_blob` (XChaCha20-Poly1305).
 
 ### Presence (`src/presence.rs`, `src/discord/presence.rs`)
-- Player events → `PresenceUpdate` (carries `track_id` + `access_token`) →
-  `run_presence_loop_with_track` → bot status + now-playing embeds.
+- `PlayerEvent::TrackChanged` (librespot) supplies title/artist/track_id/album
+  art directly — no Web API fetch. Player events → `PresenceUpdate`
+  (`Idle` | `Paused { title, artist, track_id }` |
+  `Playing { title, artist, track_id, album_art_url }`) →
+  `run_presence_loop_with_track` → bot status + now-playing embeds. `/np`
+  reports "⏸ Paused" or "🎵 Now playing" from the same state.
 
 ## Key crate versions
 - serenity 0.12, songbird 0.6 (native DAVE — not the git fork).
-- librespot 0.8 (core/connect/playback/metadata; discovery removed).
+- librespot pinned to git `dev` (rev `1599145`, 2026-08-22; unreleased
+  `add_to_queue`) — bump to the next crates.io release once it ships.
 - rusqlite 0.32 (bundled), sha2 + chacha20poly1305 (free via songbird's DAVE).
 
 ## Safety and secrets

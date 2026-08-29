@@ -28,10 +28,16 @@ DJ TTS (Kokoro) ── overlay ───────────┘ (mixes on to
 - OAuth-only (device authorization grant, RFC 8628); mDNS discovery was
   removed in v0.5.
 - `src/oauth/mod.rs`: `request_device_code`, `poll_device_token`, token
-  refresh, profile fetch — all against Spotify's desktop client id.
+  refresh — all against Spotify's desktop client id. No profile fetch; the
+  Spotify session's display name is the Discord display name.
   `src/spotify/player.rs`: `run_with_token` drives the Spirc
   session lifecycle (15s `Spirc::new` timeout, reconnect loop, event → presence).
-- `src/spotify/metadata.rs`: Spotify Web API track metadata for embeds.
+  It also owns playback control: `SpircCommand`
+  (`Play`/`Pause`/`Next`/`Previous`/`AddToQueue`) arrives over a channel and is
+  applied to the live `Spirc` — no calls to api.spotify.com.
+- Track metadata comes from librespot itself: `PlayerEvent::TrackChanged`
+  carries the `AudioItem` (title, artist, track_id, album art), which feeds
+  `PresenceUpdate` directly. There is no separate metadata fetch.
 - Sessions: one active DJ; a proactive refresher task keeps the token fresh.
 
 ## Discord path (serenity + songbird)

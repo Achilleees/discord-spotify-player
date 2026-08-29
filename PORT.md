@@ -35,10 +35,20 @@ what NOT to bring across.
 7. **Discovery (mDNS)** — deleted. OAuth-only, like nob.
 8. **Token refresh** — proactive (single-owner task, `expires_in` − 5 min) plus
    an early-refresh Notify signal from the librespot task on session death.
-9. **Tests** — nob-style, portable (111 unit tests).
+9. **Tests** — nob-style, portable (101 unit tests).
 10. **Docs** — full rewrite + this file.
 11. **Songbird/DAVE** — songbird 0.6 stable (same as nob), not the fork.
 12. **Kickoff** — plan → merge → burn down by slice, each slice deployable.
+13. **Web API dropped** — the shared desktop client ID is rate-limited on
+    `api.spotify.com`, so the bot makes no calls there at all. Playback
+    control (prev/next/queue/buttons) goes straight to the live `Spirc` via
+    `SpircCommand`; track metadata (title/artist/album art) comes from
+    librespot's own `PlayerEvent::TrackChanged` instead of a Web API fetch.
+    This needed `Spirc::add_to_queue`, which isn't in a librespot release yet
+    — `Cargo.toml` pins the four librespot crates to the git `dev` branch
+    (rev `1599145`, 2026-08-22) instead of crates.io `0.8`. Bump to the next
+    crates.io release (0.9+) once `add_to_queue` and the device-auth fixes
+    ship there; drop the git pin at the same time.
 
 ## Module map: spotibot → nob-music
 
@@ -48,14 +58,14 @@ nob-music's internal modules are laid out in nob's `ARCHITECTURE.md`. The mappin
 |---|---|---|
 | `src/oauth/mod.rs` | `spotify` (OAuth client) | device flow: `request_device_code` / `poll_device_token` / `refresh` — port as-is. |
 | `src/users/mod.rs` + `crypto.rs` | `spotify` (credential store) + nob-core db | Table schema already matches nob's `spotify_credentials`. See "storage" below. |
-| `src/spotify/player.rs` | `spotify` (session lifecycle) | `run_with_token` = the Spirc lifecycle. Drop `SpotifyPlayer` struct-of-statics for a module. |
+| `src/spotify/player.rs` | `spotify` (session lifecycle) | `run_with_token` = the Spirc lifecycle. Drop `SpotifyPlayer` struct-of-statics for a module. Also owns playback control: a `SpircCommand` channel (`Play`/`Pause`/`Next`/`Previous`/`AddToQueue`) is applied to the live `Spirc` — port this channel, not a Web API client. |
 | `src/spotify/sink.rs` | nob-audio (DSP) + `spotify` (sink) | Biquad/DSP belongs in nob-audio (already has DSP); the `Sink` impl stays in music. |
-| `src/spotify/metadata.rs` | `spotify` (Web API) | Raw reqwest track fetch. |
+| `src/spotify/metadata.rs` | *(deleted)* | Was a raw reqwest Web API track fetch; removed — track metadata now comes from librespot's `PlayerEvent::TrackChanged` (see decision #13). Nothing to port. |
 | `src/audio_bridge.rs` | nob-audio (ring buffer) | nob-audio already has a tested ring buffer — reconcile, keep nob's, port the even-frame parity guard if missing. |
 | `src/audio/dj.rs` | `dj` | **Kokoro is a Unix socket here, not HTTP.** nob's TASKS say HTTP REST :8880 — reconcile (see gotcha). |
 | `src/audio/mod.rs` (join sound) | `dj` or `actions` | Small; place with sound effects. |
 | `src/discord/voice.rs` | `voice` | `SimpleBridgeReader` = the Songbird source adapter. |
-| `src/presence.rs` | `presence` (or a shared-types module) | The shared `PresenceUpdate` enum (Idle/Paused/Playing carrying title, artist, track_id, access_token) — both the player-event side and `src/discord/presence.rs` depend on it; give it an explicit home. |
+| `src/presence.rs` | `presence` (or a shared-types module) | The shared `PresenceUpdate` enum (`Idle` / `Paused { title, artist, track_id }` / `Playing { title, artist, track_id, album_art_url }`, sourced from `PlayerEvent::TrackChanged` — no `access_token`) — both the player-event side and `src/discord/presence.rs` depend on it; give it an explicit home. |
 | `src/discord/presence.rs` | `presence` | Bot status text. |
 | `src/discord/bot.rs` | **split across `commands`/`actions`/`panel`/`player`** | **Do NOT port wholesale** — see below. |
 | `src/queue.rs` | `queue` | Priority queue (DJ overlay > queue interrupts > Spotify baseline). Capped at `MAX_QUEUE_LEN = 500` (matches nob's unified-queue cap); `push()` is fallible (`-> bool`), rejecting at capacity. |
@@ -109,10 +119,13 @@ nob-music's internal modules are laid out in nob's `ARCHITECTURE.md`. The mappin
   token race and rotate it out from under each other. The fix: one refresher
   task owns it; everything else reads the current access token from shared
   state and *signals* the refresher (Notify) rather than refreshing itself.
-- **The Web API token goes stale independently of the librespot session.** A
-  healthy >1h Spirc session keeps streaming, but its captured access token
-  expires — so metadata/buttons/queue 401 silently. Proactive refresh + reading
-  the token fresh from `ActiveSession` at call time both matter.
+- **The OAuth access token goes stale independently of the librespot session.**
+  A healthy >1h Spirc session keeps streaming, but the captured access token
+  still expires, and a reconnect (fast-reconnect loop or session death) needs
+  a live one to re-authenticate `Spirc::new`. Proactive refresh + reading the
+  token fresh from `ActiveSession` at call time both matter — even though
+  buttons/queue/metadata no longer make Web API calls (decision #13), the
+  token itself is still load-bearing for reconnects.
 - **Device flow needs no callback.** The old Authorization Code + PKCE flow
   redirected to `127.0.0.1` on the *user's* machine, where nothing listens on
   a headless box — hence the old paste-back UX. The device authorization
