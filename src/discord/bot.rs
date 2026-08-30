@@ -838,11 +838,6 @@ impl Handler {
                 }
             }
         }
-        // Fresh join only: give the previous session's abort (if any) a
-        // moment to actually stop touching the bridge before this hooks the
-        // reader to a new call — mirrors the old spawn_session's fixed
-        // pre-join wait.
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         (self.join_voice)(discord_user_id).await
     }
 

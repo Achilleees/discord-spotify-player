@@ -805,10 +805,12 @@ pub fn step(state: &mut PlayerState, input: Input, now: Instant) -> Vec<Effect> 
                 // head if queued; otherwise idle plus a channel notice. The
                 // media path is untouchable from here — the session
                 // lifecycle cannot reach the feeder or the bridge while a
-                // media item holds the turn.
+                // media item holds the turn. Spotify itself was holding the
+                // turn, though, so whatever it left buffered is cleared
+                // either way.
+                fx.push(Effect::ClearBridge);
                 if matches!(head_of(&state.queue), Head::Media) {
                     let item = state.queue.pop().expect("head checked as media");
-                    fx.push(Effect::ClearBridge);
                     start_media(state, item, StartGate::Immediate, &mut fx);
                 } else {
                     state.active = Active::None;
@@ -820,9 +822,18 @@ pub fn step(state: &mut PlayerState, input: Input, now: Instant) -> Vec<Effect> 
             }
         }
 
-        Input::LinkReconnecting { gen: _ } => {
+        Input::LinkReconnecting { gen } => {
+            if gen != state.link_gen {
+                return fx;
+            }
             // Fast reconnects are not link-down: no armed-clearing, no turn
-            // change — the session task rides it out.
+            // change — the session task rides it out. The session did just
+            // tear down and reconnect, though, so if Spotify held the turn,
+            // whatever it left buffered in the shared bridge is stale —
+            // never while a media item holds the turn.
+            if matches!(state.active, Active::Spotify { .. } | Active::SpotifyPending { .. }) {
+                fx.push(Effect::ClearBridge);
+            }
         }
 
         Input::VoiceReady => {
@@ -1008,6 +1019,14 @@ fn handle_transport(state: &mut PlayerState, ev: TransportEvent, now: Instant, f
         TransportEvent::Paused { uri } => {
             state.sp = SpDevice::Paused(uri.clone());
             state.device_active = true;
+            if matches!(state.active, Active::Spotify { .. } | Active::SpotifyPending { .. }) {
+                // Spotify holds the turn, so whatever it left buffered in
+                // the shared bridge is stale the moment it pauses. Gated on
+                // the turn, not on who caused the pause: this must never
+                // fire while a media item holds the turn — a phone pause or
+                // a reconnect wiping a YouTube track mid-play was the bug.
+                fx.push(Effect::ClearBridge);
+            }
             if !state.inflight.consume_pause(now) {
                 // Nobody here asked for it: a human paused on their device.
                 state.pause_owner = Some(PauseOwner::Human);
@@ -1024,9 +1043,11 @@ fn handle_transport(state: &mut PlayerState, ev: TransportEvent, now: Instant, f
             state.sp = if state.device_active { SpDevice::Idle } else { SpDevice::Inactive };
             state.pause_owner = None;
             if matches!(state.active, Active::Spotify { .. } | Active::SpotifyPending { .. }) {
+                // Spotify held the turn and just stopped: clear whatever it
+                // left buffered, whether or not a media item takes over next.
+                fx.push(Effect::ClearBridge);
                 if matches!(head_of(&state.queue), Head::Media) {
                     let item = state.queue.pop().expect("head checked as media");
-                    fx.push(Effect::ClearBridge);
                     start_media(state, item, StartGate::Immediate, fx);
                 } else {
                     state.active = Active::None;
@@ -1075,6 +1096,9 @@ fn handle_transport(state: &mut PlayerState, ev: TransportEvent, now: Instant, f
         }
 
         TransportEvent::Unavailable { uri } => {
+            if matches!(state.active, Active::Spotify { .. } | Active::SpotifyPending { .. }) {
+                fx.push(Effect::ClearBridge);
+            }
             if state.armed.as_ref().is_some_and(|a| a.uri == uri) {
                 // Librespot self-skips unavailable tracks — surface it,
                 // drop the request, and arm the next one.
@@ -2079,6 +2103,79 @@ mod tests {
         assert!(matches!(sim.s.active, Active::None));
     }
 
+    // --- bridge ownership: only Spotify's own turn clears it ---------------
+    //
+    // The shared-bridge hazard: `AudioBridge` is also written by the media
+    // feeder and the DJ overlay. These mirror the four raw
+    // `bridge.clear()` calls deleted from `spotify/player.rs` as gated
+    // `Effect::ClearBridge` emissions here — they must fire when Spotify's
+    // own transport reports it stopped being audible, and must never fire
+    // while a media item holds the turn (that was the bug: a librespot
+    // reconnect or a phone-side pause wiping a YouTube track mid-play).
+
+    #[test]
+    fn paused_does_not_clear_the_bridge_while_media_holds_the_turn() {
+        let mut sim = Sim::media_over_paused_baseline();
+        let fx = sim.transport(TransportEvent::Paused { uri: uri(9) });
+        assert!(!has_clear(&fx));
+    }
+
+    #[test]
+    fn paused_clears_the_bridge_while_spotify_holds_the_turn() {
+        let mut sim = Sim::baseline_playing();
+        let fx = sim.transport(TransportEvent::Paused { uri: uri(9) });
+        assert!(has_clear(&fx));
+    }
+
+    #[test]
+    fn stopped_does_not_clear_the_bridge_while_media_holds_the_turn() {
+        let mut sim = Sim::media_over_paused_baseline();
+        let fx = sim.transport(TransportEvent::Stopped);
+        assert!(!has_clear(&fx));
+    }
+
+    #[test]
+    fn stopped_clears_the_bridge_while_spotify_holds_the_turn() {
+        let mut sim = Sim::baseline_playing();
+        let fx = sim.transport(TransportEvent::Stopped);
+        assert!(has_clear(&fx));
+    }
+
+    #[test]
+    fn unavailable_does_not_clear_the_bridge_while_media_holds_the_turn() {
+        let mut sim = Sim::media_over_paused_baseline();
+        let fx = sim.transport(TransportEvent::Unavailable { uri: uri(9) });
+        assert!(!has_clear(&fx));
+    }
+
+    #[test]
+    fn unavailable_clears_the_bridge_while_spotify_holds_the_turn() {
+        let mut sim = Sim::baseline_playing();
+        let fx = sim.transport(TransportEvent::Unavailable { uri: uri(9) });
+        assert!(has_clear(&fx));
+    }
+
+    #[test]
+    fn link_down_does_not_clear_the_bridge_while_media_holds_the_turn() {
+        let mut sim = Sim::media_over_paused_baseline();
+        let fx = sim.step(Input::LinkDown { gen: 1 });
+        assert!(!has_clear(&fx));
+    }
+
+    #[test]
+    fn link_down_clears_the_bridge_while_spotify_holds_the_turn() {
+        let mut sim = Sim::baseline_playing();
+        let fx = sim.step(Input::LinkDown { gen: 1 });
+        assert!(has_clear(&fx));
+    }
+
+    #[test]
+    fn link_reconnecting_does_not_clear_the_bridge_while_media_holds_the_turn() {
+        let mut sim = Sim::media_over_paused_baseline();
+        let fx = sim.step(Input::LinkReconnecting { gen: 1 });
+        assert!(!has_clear(&fx));
+    }
+
     // --- Playing bookkeeping ----------------------------------------------
 
     #[test]
@@ -2342,7 +2439,9 @@ mod tests {
         let id = sim.push_spotify(1, "s1");
         sim.arm(1, id, Ack::Confirmed);
         let fx = sim.step(Input::LinkReconnecting { gen: 1 });
-        assert!(fx.is_empty());
+        // Only the bridge clear (Spotify held the turn) — no armed-clearing,
+        // no turn change on a fast reconnect.
+        assert!(matches!(fx.as_slice(), [Effect::ClearBridge]));
         assert!(sim.s.armed.is_some(), "no armed-clearing on a fast reconnect");
         assert!(matches!(sim.s.active, Active::Spotify { .. }));
     }

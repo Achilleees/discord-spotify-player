@@ -218,7 +218,6 @@ impl SpotifyPlayer {
 
     fn spawn_event_loop(
         rx: tokio::sync::mpsc::UnboundedReceiver<PlayerEvent>,
-        bridge_for_events: Arc<AudioBridge>,
         transport_tx: mpsc::UnboundedSender<TransportEvent>,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
@@ -267,28 +266,21 @@ impl SpotifyPlayer {
                     }
                     PlayerEvent::Paused { track_id, .. } => {
                         let _ = transport_tx.send(TransportEvent::Paused { uri: track_id });
-                        bridge_for_events.clear();
                         tracing::debug!("playback paused");
                     }
                     PlayerEvent::Stopped { .. } => {
                         let _ = transport_tx.send(TransportEvent::Stopped);
-                        bridge_for_events.clear();
                         tracing::debug!("playback stopped");
                     }
                     PlayerEvent::Loading { .. } => {
                         tracing::debug!("loading track");
                     }
                     PlayerEvent::EndOfTrack { .. } => {
-                        // Don't clear the bridge on a natural track boundary — it
-                        // would trim the tail of an auto-advancing track. A real
-                        // stop is handled by PlayerEvent::Stopped, and a priority
-                        // item's drain clears the bridge itself before playing.
                         last_sent_track = None;
                         let _ = transport_tx.send(TransportEvent::EndOfTrack);
                     }
                     PlayerEvent::Unavailable { track_id, .. } => {
                         let _ = transport_tx.send(TransportEvent::Unavailable { uri: track_id });
-                        bridge_for_events.clear();
                         println!("Track unavailable");
                     }
                     PlayerEvent::SetQueue { current_track, next_tracks, .. } => {
@@ -335,7 +327,6 @@ impl SpotifyPlayer {
         let credentials = Credentials::with_access_token(access_token.clone());
 
         loop {
-            bridge.clear();
             let session = Self::create_session(&device_id);
             let connect_config = Self::connect_config(&device_name);
             let mixer: Arc<dyn Mixer> = Arc::new(
@@ -348,7 +339,6 @@ impl SpotifyPlayer {
             };
 
             let bridge_clone = bridge.clone();
-            let bridge_for_events = bridge.clone();
             let dsp_config = DspConfig::new(
                 config.preamp_db,
                 config.bass_boost_db,
@@ -361,12 +351,12 @@ impl SpotifyPlayer {
 
             // Event loop is guarded so it is aborted when this future is
             // dropped (logout/takeover) or when the loop reconnects, rather
-            // than detaching and pushing into the shared bridge as a ghost.
-            let _event_guard = AbortOnDrop(Self::spawn_event_loop(
-                rx,
-                bridge_for_events,
-                transport_tx.clone(),
-            ));
+            // than left detached to keep forwarding a dead generation's
+            // transport events after a new one has already taken over. It
+            // never touches the bridge itself — clearing it is the player
+            // core's call now (`Effect::ClearBridge`, gated on whether
+            // Spotify holds the turn), not this raw event forwarder's.
+            let _event_guard = AbortOnDrop(Self::spawn_event_loop(rx, transport_tx.clone()));
 
             tracing::info!(device_id = %device_id, device_name = %device_name, "calling Spirc::new");
             let (spirc, spirc_task) = tokio::time::timeout(
