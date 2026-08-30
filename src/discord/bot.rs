@@ -142,9 +142,10 @@ struct Handler {
     /// Last /play per user, for the metadata-probe cooldown.
     play_cooldowns: Arc<Mutex<HashMap<u64, Instant>>>,
     auto_start_attempted: AtomicBool,
-    /// The Spotify track (if any) already pre-armed via `AddToQueue` for
-    /// gap-free handoff at the head of `priority_queue` — see
-    /// `try_arm_head`/`head_action`. `None` when nothing is armed.
+    /// The Spotify track (if any) already pre-armed via `AddToQueue` —
+    /// found anywhere in `priority_queue`, not just at the head — for
+    /// gap-free radio-rules handoff. See `try_arm_first_spotify`/
+    /// `head_action`. `None` when nothing is armed.
     armed_spotify: Arc<Mutex<Option<SpotifyUri>>>,
 }
 
@@ -192,29 +193,44 @@ enum DrainOutcome {
     Finished,
     /// Skip/stop cancelled the active item; the canceller owns what's next.
     Cancelled,
-    /// A Spotify item reached the head and was handed to Spotify; its
-    /// `Playing` event arms the next head.
-    HandedToSpotify,
 }
 
 /// What `Handler::reconcile` should do about the current queue head.
+///
+/// "Radio rules": tracks play in strict bot-queue order regardless of
+/// source, the bot never sends `SpircCommand::Next` except on an explicit
+/// user skip, and Spotify never plays over an active media item. The
+/// mechanism is arming the *first* Spotify item anywhere in the queue (not
+/// just the head) once Spotify is confirmed playing: `AddToQueue` puts it
+/// on librespot's own auto-advance, which then lands on it whenever
+/// whatever's ahead of it (in our queue, media or otherwise) finishes —
+/// paused at 0:00 if a media item got there first, since media playback
+/// pauses the Spotify baseline while it runs.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum HeadAction {
-    /// Pre-arm the head via `AddToQueue` (see `try_arm_head`).
+    /// Pre-arm the first Spotify item anywhere in the queue via
+    /// `AddToQueue` (see `try_arm_first_spotify`).
     Arm,
-    /// Hand the head straight to Spotify (`AddToQueue`+`Next`, +`Play` if
-    /// paused), pop it, clear armed, then arm whatever's next.
-    Handoff,
+    /// Queue the first un-armed Spotify item behind Spotify's current
+    /// context (`AddToQueue`, no `Next`) and mark it armed (see
+    /// `queue_behind_current`). Never pops — its own `Playing` event does.
+    QueueBehindCurrent,
+    /// `QueueBehindCurrent`, then resume the Spotify baseline (`Play`) —
+    /// only if it was playing before whatever just triggered this.
+    QueueThenResume,
+    /// `QueueBehindCurrent`, then skip straight to it (`Next`).
+    QueueThenNext,
     /// `Load` the head now (Spotify is idle — no context to lose).
     Load,
     /// Run/continue a priority-queue drain of the media item at the head.
     Drain,
+    /// Send `SpircCommand::Next` (so Spotify also leaves whatever it's on),
+    /// then run/continue a drain of the media item at the head.
+    NextThenDrain,
     /// Resume the Spotify baseline (`Play`).
     ResumeSpotify,
     /// Skip to the already-armed track (`Next`).
     NextSpotify,
-    /// Resume the paused baseline without hijacking it, then try to arm.
-    ResumeThenArm,
     /// Nothing to do.
     Nothing,
 }
@@ -228,30 +244,33 @@ enum HeadAction {
 fn head_action(head: HeadKind, spotify: SpotifyState, media_active: bool, trigger: Trigger) -> HeadAction {
     use HeadAction::*;
     match (trigger, head) {
-        (Trigger::Enqueue, HeadKind::Spotify { armed: false }) => {
+        // Arm is a no-op (via try_arm_first_spotify) when there's nothing
+        // un-armed to arm, so this doesn't need to inspect the head at all.
+        (Trigger::Enqueue, _) => {
             if spotify == SpotifyState::Playing && !media_active { Arm } else { Nothing }
         }
-        (Trigger::Enqueue, _) => Nothing,
 
         (Trigger::TrackEnd, _) if media_active => Nothing,
         (Trigger::TrackEnd, HeadKind::Spotify { armed: true }) => Nothing,
-        (Trigger::TrackEnd, HeadKind::Spotify { armed: false }) => Handoff,
+        (Trigger::TrackEnd, HeadKind::Spotify { armed: false }) => QueueBehindCurrent,
         (Trigger::TrackEnd, HeadKind::Media) => Drain,
         (Trigger::TrackEnd, HeadKind::Empty) => Nothing,
 
         (Trigger::MediaEnd, HeadKind::Spotify { armed: true }) => ResumeSpotify,
-        (Trigger::MediaEnd, HeadKind::Spotify { armed: false }) => Handoff,
+        (Trigger::MediaEnd, HeadKind::Spotify { armed: false }) => {
+            if spotify == SpotifyState::Idle { Load } else { QueueThenResume }
+        }
         (Trigger::MediaEnd, HeadKind::Media) => Nothing,
         (Trigger::MediaEnd, HeadKind::Empty) => Nothing,
 
         (Trigger::Skip, HeadKind::Spotify { armed: true }) => NextSpotify,
-        (Trigger::Skip, HeadKind::Spotify { armed: false }) => Handoff,
-        (Trigger::Skip, HeadKind::Media) => Drain,
+        (Trigger::Skip, HeadKind::Spotify { armed: false }) => QueueThenNext,
+        (Trigger::Skip, HeadKind::Media) => NextThenDrain,
         (Trigger::Skip, HeadKind::Empty) => NextSpotify,
 
         (Trigger::PlayButton, HeadKind::Spotify { armed: true }) => ResumeSpotify,
         (Trigger::PlayButton, HeadKind::Spotify { armed: false }) => {
-            if spotify == SpotifyState::Idle { Load } else { ResumeThenArm }
+            if spotify == SpotifyState::Idle { Load } else { QueueThenResume }
         }
         (Trigger::PlayButton, HeadKind::Media) => Drain,
         (Trigger::PlayButton, HeadKind::Empty) => ResumeSpotify,
@@ -269,8 +288,14 @@ mod head_action_tests {
     const SPOT_UNARMED: HeadKind = HeadKind::Spotify { armed: false };
 
     #[test]
-    fn enqueue_arms_a_playing_idle_spotify_head() {
+    fn enqueue_arms_while_spotify_is_playing_regardless_of_head() {
+        // Arm looks anywhere in the queue for the first un-armed Spotify
+        // item (and is a no-op if there isn't one), so this trigger doesn't
+        // need to inspect the head kind at all.
         assert_eq!(head_action(SPOT_UNARMED, PLAYING, false, Trigger::Enqueue), HeadAction::Arm);
+        assert_eq!(head_action(SPOT_ARMED, PLAYING, false, Trigger::Enqueue), HeadAction::Arm);
+        assert_eq!(head_action(HeadKind::Media, PLAYING, false, Trigger::Enqueue), HeadAction::Arm);
+        assert_eq!(head_action(HeadKind::Empty, PLAYING, false, Trigger::Enqueue), HeadAction::Arm);
     }
 
     #[test]
@@ -279,12 +304,9 @@ mod head_action_tests {
     }
 
     #[test]
-    fn enqueue_does_nothing_for_any_other_head() {
+    fn enqueue_does_nothing_unless_spotify_is_playing() {
         assert_eq!(head_action(SPOT_UNARMED, PAUSED, false, Trigger::Enqueue), HeadAction::Nothing);
         assert_eq!(head_action(SPOT_UNARMED, IDLE, false, Trigger::Enqueue), HeadAction::Nothing);
-        assert_eq!(head_action(SPOT_ARMED, PLAYING, false, Trigger::Enqueue), HeadAction::Nothing);
-        assert_eq!(head_action(HeadKind::Media, PLAYING, false, Trigger::Enqueue), HeadAction::Nothing);
-        assert_eq!(head_action(HeadKind::Empty, PLAYING, false, Trigger::Enqueue), HeadAction::Nothing);
     }
 
     #[test]
@@ -293,8 +315,8 @@ mod head_action_tests {
     }
 
     #[test]
-    fn track_end_hands_off_an_unarmed_spotify_head() {
-        assert_eq!(head_action(SPOT_UNARMED, PAUSED, false, Trigger::TrackEnd), HeadAction::Handoff);
+    fn track_end_queues_behind_current_for_an_unarmed_spotify_head() {
+        assert_eq!(head_action(SPOT_UNARMED, PAUSED, false, Trigger::TrackEnd), HeadAction::QueueBehindCurrent);
     }
 
     #[test]
@@ -319,8 +341,13 @@ mod head_action_tests {
     }
 
     #[test]
-    fn media_end_hands_off_an_unarmed_spotify_head() {
-        assert_eq!(head_action(SPOT_UNARMED, PAUSED, false, Trigger::MediaEnd), HeadAction::Handoff);
+    fn media_end_queues_behind_current_for_an_unarmed_spotify_head_when_not_idle() {
+        assert_eq!(head_action(SPOT_UNARMED, PAUSED, false, Trigger::MediaEnd), HeadAction::QueueThenResume);
+    }
+
+    #[test]
+    fn media_end_loads_an_unarmed_spotify_head_while_idle() {
+        assert_eq!(head_action(SPOT_UNARMED, IDLE, false, Trigger::MediaEnd), HeadAction::Load);
     }
 
     #[test]
@@ -334,13 +361,13 @@ mod head_action_tests {
     }
 
     #[test]
-    fn skip_hands_off_an_unarmed_spotify_head() {
-        assert_eq!(head_action(SPOT_UNARMED, PLAYING, false, Trigger::Skip), HeadAction::Handoff);
+    fn skip_queues_behind_current_then_skips_an_unarmed_spotify_head() {
+        assert_eq!(head_action(SPOT_UNARMED, PLAYING, false, Trigger::Skip), HeadAction::QueueThenNext);
     }
 
     #[test]
-    fn skip_drains_a_media_head() {
-        assert_eq!(head_action(HeadKind::Media, PLAYING, false, Trigger::Skip), HeadAction::Drain);
+    fn skip_sends_next_then_drains_a_media_head() {
+        assert_eq!(head_action(HeadKind::Media, PLAYING, false, Trigger::Skip), HeadAction::NextThenDrain);
     }
 
     #[test]
@@ -360,7 +387,7 @@ mod head_action_tests {
 
     #[test]
     fn play_button_never_hijacks_a_paused_baseline() {
-        assert_eq!(head_action(SPOT_UNARMED, PAUSED, false, Trigger::PlayButton), HeadAction::ResumeThenArm);
+        assert_eq!(head_action(SPOT_UNARMED, PAUSED, false, Trigger::PlayButton), HeadAction::QueueThenResume);
     }
 
     #[test]
@@ -375,9 +402,11 @@ mod head_action_tests {
 }
 
 /// Classifies the current head of `priority_queue` into a `HeadKind`,
-/// comparing a Spotify head's URI against `armed` to decide `armed: bool`.
-/// Locks `armed` first, then `priority_queue` — same order as
-/// `try_arm_head`/`handoff_head`, and never holds both at once.
+/// comparing a Spotify head's URI against `armed` to decide `armed: bool`
+/// (whether this particular head item is the one currently armed — armed
+/// itself can sit anywhere else in the queue). Locks `armed` first, then
+/// `priority_queue` — same order as `try_arm_first_spotify`/
+/// `queue_behind_current`, and never holds both at once.
 fn classify_head(priority_queue: &Mutex<PriorityQueue>, armed: &Mutex<Option<SpotifyUri>>) -> HeadKind {
     let armed_uri = { armed.lock().clone() };
     let lock = priority_queue.lock();
@@ -390,15 +419,31 @@ fn classify_head(priority_queue: &Mutex<PriorityQueue>, armed: &Mutex<Option<Spo
     }
 }
 
-/// The armed-head critical section (invariant: an armed head is never
-/// `AddToQueue`'d again). If nothing is currently armed, the queue's head
-/// is an un-armed Spotify item, Spotify is playing, and no media item is
-/// mid-playback, hands that track to Spotify's own queue and remembers it
-/// as armed. Returns whether it armed something.
+/// Finds the first Spotify item anywhere in `priority_queue` and returns
+/// its URI. Shared by `try_arm_first_spotify` and `queue_behind_current` —
+/// both only ever call this while `armed` is confirmed `None`, so "first
+/// Spotify item" and "first un-armed Spotify item" coincide. Caller must
+/// already hold `priority_queue`'s lock (passed in as `lock` to avoid
+/// re-entrant locking).
+fn first_spotify_uri(lock: &PriorityQueue) -> Option<SpotifyUri> {
+    lock.find_first(|item| matches!(item.source, MediaSource::Spotify { .. }))
+        .and_then(|item| match &item.source {
+            MediaSource::Spotify { uri, .. } => Some(uri.clone()),
+            _ => None,
+        })
+}
+
+/// The armed-head critical section (invariant: an armed track is never
+/// `AddToQueue`'d again). If nothing is currently armed, Spotify is
+/// playing, and no media item is mid-playback, arms the first Spotify item
+/// anywhere in the queue: `AddToQueue`s it onto Spotify's own device queue
+/// and remembers it as armed, so librespot's auto-advance lands on it once
+/// everything ahead of it in our queue (media items included) is done.
+/// Returns whether it armed something.
 ///
 /// Lock order: `armed` first, then `priority_queue` — callers must not
 /// already hold `priority_queue` when calling this.
-fn try_arm_head(
+fn try_arm_first_spotify(
     priority_queue: &Mutex<PriorityQueue>,
     armed: &Mutex<Option<SpotifyUri>>,
     spirc_tx: Option<&mpsc::UnboundedSender<SpircCommand>>,
@@ -415,13 +460,7 @@ fn try_arm_head(
     };
     let uri = {
         let queue_lock = priority_queue.lock();
-        match queue_lock.peek() {
-            Some(item) => match &item.source {
-                MediaSource::Spotify { uri, .. } => Some(uri.clone()),
-                _ => None,
-            },
-            None => None,
-        }
+        first_spotify_uri(&queue_lock)
     };
     let uri = match uri {
         Some(u) => u,
@@ -434,67 +473,55 @@ fn try_arm_head(
     true
 }
 
-/// `HeadAction::Handoff`: hand the queue head straight to Spotify
-/// (`AddToQueue` + `Next`, plus `Play` if Spotify was paused — it sits
-/// paused on its context's next track after a queue exhausts), pop it from
-/// our queue, clear `armed`, then immediately try to arm whatever is now
-/// the new head so chained Spotify items stay gap-free. Free function (not
-/// a `Handler` method) so it's usable from contexts without `&self`, such
-/// as `priority_queue_manager`.
-fn handoff_head(
+/// `HeadAction::QueueBehindCurrent`: finds the first un-armed Spotify item
+/// anywhere in the queue and queues it behind whatever Spotify's device is
+/// currently on (`AddToQueue`, never `Next` — that's how this never plays
+/// over an active media item or interrupts a mid-play Spotify track), then
+/// marks it armed so it isn't queued twice. Never pops it: its own
+/// `Playing` event does that once librespot's auto-advance reaches it.
+/// No-op if something is already armed or there's no live session. Free
+/// function (not a `Handler` method) so it's usable from contexts without
+/// `&self`, such as `priority_queue_manager`.
+///
+/// Lock order: `armed` first, then `priority_queue` — callers must not
+/// already hold `priority_queue` when calling this.
+fn queue_behind_current(
     priority_queue: &Mutex<PriorityQueue>,
     armed: &Mutex<Option<SpotifyUri>>,
     spirc_tx: Option<&mpsc::UnboundedSender<SpircCommand>>,
-    spotify: SpotifyState,
-    media_active: bool,
-) {
+) -> bool {
+    let mut armed_lock = armed.lock();
+    if armed_lock.is_some() {
+        return false;
+    }
+    let tx = match spirc_tx {
+        Some(tx) => tx,
+        None => return false,
+    };
     let uri = {
-        let lock = priority_queue.lock();
-        match lock.peek() {
-            Some(item) => match &item.source {
-                MediaSource::Spotify { uri, .. } => Some(uri.clone()),
-                _ => None,
-            },
-            None => None,
-        }
+        let queue_lock = priority_queue.lock();
+        first_spotify_uri(&queue_lock)
     };
     let uri = match uri {
         Some(u) => u,
-        None => return,
+        None => return false,
     };
-    if let Some(tx) = spirc_tx {
-        if spotify == SpotifyState::Idle {
-            // Nothing loaded: there is no context to queue behind, and none
-            // to lose — load the track directly.
-            let _ = tx.send(SpircCommand::Load(uri.clone()));
-        } else {
-            let _ = tx.send(SpircCommand::AddToQueue(uri.clone()));
-            let _ = tx.send(SpircCommand::Next);
-            if spotify == SpotifyState::Paused {
-                let _ = tx.send(SpircCommand::Play);
-            }
-        }
+    if tx.send(SpircCommand::AddToQueue(uri.clone())).is_err() {
+        return false;
     }
-    {
-        let mut lock = priority_queue.lock();
-        lock.pop_if(|item| matches!(&item.source, MediaSource::Spotify { uri: u, .. } if *u == uri));
-    }
-    {
-        let mut lock = armed.lock();
-        *lock = None;
-    }
-    try_arm_head(priority_queue, armed, spirc_tx, spotify, media_active);
+    *armed_lock = Some(uri);
+    true
 }
 
-/// After a queue drain returns — naturally finished, or (per
-/// `run_queue_drain`) broke off having handed a Spotify item straight to
-/// Spotify's own queue — decides what, if anything, happens to whatever is
-/// now at the head of our queue. Implements the `MediaEnd` rows of
-/// `head_action`. `media_active` is not read here: a drain always clears
-/// `active_priority_item` before returning, so it is always false at this
-/// point. Free function so the drain owners (`priority_queue_manager`, and
-/// the task `trigger_priority_queue_drain` spawns) can call it without
-/// `&self`.
+/// After a queue drain returns — naturally finished (per
+/// `run_queue_drain`, only media items reach the feeder now: a Spotify item
+/// reaching the head just ends the drain, it's never handed off) — decides
+/// what, if anything, happens to whatever is now at the head of our queue.
+/// Implements the `MediaEnd` rows of `head_action`. `media_active` is not
+/// read here: a drain always clears `active_priority_item` before
+/// returning, so it is always false at this point. Free function so the
+/// drain owners (`priority_queue_manager`, and the task
+/// `trigger_priority_queue_drain` spawns) can call it without `&self`.
 fn after_media_end(
     priority_queue: &Mutex<PriorityQueue>,
     armed: &Mutex<Option<SpotifyUri>>,
@@ -504,15 +531,34 @@ fn after_media_end(
 ) {
     let head = classify_head(priority_queue, armed);
     let spotify = *spotify_state.lock();
+    let was_playing = resume_spotify_after_drain.load(Ordering::SeqCst);
     match head_action(head, spotify, false, Trigger::MediaEnd) {
         HeadAction::ResumeSpotify => {
-            if resume_spotify_after_drain.load(Ordering::SeqCst) {
+            if was_playing {
                 if let Some(tx) = spirc_tx {
                     let _ = tx.send(SpircCommand::Play);
                 }
             }
         }
-        HeadAction::Handoff => handoff_head(priority_queue, armed, spirc_tx, spotify, false),
+        HeadAction::Load => {
+            let popped = {
+                let mut lock = priority_queue.lock();
+                lock.pop_if(|item| matches!(item.source, MediaSource::Spotify { .. }))
+            };
+            if let Some(QueueItem { source: MediaSource::Spotify { uri, .. }, .. }) = popped {
+                if let Some(tx) = spirc_tx {
+                    let _ = tx.send(SpircCommand::Load(uri));
+                }
+            }
+        }
+        HeadAction::QueueThenResume => {
+            queue_behind_current(priority_queue, armed, spirc_tx);
+            if was_playing {
+                if let Some(tx) = spirc_tx {
+                    let _ = tx.send(SpircCommand::Play);
+                }
+            }
+        }
         _ => {}
     }
 }
@@ -993,9 +1039,11 @@ async fn clear_now_playing_card(d: &QueueDrainCtx) {
     }
 }
 
-/// Drain the priority queue until it is empty, the current item is
-/// cancelled, or the head is a Spotify item (handed off directly, see
-/// below). The caller must already own the drain-active flag (DrainGuard).
+/// Drain the priority queue until it is empty or the head is a Spotify item
+/// — under radio rules a Spotify item is never fed, so reaching it just
+/// ends the drain and leaves it at the head for the presence loop's own
+/// `Playing`/arm bookkeeping — or the current item is cancelled. The caller
+/// must already own the drain-active flag (DrainGuard).
 ///
 /// Semantics decided once for both owners: no history embed for cancelled or
 /// failed items (failures get a user-facing error message instead); Spotify
@@ -1003,9 +1051,8 @@ async fn clear_now_playing_card(d: &QueueDrainCtx) {
 /// skip/stop owns what plays next.
 ///
 /// Returns how the drain ended so the owner knows whether the `MediaEnd`
-/// step still applies: only a natural finish needs it — a handed-off
-/// Spotify item is already on its way (its `Playing` event arms the next
-/// head), and a cancelled drain is owned by skip/stop.
+/// step still applies: only a natural finish needs it — a cancelled drain
+/// is owned by skip/stop.
 async fn run_queue_drain(d: &QueueDrainCtx) -> DrainOutcome {
     // Only resume Spotify at the end of a natural drain if it was actually
     // playing when the drain started — an idle/paused baseline should stay
@@ -1015,37 +1062,19 @@ async fn run_queue_drain(d: &QueueDrainCtx) -> DrainOutcome {
     let resume_spotify = *d.spotify_state.lock() == SpotifyState::Playing;
     d.resume_spotify_after_drain.store(resume_spotify, Ordering::SeqCst);
     let mut cancelled = false;
-    let mut handed_to_spotify = false;
     loop {
+        // Only pop a media item off the head — a Spotify item there (or an
+        // empty queue) ends the loop instead of being consumed: radio rules
+        // require it to stay at the head until it's armed and Spotify's own
+        // `Playing` event pops it.
         let item = {
             let mut lock = d.priority_queue.lock();
-            lock.pop()
+            lock.pop_if(|item| !matches!(item.source, MediaSource::Spotify { .. }))
         };
         let item = match item {
             Some(i) => i,
             None => break,
         };
-
-        // A Spotify item at the head never runs through the feeder: hand it
-        // straight to Spotify's own queue/context and let Spotify's presence
-        // path post its own card. No active_priority_item, no pause, no
-        // priority now-playing card — this drain's job here is done.
-        if let MediaSource::Spotify { uri, .. } = &item.source {
-            let state = *d.spotify_state.lock();
-            if let Some(tx) = &d.spirc_cmd_tx {
-                if state == SpotifyState::Idle {
-                    let _ = tx.send(SpircCommand::Load(uri.clone()));
-                } else {
-                    let _ = tx.send(SpircCommand::AddToQueue(uri.clone()));
-                    let _ = tx.send(SpircCommand::Next);
-                    if state == SpotifyState::Paused {
-                        let _ = tx.send(SpircCommand::Play);
-                    }
-                }
-            }
-            handed_to_spotify = true;
-            break;
-        }
 
         // Mark the item active BEFORE pausing Spotify: the pause lands as a
         // Paused/Idle player event, and the presence loop pauses the shared
@@ -1105,9 +1134,9 @@ async fn run_queue_drain(d: &QueueDrainCtx) -> DrainOutcome {
                 let ext = filename.rsplit('.').next().unwrap_or("mp3");
                 feed_file_to_bridge(attachment_url, ext, d.bridge.clone(), token, d.feeder_paused.clone()).await
             }
-            // Unreachable: the Spotify branch above breaks out of the loop
-            // before an item of this source ever reaches the feeder.
-            MediaSource::Spotify { .. } => unreachable!("Spotify items are handed off and never fed"),
+            // Unreachable: the pop_if above only ever pops a non-Spotify
+            // item — a Spotify item at the head ends the loop instead.
+            MediaSource::Spotify { .. } => unreachable!("Spotify items are never fed"),
         };
 
         {
@@ -1151,9 +1180,6 @@ async fn run_queue_drain(d: &QueueDrainCtx) -> DrainOutcome {
 
     if cancelled {
         return DrainOutcome::Cancelled;
-    }
-    if handed_to_spotify {
-        return DrainOutcome::HandedToSpotify;
     }
 
     // Natural drain end: hand playback back to Spotify, but only if it was
@@ -1225,8 +1251,10 @@ async fn priority_queue_manager(
 
         // The Spotify baseline's own EndOfTrack fired: decide what (if
         // anything) our queue head should do about it, instead of blindly
-        // draining. An armed head does nothing (Spotify plays it itself); a
-        // media head drains; an un-armed Spotify head is handed off directly.
+        // draining. An armed head does nothing (librespot's own
+        // auto-advance is already carrying it); a media head drains; an
+        // un-armed Spotify head gets queued behind whatever's currently
+        // loaded (radio rules: never a bare `Next`).
         let head = classify_head(&drain_ctx.priority_queue, &armed_spotify);
         let spotify = *drain_ctx.spotify_state.lock();
         let media_active = { drain_ctx.active_priority_item.lock().is_some() };
@@ -1249,8 +1277,8 @@ async fn priority_queue_manager(
                     );
                 }
             }
-            HeadAction::Handoff => {
-                handoff_head(&drain_ctx.priority_queue, &armed_spotify, Some(&spirc_cmd_tx_direct), spotify, media_active);
+            HeadAction::QueueBehindCurrent => {
+                queue_behind_current(&drain_ctx.priority_queue, &armed_spotify, Some(&spirc_cmd_tx_direct));
             }
             _ => {}
         }
@@ -1342,11 +1370,16 @@ async fn run_presence_loop_with_track(
         }
 
         // Armed-head bookkeeping: on every Playing event, if it matches the
-        // track we pre-armed, pop it from our queue and clear armed; then —
-        // whether it matched or not — try to arm whatever the head now is,
-        // so chained Spotify items (and a DJ resuming a paused queue from
-        // their phone) stay gap-free. Idle means Spotify's own device queue
-        // is gone, so nothing is armed anymore.
+        // track we pre-armed (librespot's auto-advance landed on it — it
+        // can be anywhere in the queue, not just the head, hence
+        // `remove_first` rather than a head-only pop), remove it from our
+        // queue and clear armed. Then: if a media item is actively playing,
+        // Spotify must not play over it under radio rules — pause it back
+        // down (it resumes once the queue clears, via `after_media_end`);
+        // otherwise try to arm whatever the first un-armed Spotify item now
+        // is, so chained Spotify items (and a DJ resuming a paused queue
+        // from their phone) stay gap-free. Idle means Spotify's own device
+        // queue is gone, so nothing is armed anymore.
         match &update {
             PresenceUpdate::Playing { track_id, .. } => {
                 let matched = {
@@ -1359,11 +1392,21 @@ async fn run_presence_loop_with_track(
                 };
                 if matched {
                     let mut lock = priority_queue.lock();
-                    lock.pop_if(|item| matches!(&item.source, MediaSource::Spotify { uri, .. } if uri.to_id() == *track_id));
+                    lock.remove_first(|item| matches!(&item.source, MediaSource::Spotify { uri, .. } if uri.to_id() == *track_id));
                 }
                 let media_active = { active_priority_item.lock().is_some() };
                 let tx = { spirc_cmd_tx.lock().clone() };
-                try_arm_head(&priority_queue, &armed_spotify, tx.as_ref(), SpotifyState::Playing, media_active);
+                if media_active {
+                    if let Some(tx) = &tx {
+                        let _ = tx.send(SpircCommand::Pause);
+                    }
+                    // This Playing never reached the listeners — no card, no
+                    // history, and no dedup key, so the track's real start
+                    // (after the queue clears) posts normally.
+                    continue;
+                } else {
+                    try_arm_first_spotify(&priority_queue, &armed_spotify, tx.as_ref(), SpotifyState::Playing, media_active);
+                }
             }
             PresenceUpdate::Idle => {
                 let mut lock = armed_spotify.lock();
@@ -1975,9 +2018,9 @@ impl Handler {
         match action {
             HeadAction::Nothing => None,
             HeadAction::Arm => {
-                let armed = try_arm_head(&self.priority_queue, &self.armed_spotify, spirc_tx.as_ref(), spotify, media_active);
+                let armed = try_arm_first_spotify(&self.priority_queue, &self.armed_spotify, spirc_tx.as_ref(), spotify, media_active);
                 if armed {
-                    Some("Queued on Spotify — plays after the current track.".to_string())
+                    Some("Queued — plays after the current track.".to_string())
                 } else {
                     None
                 }
@@ -1994,11 +2037,38 @@ impl Handler {
                 }
                 Some("Playing now on Spotify.".to_string())
             }
-            HeadAction::Handoff => {
-                handoff_head(&self.priority_queue, &self.armed_spotify, spirc_tx.as_ref(), spotify, media_active);
+            HeadAction::QueueBehindCurrent => {
+                queue_behind_current(&self.priority_queue, &self.armed_spotify, spirc_tx.as_ref());
+                None
+            }
+            HeadAction::QueueThenResume => {
+                queue_behind_current(&self.priority_queue, &self.armed_spotify, spirc_tx.as_ref());
+                // Reached only via PlayButton (MediaEnd's own QueueThenResume
+                // goes through after_media_end, which gates this on whether
+                // Spotify was playing before) — the button press itself is
+                // the explicit request to resume.
+                if let Some(tx) = &spirc_tx {
+                    let _ = tx.send(SpircCommand::Play);
+                }
+                None
+            }
+            HeadAction::QueueThenNext => {
+                queue_behind_current(&self.priority_queue, &self.armed_spotify, spirc_tx.as_ref());
+                if let Some(tx) = &spirc_tx {
+                    let _ = tx.send(SpircCommand::Next);
+                }
                 None
             }
             HeadAction::Drain => {
+                match self.trigger_priority_queue_drain(requester_id).await {
+                    Ok(_) => None,
+                    Err(msg) => Some(format!("⚠ {}", msg)),
+                }
+            }
+            HeadAction::NextThenDrain => {
+                if let Some(tx) = &spirc_tx {
+                    let _ = tx.send(SpircCommand::Next);
+                }
                 match self.trigger_priority_queue_drain(requester_id).await {
                     Ok(_) => None,
                     Err(msg) => Some(format!("⚠ {}", msg)),
@@ -2014,17 +2084,6 @@ impl Handler {
                 if let Some(tx) = &spirc_tx {
                     let _ = tx.send(SpircCommand::Next);
                 }
-                None
-            }
-            HeadAction::ResumeThenArm => {
-                if let Some(tx) = &spirc_tx {
-                    let _ = tx.send(SpircCommand::Play);
-                }
-                // Spotify hasn't actually reported Playing yet (that arrives
-                // asynchronously via the presence loop, which retries this
-                // same arm step on every Playing event) — this call is a
-                // no-op today and a safety net if that ordering ever changes.
-                try_arm_head(&self.priority_queue, &self.armed_spotify, spirc_tx.as_ref(), spotify, media_active);
                 None
             }
         }
@@ -2593,10 +2652,12 @@ impl Handler {
                             let (accepted, queue_len) = {
                                 let mut lock = self.priority_queue.lock();
                                 let accepted = if next {
-                                    // An armed head is already on Spotify's own
-                                    // queue and can't be un-queued — a "next"
-                                    // item lands right behind it instead of
-                                    // jumping it.
+                                    // An armed track is already on Spotify's
+                                    // own device queue and can't be
+                                    // un-queued — a "next" item lands right
+                                    // behind our queue's head instead of
+                                    // jumping it, so it still plays before
+                                    // the armed track's own turn comes up.
                                     if armed_head { lock.insert(1, item) } else { lock.push_front(item) }
                                 } else {
                                     lock.push(item)
@@ -2778,8 +2839,8 @@ impl Handler {
             let _drain_guard = drain_guard;
             if run_queue_drain(&drain_ctx).await == DrainOutcome::Finished {
                 // MediaEnd: decide what (if anything) happens to whatever is
-                // now at the queue head — arms/hands off a revealed Spotify
-                // head. Skipped when the drain itself already handed one off.
+                // now at the queue head — loads, queues-behind, or resumes a
+                // revealed Spotify head.
                 let tx = { spirc_cmd_tx_for_end.lock().clone() };
                 after_media_end(
                     &priority_queue_for_end,

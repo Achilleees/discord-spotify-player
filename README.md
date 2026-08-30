@@ -54,22 +54,28 @@ only requires the requester to be in *some* voice channel — the bot joins them
 ## How the queue works
 
 `/play` and `/queue` share one bot-owned queue for Spotify tracks,
-YouTube/SoundCloud links, and files, in the order they were added — `/queue`
-lists all of it, not just one kind.
+YouTube/SoundCloud links, and files. Tracks play strictly in that order,
+regardless of source — like a radio. The bot never skips a track on its own;
+`/queue` lists the true order, and the only way past a track is ⏭ or `/skip`.
 
-- **Spotify at the head, Spotify playing:** the bot hands the track to
-  Spotify Connect's own queue right away so it starts gap-free the instant
-  the current track ends (`/queue` shows it as "next on Spotify"). Once
-  handed off, it's locked in — `next:true` can only insert behind it, and
-  `/stop` clears everything else but that track still plays once.
-- **Spotify at the head, Spotify idle:** the track is loaded directly (there's
-  no context to preserve).
-- **YouTube/SoundCloud/file at the head:** Spotify pauses, the item plays,
-  then Spotify resumes only if it was playing before — handing off the next
-  Spotify track from the queue if there is one.
-- **⏭:** advances the bot's queue first (a handed-off Spotify track, or a
-  media item); with the queue empty, it's Spotify's own next. Skipping into a
-  queued video parks the current Spotify track and resumes it afterwards.
+- **While Spotify is playing:** the bot arms the *first Spotify track
+  anywhere in the queue* into Spotify Connect's own queue. Spotify's own
+  track-end advance then lands on that track — any YouTube/SoundCloud/file
+  items ahead of it play first (Spotify sits paused on the armed track at
+  0:00 in the meantime), then Spotify resumes onto it. The armed track is
+  popped from the bot's queue once Spotify reports it playing. It's locked in
+  once armed — Spotify can't be un-queued — so `next:true` can only insert
+  behind it, and `/stop` clears everything else but that track still plays
+  once.
+- **A Spotify track starting mid-media** (e.g. picked in the Spotify app
+  while a YouTube/SoundCloud/file item is playing) is paused immediately and
+  resumes after the queue — Spotify never plays over the queue.
+- **Spotify idle, Spotify track at the head:** the track is loaded directly
+  with `load` (there's no context to preserve).
+- **Spotify paused, Spotify track at the head:** the track is queued behind
+  the current one and playback resumed — nothing is skipped.
+- **⏭ with a media track next:** the current Spotify track is also advanced
+  (skipped), the media track plays, then Spotify resumes.
 - A failed download removes its card and reposts the controls; the queue
   continues.
 - The DJ's own phone-side Spotify queue is invisible to the bot — ordering

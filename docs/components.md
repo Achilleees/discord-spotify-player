@@ -21,18 +21,20 @@ DJ TTS (Kokoro) ── overlay ───────────┘ (mixes on to
   for Songbird. Prebuffers on first read (honors `PREBUFFER_SECONDS`), then
   pulls from the bridge.
 - **Priority model** (`src/queue.rs`, managed in `bot.rs`): DJ overlay > one
-  bot-owned queue (Spotify tracks and YouTube/SoundCloud/files, in the order
-  they were added — `MediaSource::Spotify | YouTube | File`, YouTube covers
-  SoundCloud via yt-dlp) > Spotify Connect baseline. A media item at the head never interrupts a
-  playing Spotify track — the priority-queue manager waits for `EndOfTrack`
-  before draining, then resumes Spotify afterwards only if it was playing
-  before. A Spotify item at the head is instead pre-armed: while Spotify is
-  playing, `try_arm_head` hands it to Spotify Connect's own queue
-  (`AddToQueue`) so it plays gap-free at track end, tracked in
-  `Handler.armed_spotify` and popped when the matching `Playing` event
-  arrives; while Spotify is idle it's `Load`ed directly. `head_action` (pure
-  fn) maps `(head kind, Spotify state, trigger)` to the action to take —
-  arm, hand off, load, drain, or resume — and is unit-tested per case.
+  bot-owned queue (Spotify tracks and YouTube/SoundCloud/files, in true
+  order — `MediaSource::Spotify | YouTube | File`, YouTube covers SoundCloud
+  via yt-dlp) > Spotify Connect baseline. Radio rules: tracks play strictly
+  in queue order regardless of source, and the bot never skips a track on
+  its own — `next` is only sent on ⏭/`/skip`. While Spotify is playing,
+  `try_arm_first_spotify` arms the *first Spotify track anywhere in the queue* into
+  Spotify Connect's own queue (`AddToQueue`), so librespot's own track-end
+  advance lands on it — any media items ahead of it in the bot's queue play
+  first (Spotify sits paused on the armed track), then Spotify resumes onto
+  it. The armed track is tracked in `Handler.armed_spotify` and popped from
+  the bot's queue when the matching `Playing` event arrives; while Spotify
+  is idle a head Spotify track is `Load`ed directly instead. `head_action`
+  (pure fn) maps `(head kind, Spotify state, trigger)` to the action to
+  take — arm, load, drain, or resume — and is unit-tested per case.
 
 ## Spotify path (librespot + OAuth)
 

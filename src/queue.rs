@@ -143,6 +143,18 @@ impl PriorityQueue {
         }
     }
 
+    /// The first item (anywhere in the queue) that satisfies `pred`.
+    pub fn find_first(&self, pred: impl Fn(&QueueItem) -> bool) -> Option<&QueueItem> {
+        self.items.iter().find(|i| pred(i))
+    }
+
+    /// Remove and return the first item (anywhere in the queue) that
+    /// satisfies `pred`.
+    pub fn remove_first(&mut self, pred: impl Fn(&QueueItem) -> bool) -> Option<QueueItem> {
+        let idx = self.items.iter().position(pred)?;
+        self.items.remove(idx)
+    }
+
     pub fn len(&self) -> usize {
         self.items.len()
     }
@@ -293,6 +305,24 @@ mod tests {
         assert_eq!(q.peek().unwrap().source.display_title(), "a");
         assert_eq!(q.len(), 2, "peek doesn't drain");
         assert_eq!(q.peek().unwrap().source.display_title(), "a");
+    }
+
+    #[test]
+    fn find_first_and_remove_first_reach_past_the_head() {
+        let mut q = PriorityQueue::new();
+        q.push(item("a"));
+        q.push(spotify_item("spotify:track:11dFghVXANMlKmJXsNCbNl", "b"));
+        q.push(item("c"));
+
+        let is_spotify = |i: &QueueItem| matches!(i.source, MediaSource::Spotify { .. });
+        assert_eq!(q.find_first(is_spotify).unwrap().source.display_title(), "b");
+        assert_eq!(q.len(), 3, "find_first does not consume");
+
+        let removed = q.remove_first(is_spotify).unwrap();
+        assert_eq!(removed.source.display_title(), "b");
+        let titles: Vec<_> = q.snapshot().iter().map(|i| i.source.display_title().to_string()).collect();
+        assert_eq!(titles, vec!["a", "c"], "the surrounding order is kept");
+        assert!(q.remove_first(is_spotify).is_none());
     }
 
     #[test]

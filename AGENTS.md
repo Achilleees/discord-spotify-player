@@ -20,9 +20,11 @@ channel. This repo is the hardened reference for nob's music stack — see
 ## Architecture (see `docs/components.md`)
 - Two audio producers push PCM f32 into `AudioBridge`; `SimpleBridgeReader`
   pulls it out for Songbird. Priority: DJ overlay > the one bot-owned queue
-  (Spotify tracks, YT/SC, files — same order as `/queue` lists) > Spotify
-  Connect baseline. A Spotify item at the head is pre-armed into Spotify's
-  own queue for a gap-free handoff; a media item waits for `EndOfTrack`.
+  (Spotify tracks, YT/SC, files — same true order as `/queue` lists, radio
+  rules: the bot never skips a track on its own) > Spotify Connect baseline.
+  While Spotify is playing, the bot arms the first Spotify track anywhere in
+  the queue into Spotify's own queue, so librespot's own track-end advance
+  lands on it once any media items ahead of it have played.
 - Sessions are OAuth-only (discovery/mDNS was removed in v0.5). One active DJ at
   a time; auto-start replays the stored active user on boot.
 - Tokens live in SQLite (`spotify_credentials`, encrypted `auth_blob`). One

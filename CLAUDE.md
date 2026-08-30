@@ -58,13 +58,14 @@ Spotify / YouTube / files / DJ ─> AudioBridge ─> SimpleBridgeReader ─> Son
 - **SimpleBridgeReader** (`src/discord/voice.rs`): Songbird source; prebuffers
   per `PREBUFFER_SECONDS`.
 - Priority: DJ overlay > the one bot-owned queue (Spotify tracks, YT/SC,
-  files, in order) > Spotify Connect baseline. A media item at the head never
-  interrupts a playing Spotify track — it waits for `EndOfTrack`
-  (EndOfTrack-driven drain), then resumes Spotify afterwards only if Spotify
-  was playing before. A Spotify item at the head is instead pre-armed into
-  Spotify Connect's own queue (`add_to_queue`) while Spotify is playing, so
-  it plays gap-free at track end; idle Spotify gets a direct `load` instead
-  (`src/queue.rs` + the priority-queue manager in `bot.rs`).
+  files, in true order — radio rules, the bot never skips on its own) >
+  Spotify Connect baseline. While Spotify is playing, the bot arms the first
+  Spotify track anywhere in the queue into Spotify Connect's own queue
+  (`add_to_queue`), so librespot's own track-end advance lands on it; any
+  media items ahead of it in the bot's queue play first (Spotify sits paused
+  on the armed track), then Spotify resumes onto it. Idle Spotify gets a
+  direct `load` instead (`src/queue.rs` + the priority-queue manager in
+  `bot.rs`).
 
 ### Startup (`src/main.rs`)
 1. Init logging from `RUST_LOG`.
@@ -84,11 +85,11 @@ Spotify / YouTube / files / DJ ─> AudioBridge ─> SimpleBridgeReader ─> Son
   `Lookup`) — no calls to api.spotify.com. `Lookup` resolves title/artist/
   album art for a Spotify item at enqueue time (`Track::get`), so the queue
   never needs the Web API either.
-- `Handler.armed_spotify` tracks which Spotify track (if any) has been handed
-  off to Spotify's own queue; `head_action` (pure fn, unit-tested per table
+- `Handler.armed_spotify` tracks which Spotify track (if any) is currently
+  armed in Spotify's own queue; `head_action` (pure fn, unit-tested per table
   row) decides what a trigger (enqueue, track end, skip, ...) does to the
-  queue head, and `try_arm_head` is the single critical section that performs
-  the hand-off and sets `armed_spotify` — called from `reconcile` and from
+  queue head, and `try_arm_first_spotify` is the single critical section
+  that arms it and sets `armed_spotify` — called from `reconcile` and from
   the presence loop on every Spotify `Playing` event. `armed_spotify` is
   cleared on `Idle`, `spawn_session`, `/logout`, `/forget`, and `/stop`.
 
