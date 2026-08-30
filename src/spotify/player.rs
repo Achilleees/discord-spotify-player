@@ -1,6 +1,6 @@
 use crate::audio_bridge::AudioBridge;
 use crate::config::Config;
-use crate::presence::PresenceUpdate;
+use crate::player::state::{TrackMeta, TransportEvent};
 use crate::spotify::sink::{DiscordSink, DspConfig};
 use librespot_connect::{ConnectConfig, LoadRequest, LoadRequestOptions, Spirc};
 use librespot_core::authentication::Credentials;
@@ -48,13 +48,10 @@ pub struct TrackLookup {
     pub album_art_url: Option<String>,
 }
 
-fn extract_track_id(uri: &SpotifyUri) -> String {
-    uri.to_id()
-}
-
-/// Info about the current track, kept in the event loop so `Playing`/
-/// `Paused` events (which only carry a bare `track_id`) can be turned into
-/// full presence updates without calling any Web API.
+/// Info about the current track, kept in the event loop so a `Playing`
+/// event (which only carries a bare `track_id`) can carry a `TrackMeta`
+/// without calling any Web API. Filled by `TrackChanged`, consumed by the
+/// next matching `Playing`.
 struct CurrentTrack {
     track_id: SpotifyUri,
     title: String,
@@ -160,9 +157,8 @@ impl SpotifyPlayer {
         }
     }
 
-    /// All artists' names, joined — matching the Web API path the embeds
-    /// use, so bot status and embed can't disagree. Shared by
-    /// `fetch_track_info` and `lookup_track`.
+    /// All artists' names, joined the way Spotify itself displays multiple
+    /// artists. Used by `lookup_track`.
     fn join_artist_names<'a>(artists: impl IntoIterator<Item = &'a Artist>) -> String {
         let names: Vec<_> = artists.into_iter().map(|a| a.name.clone()).collect();
         if names.is_empty() {
@@ -184,24 +180,6 @@ impl SpotifyPlayer {
             .iter()
             .max_by_key(|c| c.width)
             .map(|c| template.replace("{file_id}", &c.id.to_string()))
-    }
-
-    async fn fetch_track_info(
-        session: &Session,
-        track_uri: &SpotifyUri,
-    ) -> Option<(String, String)> {
-        match track_uri {
-            SpotifyUri::Track { .. } => {
-                let track = Track::get(session, track_uri).await.ok()?;
-                let artist = Self::join_artist_names(track.artists.iter());
-                Some((track.name, artist))
-            }
-            SpotifyUri::Episode { .. } => {
-                let episode = Episode::get(session, track_uri).await.ok()?;
-                Some((episode.name, "Podcast".to_string()))
-            }
-            _ => None,
-        }
     }
 
     /// Resolves title/artist/art for a track or episode through the live
@@ -232,74 +210,60 @@ impl SpotifyPlayer {
 
     fn spawn_event_loop(
         rx: tokio::sync::mpsc::UnboundedReceiver<PlayerEvent>,
-        session_for_meta: Session,
         bridge_for_events: Arc<AudioBridge>,
-        presence_tx_events: mpsc::UnboundedSender<PresenceUpdate>,
-        end_of_track_tx: Option<mpsc::UnboundedSender<()>>,
+        transport_tx: mpsc::UnboundedSender<TransportEvent>,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let mut rx = rx;
-            // Set by TrackChanged, consumed by the next Playing/Paused for
-            // that same track_id. Nothing here ever calls api.spotify.com.
+            // Set by TrackChanged, consumed by the next Playing for that
+            // same track_id. Nothing here ever calls api.spotify.com.
             let mut current: Option<CurrentTrack> = None;
             let mut last_sent_track: Option<SpotifyUri> = None;
 
             while let Some(event) = rx.recv().await {
                 match event {
                     PlayerEvent::TrackChanged { audio_item } => {
-                        current = Some(track_info_from_audio_item(&audio_item));
+                        let info = track_info_from_audio_item(&audio_item);
+                        let uri = info.track_id.clone();
+                        let meta = TrackMeta {
+                            title: info.title.clone(),
+                            artist: info.artist.clone(),
+                            album_art_url: info.album_art_url.clone(),
+                        };
+                        current = Some(info);
+                        let _ = transport_tx.send(TransportEvent::TrackChanged { uri, meta });
                     }
                     PlayerEvent::Playing { track_id, .. } => {
                         let is_new_track = last_sent_track.as_ref() != Some(&track_id);
-
-                        let (title, artist, album_art_url) = match &current {
-                            Some(c) if c.track_id == track_id => {
-                                (c.title.clone(), c.artist.clone(), c.album_art_url.clone())
-                            }
-                            _ => {
-                                // No TrackChanged remembered for this id (or it
-                                // doesn't match) — fall back to metadata lookup,
-                                // without album art.
-                                match Self::fetch_track_info(&session_for_meta, &track_id).await {
-                                    Some((title, artist)) => (title, artist, None),
-                                    None => ("Unknown track".to_string(), "Unknown artist".to_string(), None),
-                                }
-                            }
+                        let meta = match &current {
+                            Some(c) if c.track_id == track_id => Some(TrackMeta {
+                                title: c.title.clone(),
+                                artist: c.artist.clone(),
+                                album_art_url: c.album_art_url.clone(),
+                            }),
+                            // No TrackChanged remembered for this id (or it
+                            // doesn't match) — the player core falls back to
+                            // its own last-heard/queue metadata for this uri.
+                            _ => None,
                         };
 
                         if is_new_track {
-                            // Console announcement happens in the presence
-                            // loop, once the track is actually heard (a
-                            // Playing under an active media item is paused
-                            // straight back down).
-                            tracing::debug!(title = %title, artist = %artist, "spotify playing event");
+                            // Console announcement happens downstream, once
+                            // the track is actually heard (a Playing under an
+                            // active media item is paused straight back
+                            // down).
+                            tracing::debug!(track_id = %track_id, has_meta = meta.is_some(), "spotify playing event");
                         }
                         last_sent_track = Some(track_id.clone());
-                        let _ = presence_tx_events.send(PresenceUpdate::Playing {
-                            title,
-                            artist,
-                            track_id: extract_track_id(&track_id),
-                            album_art_url,
-                        });
+                        let _ = transport_tx.send(TransportEvent::Playing { uri: track_id, meta });
                     }
                     PlayerEvent::Paused { track_id, .. } => {
-                        let (title, artist) = match &current {
-                            Some(c) if c.track_id == track_id => (c.title.clone(), c.artist.clone()),
-                            _ => match Self::fetch_track_info(&session_for_meta, &track_id).await {
-                                Some((title, artist)) => (title, artist),
-                                None => ("Unknown track".to_string(), "Unknown artist".to_string()),
-                            },
-                        };
-                        let _ = presence_tx_events.send(PresenceUpdate::Paused {
-                            title,
-                            artist,
-                            track_id: extract_track_id(&track_id),
-                        });
+                        let _ = transport_tx.send(TransportEvent::Paused { uri: track_id });
                         bridge_for_events.clear();
                         tracing::debug!("playback paused");
                     }
                     PlayerEvent::Stopped { .. } => {
-                        let _ = presence_tx_events.send(PresenceUpdate::Idle);
+                        let _ = transport_tx.send(TransportEvent::Stopped);
                         bridge_for_events.clear();
                         tracing::debug!("playback stopped");
                     }
@@ -311,16 +275,32 @@ impl SpotifyPlayer {
                         // would trim the tail of an auto-advancing track. A real
                         // stop is handled by PlayerEvent::Stopped, and a priority
                         // item's drain clears the bridge itself before playing.
-                        let _ = presence_tx_events.send(PresenceUpdate::Idle);
                         last_sent_track = None;
-                        if let Some(ref tx) = end_of_track_tx {
-                            let _ = tx.send(());
-                        }
+                        let _ = transport_tx.send(TransportEvent::EndOfTrack);
                     }
-                    PlayerEvent::Unavailable { .. } => {
-                        let _ = presence_tx_events.send(PresenceUpdate::Idle);
+                    PlayerEvent::Unavailable { track_id, .. } => {
+                        let _ = transport_tx.send(TransportEvent::Unavailable { uri: track_id });
                         bridge_for_events.clear();
                         println!("Track unavailable");
+                    }
+                    PlayerEvent::SetQueue { current_track, next_tracks, .. } => {
+                        let current: Option<SpotifyUri> =
+                            current_track.and_then(|t| SpotifyUri::from_uri(&t.uri).ok());
+                        // Only "queue"-provider entries are ours (the ones
+                        // AddToQueue creates) — context/autoplay tracks in
+                        // next_tracks aren't arm confirmations.
+                        let queued: Vec<SpotifyUri> = next_tracks
+                            .into_iter()
+                            .filter(|t| t.provider == "queue")
+                            .filter_map(|t| SpotifyUri::from_uri(&t.uri).ok())
+                            .collect();
+                        let _ = transport_tx.send(TransportEvent::SetQueue { current, queued });
+                    }
+                    PlayerEvent::SessionConnected { .. } => {
+                        let _ = transport_tx.send(TransportEvent::SessionConnected);
+                    }
+                    PlayerEvent::SessionDisconnected { .. } => {
+                        let _ = transport_tx.send(TransportEvent::SessionDisconnected);
                     }
                     _ => {}
                 }
@@ -336,9 +316,8 @@ impl SpotifyPlayer {
     pub async fn run_with_token(
         config: &Config,
         bridge: Arc<AudioBridge>,
-        presence_tx: mpsc::UnboundedSender<PresenceUpdate>,
+        transport_tx: mpsc::UnboundedSender<TransportEvent>,
         access_token: String,
-        end_of_track_tx: Option<mpsc::UnboundedSender<()>>,
         spirc_cmd_rx: &mut Option<mpsc::UnboundedReceiver<SpircCommand>>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let device_id = Self::resolve_device_id(config);
@@ -377,10 +356,8 @@ impl SpotifyPlayer {
             // than detaching and pushing into the shared bridge as a ghost.
             let _event_guard = AbortOnDrop(Self::spawn_event_loop(
                 rx,
-                session.clone(),
                 bridge_for_events,
-                presence_tx.clone(),
-                end_of_track_tx.clone(),
+                transport_tx.clone(),
             ));
 
             tracing::info!(device_id = %device_id, device_name = %device_name, "calling Spirc::new");
@@ -480,7 +457,7 @@ impl SpotifyPlayer {
             }
 
             tracing::info!("max reconnects reached, returning for token refresh");
-            let _ = presence_tx.send(PresenceUpdate::Idle);
+            let _ = transport_tx.send(TransportEvent::SessionDisconnected);
             return Ok(());
         }
     }
