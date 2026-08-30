@@ -184,6 +184,12 @@ impl Handler {
             .switch(discord_user_id, discord_name.clone(), access_token, refresh_token, expires_in)
             .await;
         self.finish_account_switch(discord_user_id, discord_name).await;
+        // `/login` is a human claim on the device: activate it, so the
+        // bot shows as the playing device right away. Only this explicit
+        // path does — boot auto-start and on-demand sessions never
+        // activate (F15). The command sits in the session's channel until
+        // Spirc is up.
+        self.player.send(PlayerInput::ActivateDevice);
     }
 
     /// The half of an account switch that isn't the supervisor's job (see

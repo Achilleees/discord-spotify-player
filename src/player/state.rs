@@ -325,6 +325,10 @@ pub enum Input {
     LinkReconnecting { gen: u64 },
     VoiceReady,
     VoiceLost,
+    /// An explicit human claim on the Connect device (`/login`): the one
+    /// path besides ▶ that may activate. Auto-start and on-demand sessions
+    /// never send it (F15).
+    ActivateDevice,
     Query { reply: oneshot::Sender<PlayerSnapshot> },
     Tick(TimerKind),
 }
@@ -840,6 +844,14 @@ pub fn step(state: &mut PlayerState, input: Input, now: Instant) -> Vec<Effect> 
             state.voice = VoiceStatus::Ready;
         }
 
+        Input::ActivateDevice => {
+            if !state.device_active {
+                fx.push(Effect::Spirc(SpircCmd::ActivateDevice));
+                state.device_active = true;
+                maybe_arm(state, now, &mut fx);
+            }
+        }
+
         Input::VoiceLost => {
             state.voice = VoiceStatus::Down;
             if matches!(state.active, Active::Media { .. }) {
@@ -976,6 +988,16 @@ fn handle_transport(state: &mut PlayerState, ev: TransportEvent, now: Instant, f
             );
             if state.armed.as_ref().is_some_and(|a| a.uri == uri) {
                 state.armed = None;
+            } else if let Active::SpotifyPending { uri: wanted, .. } = &state.active {
+                // Our own advance landed somewhere other than the armed
+                // track: the arm isn't at the front of Spotify's queue (a
+                // dropped AddToQueue, a phone-side reorder) — a dead arm.
+                // Clearing it here is what lets `maybe_arm` below issue a
+                // fresh one; without this the player stayed armed-but-
+                // never-acked forever and every skip played the context.
+                if wanted != &uri && state.armed.is_some() {
+                    state.armed = None;
+                }
             }
             let same_track = state.last_heard_track.as_deref() == Some(uri_str.as_str());
             let existing = if same_track { current_meta(&state.active) } else { None };
@@ -1065,13 +1087,15 @@ fn handle_transport(state: &mut PlayerState, ev: TransportEvent, now: Instant, f
             }
             match head_of(&state.queue) {
                 Head::Media => {
-                    // The old Drain-on-TrackEnd: pause the advancing next
-                    // track at ~0:00, then run the media item; the resume at
-                    // media end picks Spotify back up from that pause.
+                    // Hand the turn to the media item at the boundary. No
+                    // `Pause` here: librespot ignores a pause in its
+                    // EndOfTrack state (and logs an error), so the advancing
+                    // next track is caught by the `Playing`-under-Media arm
+                    // instead, which pauses it at ~0:00; the sink's turn
+                    // gate keeps its first samples out of the bridge. The
+                    // start gate still waits for that pause ack.
                     let pausing = state.device_active;
                     if pausing {
-                        fx.push(Effect::Spirc(SpircCmd::Pause));
-                        state.inflight.record_pause(now);
                         state.pause_owner = Some(PauseOwner::BotForMedia);
                     }
                     let item = state.queue.pop().expect("head checked as media");
@@ -1117,11 +1141,23 @@ fn handle_transport(state: &mut PlayerState, ev: TransportEvent, now: Instant, f
             }
         }
 
-        TransportEvent::TrackChanged { uri: _, meta } => {
-            // Metadata enrichment only; the turn and the card wait for
-            // `Playing`.
+        TransportEvent::TrackChanged { uri, meta } => {
+            // Never moves the turn. While the baseline holds it, a change
+            // is shown on the card at once — a `pause(); next()` cues the
+            // next track paused at 0:00 and never emits `Playing`, so
+            // waiting for that left the card on the previous song.
+            if matches!(state.active, Active::Media { .. }) {
+                return;
+            }
             if let Active::Spotify { track } = &mut state.active {
-                *track = Some(meta);
+                *track = Some(meta.clone());
+            }
+            let uri_str = uri.to_string();
+            if state.last_heard_track.as_deref() != Some(uri_str.as_str())
+                && matches!(state.active, Active::Spotify { .. } | Active::SpotifyPending { .. })
+            {
+                fx.push(Effect::Ui(UiMsg::NowPlayingSpotify { uri, meta: Some(meta) }));
+                state.last_heard_track = Some(uri_str);
             }
         }
 
@@ -1715,16 +1751,77 @@ mod tests {
     }
 
     #[test]
-    fn end_of_track_with_media_head_pauses_and_starts_it() {
-        // Old: track_end_drains_a_media_head — pause the auto-advancing
-        // next track at ~0:00, then run the media item behind the pause ack.
+    fn end_of_track_with_media_head_starts_it_behind_the_pause_ack() {
+        // Old: track_end_drains_a_media_head. No Pause at the boundary —
+        // librespot ignores one in its EndOfTrack state; the advancing
+        // next track is caught by the Playing-under-Media arm, and the
+        // media item starts behind that pause's ack.
         let mut sim = Sim::baseline_playing();
         sim.s.queue.push(media_item("m"));
         let fx = sim.transport(TransportEvent::EndOfTrack);
-        assert_eq!(spircs(&fx), vec![SpircCmd::Pause]);
+        assert!(spircs(&fx).is_empty(), "no pause at a boundary");
         assert_eq!(start_gate(&fx), Some(StartGate::AfterSpotifyPauseAck));
         assert_eq!(sim.s.pause_owner, Some(PauseOwner::BotForMedia));
         assert!(matches!(sim.s.active, Active::Media { .. }));
+        // The auto-advance lands: it's not its turn, so it is paused back.
+        let fx = sim.transport(TransportEvent::Playing { uri: uri(10), meta: None });
+        assert_eq!(spircs(&fx), vec![SpircCmd::Pause]);
+        assert!(matches!(sim.s.active, Active::Media { .. }));
+    }
+
+    #[test]
+    fn dead_arm_clears_and_rearms_when_our_next_lands_elsewhere() {
+        // The live stuck-queue bug: an arm that never acks (dropped
+        // AddToQueue) stayed `Some` forever, so nothing re-armed and every
+        // skip played the context. Our own advance landing on a non-armed
+        // track proves the arm is dead.
+        let mut sim = Sim::baseline_playing();
+        let id = sim.push_spotify(1, "s1");
+        sim.arm(1, id, Ack::Lost);
+        let fx = sim.skip();
+        assert_eq!(add_to_queue_count(&fx), 0, "still armed: no second AddToQueue");
+        assert!(matches!(sim.s.active, Active::SpotifyPending { .. }));
+        // Spotify advanced onto a context track instead of s1.
+        let fx = sim.transport(TransportEvent::Playing { uri: uri(42), meta: None });
+        assert_eq!(sim.s.queue.len(), 1, "s1 is still a request");
+        assert!(
+            matches!(&sim.s.armed, Some(Armed { uri: u, ack: Ack::Sent(_), .. }) if *u == uri(1)),
+            "a fresh arm was issued: {:?}",
+            sim.s.armed
+        );
+        assert_eq!(add_to_queue_count(&fx), 1);
+    }
+
+    #[test]
+    fn activate_device_input_activates_once_and_arms() {
+        let mut sim = Sim::new();
+        sim.s.sp = SpDevice::Paused(uri(9));
+        sim.push_spotify(1, "s1");
+        let fx = sim.step(Input::ActivateDevice);
+        assert_eq!(spircs(&fx), vec![SpircCmd::ActivateDevice, SpircCmd::AddToQueue(uri(1))]);
+        assert!(sim.s.device_active);
+        let fx = sim.step(Input::ActivateDevice);
+        assert!(fx.is_empty(), "already active: nothing to do");
+    }
+
+    #[test]
+    fn track_changed_under_baseline_repaints_the_card_once() {
+        // pause(); next() cues the next track without a Playing: the card
+        // follows TrackChanged, and the later Playing doesn't repost.
+        let mut sim = Sim::baseline_playing();
+        let meta = TrackMeta { title: "t".into(), artist: "a".into(), album_art_url: None };
+        let fx = sim.transport(TransportEvent::TrackChanged { uri: uri(10), meta: meta.clone() });
+        assert!(fx.iter().any(|e| matches!(e, Effect::Ui(UiMsg::NowPlayingSpotify { .. }))));
+        let fx = sim.transport(TransportEvent::Playing { uri: uri(10), meta: Some(meta) });
+        assert!(!fx.iter().any(|e| matches!(e, Effect::Ui(UiMsg::NowPlayingSpotify { .. }))));
+    }
+
+    #[test]
+    fn track_changed_under_media_is_ignored() {
+        let mut sim = Sim::media_over_paused_baseline();
+        let meta = TrackMeta { title: "t".into(), artist: "a".into(), album_art_url: None };
+        let fx = sim.transport(TransportEvent::TrackChanged { uri: uri(10), meta });
+        assert!(fx.is_empty());
     }
 
     #[test]

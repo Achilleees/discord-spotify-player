@@ -29,6 +29,11 @@ pub struct AudioBridge {
     overlay: Mutex<VecDeque<f32>>,
     max_samples: usize,
     stats: BridgeStats,
+    /// Set by the player actor while a media item holds the turn: the
+    /// librespot sink drops its samples instead of pushing them, so a
+    /// phone-side play press can't bleed Spotify audio over the item
+    /// before the actor's `Pause` lands.
+    spotify_muted: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Default)]
@@ -49,7 +54,17 @@ impl AudioBridge {
             overlay: Mutex::new(VecDeque::with_capacity(cap)),
             max_samples: cap,
             stats: BridgeStats::default(),
+            spotify_muted: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// Gate the librespot sink: `true` drops Spotify samples at the sink.
+    pub fn set_spotify_muted(&self, muted: bool) {
+        self.spotify_muted.store(muted, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn spotify_muted(&self) -> bool {
+        self.spotify_muted.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Push music samples (44.1kHz stereo f32). Called by the librespot sink

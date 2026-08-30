@@ -156,7 +156,9 @@ impl SpotifyPlayer {
             name: device_name.to_string(),
             device_type: DeviceType::Computer,
             is_group: false,
-            initial_volume: 32767,
+            // 80% of full scale: what the device reports to Spotify clients
+            // on first connect.
+            initial_volume: 52428,
             disable_volume: false,
             volume_steps: 64,
             // SetQueue reports Spotify's own queue on every mutation; kept

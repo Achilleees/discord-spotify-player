@@ -27,7 +27,7 @@ use tokio::sync::mpsc;
 
 fn app_centric_filter(level: &str) -> String {
     format!(
-        "warn,discord_spotify_player={level},audio_stream={level},\
+        "warn,discord_spotify_player={level},audio_stream={level},player={level},\
          serenity=warn,songbird=warn,librespot=warn,\
          librespot_connect::state::context=error,\
          symphonia_bundle_mp3=error"

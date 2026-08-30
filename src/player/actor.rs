@@ -277,7 +277,24 @@ impl Actor {
                 _ => {}
             }
 
+            tracing::debug!(target: "player", ?input, "input");
             let effects = step(&mut self.state, input, Instant::now());
+            tracing::debug!(
+                target: "player",
+                active = ?self.state.active,
+                sp = ?self.state.sp,
+                armed = ?self.state.armed,
+                device_active = self.state.device_active,
+                queue_len = self.state.queue.len(),
+                effects = ?effects,
+                "step"
+            );
+
+            // The sink's turn gate: Spotify samples reach the bridge only
+            // when no media item holds the turn.
+            self.deps
+                .bridge
+                .set_spotify_muted(matches!(self.state.active, Active::Media { .. }));
 
             // A `StartMedia` in this batch: remember whose item it is, so a
             // cold-start voice join follows the requester.

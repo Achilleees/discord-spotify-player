@@ -22,7 +22,8 @@ target/release/discord-spotify-player.exe          # normal
 target/release/discord-spotify-player.exe --setup  # first-run wizard
 ```
 
-`cargo check` for fast feedback, `cargo test` (186 unit tests), `cargo clippy`.
+`cargo check` for fast feedback, `cargo test`, `cargo clippy`. Stop the
+running bot before `cargo build --release` — it locks the exe.
 
 ### Prerequisites
 - MSVC toolchain (native deps: opus, cmake). `.cargo/config.toml` (tracked)
@@ -31,16 +32,10 @@ target/release/discord-spotify-player.exe --setup  # first-run wizard
 
 ## Configuration
 
-`.env` (see `.env.example`). Required: `DISCORD_TOKEN`, `DISCORD_GUILD_ID`,
-`DISCORD_CHANNEL_ID`. Recommended: `TOKEN_ENC_KEY`
-(encrypts stored tokens), `TEXT_CHANNEL_ID`. Optional: `AUDIO_BUFFER_SECONDS`,
-`PREBUFFER_SECONDS`, `PREAMP_DB`, `BASS_BOOST_DB`, `TREBLE_BOOST_DB`,
-`DEVICE_NAME`, `DEVICE_ID`, `SPOTIBOT_DB`, `RUST_LOG`, `YOUTUBE_COOKIES`,
-`YOUTUBE_TMP_DIR`, `YOUTUBE_MAX_DURATION_SECS`, `DJ_CLIPS_DIR`, `DJ_CACHE_DIR`,
-`KOKORO_SOCKET` (path defaults target the VPS layout under `/var/lib/spotibot`).
-
-`--setup` runs the wizard; otherwise the app loads `.env`. OAuth needs no
-config — it authenticates against Spotify's desktop client id.
+`.env` — every variable is documented in `.env.example`; path defaults target
+the VPS layout under `/var/lib/spotibot`. `--setup` runs the wizard;
+otherwise the app loads `.env`. OAuth needs no config — it authenticates
+against Spotify's desktop client id.
 
 `RUST_LOG`: a preset (`trace|debug|info|warn|error`, app-centric) or a raw
 `EnvFilter`. Default `warn`.
@@ -109,32 +104,10 @@ Spotify / YouTube / files / DJ ─> AudioBridge ─> SimpleBridgeReader ─> Son
   rather than touching the channel directly, so the two playback sources can
   never race each other's post/delete.
 
-### Startup (`src/main.rs`)
-1. Init logging from `RUST_LOG`.
-2. Load config (or run wizard); build the OAuth client.
-3. Open the SQLite credential store (`spotibot.db`).
-4. Create `AudioBridge`; start the Discord bot; wait for ready.
-5. `ready()` (first time only) spawns the UI task (which sweeps stale
-   messages and posts the idle card) and auto-starts the stored active user's
-   session; `main` then parks. New sessions start via `/login`.
-
-### OAuth + storage
-- `src/oauth/mod.rs`: device authorization grant (RFC 8628) on Spotify's
-  desktop client id — request code, poll, refresh.
-- `src/users/mod.rs` + `crypto.rs`: SQLite `spotify_credentials`, encrypted
-  `auth_blob` (XChaCha20-Poly1305).
-
-### Presence (`src/presence.rs`, `src/discord/presence.rs`)
-- `PresenceUpdate` (`Idle` | `Paused` | `Playing { title, artist }`) is
-  produced by the player actor (`Effect::Presence`, fed by librespot's
-  `PlayerEvent::TrackChanged` — no Web API fetch) and rendered by
-  `run_presence_loop` as the bot's Discord status line.
-
-## Key crate versions
-- serenity 0.12, songbird 0.6 (native DAVE — not the git fork).
-- librespot pinned to git `dev` (rev `1599145`, 2026-08-22; unreleased
-  `add_to_queue`) — bump to the next crates.io release once it ships.
-- rusqlite 0.32 (bundled), sha2 + chacha20poly1305 (free via songbird's DAVE).
+## Dependency gotchas
+- songbird is the crates.io release with native DAVE — not the git fork.
+- librespot is pinned to git `dev` (rev `1599145`, 2026-08-22) for the
+  unreleased `add_to_queue` — bump to the next crates.io release once it ships.
 
 ## Safety and secrets
 - Never print or commit `.env`, `spotibot.db*`, `.user_creds*`, `.spotify_cache/`

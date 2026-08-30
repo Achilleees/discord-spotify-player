@@ -161,9 +161,12 @@ impl DiscordSink {
 }
 
 impl Sink for DiscordSink {
+    // Neither start nor stop touches the bridge: only the turn holder may
+    // clear it. Librespot starts/stops the sink on every play/pause,
+    // including a phone-side press while a media item is airing — a clear
+    // here wiped that item's buffered audio.
     fn start(&mut self) -> SinkResult<()> {
         tracing::debug!("spotify sink started");
-        self.bridge.clear();
         self.start_instant = None;
         self.frames_sent = 0;
         Ok(())
@@ -171,7 +174,6 @@ impl Sink for DiscordSink {
 
     fn stop(&mut self) -> SinkResult<()> {
         tracing::debug!("spotify sink stopped");
-        self.bridge.clear();
         self.start_instant = None;
         self.frames_sent = 0;
         Ok(())
@@ -225,7 +227,11 @@ impl Sink for DiscordSink {
                     }
                 }
 
-                self.bridge.push_samples(&self.scratch[..n]);
+                // Gated on the turn: while a media item is audible the
+                // samples are decoded and paced but never reach the bridge.
+                if !self.bridge.spotify_muted() {
+                    self.bridge.push_samples(&self.scratch[..n]);
+                }
 
                 // Pace the decode to real time: sleep/spin until this frame's
                 // playout deadline before returning to librespot.
@@ -308,16 +314,30 @@ mod tests {
     }
 
     #[test]
-    fn start_and_stop_clear_the_bridge() {
+    fn start_and_stop_never_touch_the_bridge() {
+        // Only the turn holder clears: a librespot start/stop (every
+        // play/pause, including phone presses under a media item) must
+        // leave whatever is buffered alone.
         let bridge = AudioBridge::new(1);
         let mut sink = DiscordSink::new(bridge.clone(), DspConfig::new(0.0, 0.0, 0.0));
         write(&mut sink, vec![0.5, 0.5]);
         assert_eq!(bridge.len(), 2);
         sink.start().unwrap();
-        assert_eq!(bridge.len(), 0, "start flushes stale audio");
-        write(&mut sink, vec![0.5, 0.5]);
+        assert_eq!(bridge.len(), 2, "start leaves the bridge alone");
         sink.stop().unwrap();
-        assert_eq!(bridge.len(), 0, "stop flushes too");
+        assert_eq!(bridge.len(), 2, "stop leaves the bridge alone");
+    }
+
+    #[test]
+    fn muted_sink_drops_samples() {
+        let bridge = AudioBridge::new(1);
+        let mut sink = DiscordSink::new(bridge.clone(), DspConfig::new(0.0, 0.0, 0.0));
+        bridge.set_spotify_muted(true);
+        write(&mut sink, vec![0.5, 0.5]);
+        assert_eq!(bridge.len(), 0, "muted: nothing reaches the bridge");
+        bridge.set_spotify_muted(false);
+        write(&mut sink, vec![0.5, 0.5]);
+        assert_eq!(bridge.len(), 2);
     }
 
     #[test]

@@ -162,7 +162,8 @@ impl PriorityQueue {
     }
 
     /// Pop the head only if it satisfies `pred`; otherwise leaves the queue
-    /// untouched and returns `None`.
+    /// untouched and returns `None`. Test-only today.
+    #[cfg(test)]
     pub fn pop_if(&mut self, pred: impl Fn(&QueueItem) -> bool) -> Option<QueueItem> {
         if self.items.front().is_some_and(&pred) {
             self.items.pop_front()
@@ -187,6 +188,7 @@ impl PriorityQueue {
         self.items.len()
     }
 
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.items.is_empty()
     }
