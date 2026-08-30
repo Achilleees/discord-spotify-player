@@ -150,13 +150,14 @@ past `ARM_ACK_TIMEOUT` (2s) is marked `Lost` rather than retried.
 
 ## Device activation
 
-Claiming Spotify's "active device" slot is explicit-only: it happens on
-`/login` (a human claim on the device) or on a human pressing ▶ to take over
-(`Effect::Spirc(SpircCmd::ActivateDevice)`), and nowhere else — never on a
-bare reconnect, never on boot auto-start, never on an on-demand session
-brought up to resolve a queued link. This is deliberate: a background
-session coming up (auto-start, `ensure_session`) must not steal the
-"currently playing" slot away from a DJ who's actively using their phone.
+Claiming Spotify's "active device" slot is tied to a request, never to a
+session coming up. It happens (`Effect::Spirc(SpircCmd::ActivateDevice)`)
+on `/login` (a human claim on the device), on a human pressing ▶ to take
+over, and when a queued Spotify track reaches its turn — queuing it *was*
+the request to hear it here. It never happens on a bare reconnect, on boot
+auto-start, or on an on-demand session brought up to resolve a link: a
+background session must not steal the "currently playing" slot away from a
+DJ who's actively using their phone when nothing has been asked of the bot.
 
 ## See also
 

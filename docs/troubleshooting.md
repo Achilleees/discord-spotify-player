@@ -11,16 +11,17 @@ session was previously running, check the logs around startup for
 gets deactivated automatically and needs a fresh `/login`. `/who` tells you
 whether any session is currently marked active.
 
-## "Spotify is in use on another device" / takeover prompt
+## "No Spotify session right now" / takeover prompt
 
-**Cause:** Spotify's active-device slot is claimed by something else (the
-DJ's phone, another Spotify client), and the bot's device is only
-*connected*, not *active*. The bot never claims the active slot on its own —
-see `docs/architecture.md`'s device-activation section — it only claims it
-on `/login` or a human pressing ▶.
+**Cause:** there is no live Spotify session (nobody has run `/login`, or the
+link just dropped), so the bot has nothing to play a Spotify request
+through. A session that comes up on its own (boot auto-start, on-demand)
+does not claim Spotify's active-device slot away from the DJ's phone; the
+bot claims it on `/login`, on ▶, or the moment a queued Spotify track
+reaches its turn — see `docs/architecture.md`'s device-activation section.
 
-**Fix:** press ▶ on the now-playing card (or `/login` again if you're
-reconnecting) to explicitly take over the device.
+**Fix:** run `/login` (or press ▶ once the session is back) — the queued
+track then plays without touching the phone.
 
 ## yt-dlp fails / 403s on YouTube links
 

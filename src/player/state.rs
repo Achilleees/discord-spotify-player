@@ -477,9 +477,10 @@ pub fn step(state: &mut PlayerState, input: Input, now: Instant) -> Vec<Effect> 
                         start_media(state, head_item, gate, &mut fx);
                     }
                     Head::Spotify(uri) => {
-                        if !state.device_active {
-                            // Explicit activation only: never Load/activate
-                            // over the DJ's phone from an enqueue.
+                        if !claim_device(state, &mut fx) {
+                            // No session to play through: the handler
+                            // brings one up before a Spotify enqueue, so
+                            // this is a link that just died.
                             fx.push(Effect::Ui(UiMsg::TakeoverPrompt));
                         } else if matches!(state.sp, SpDevice::Idle) {
                             started_title = state
@@ -559,12 +560,11 @@ pub fn step(state: &mut PlayerState, input: Input, now: Instant) -> Vec<Effect> 
                     reply(&mut fx, tx, "⏭ Skipped.");
                 }
                 Head::Spotify(uri) => {
-                    if !state.device_active {
-                        fx.push(Effect::Ui(UiMsg::TakeoverPrompt));
+                    if !claim_device(state, &mut fx) {
                         reply(
                             &mut fx,
                             tx,
-                            "⚠️ Spotify is in use on another device — press ▶ to take over.",
+                            "⚠️ No Spotify session right now — someone needs to run `/login`.",
                         );
                         return fx;
                     }
@@ -1297,10 +1297,10 @@ fn after_media_boundary(state: &mut PlayerState, now: Instant, fx: &mut Vec<Effe
             maybe_arm(state, now, fx);
         }
         Head::Spotify(uri) => {
-            if !state.device_active {
-                // Nobody to talk to (link down or another device owns
-                // playback). Keep `pause_owner`: LinkUp reconciliation
-                // pays the resume debt when the session returns.
+            if !claim_device(state, fx) {
+                // Nobody to talk to (link down). Keep `pause_owner`: LinkUp
+                // reconciliation pays the resume debt when the session
+                // returns.
                 state.active = Active::None;
                 return;
             }
@@ -1313,11 +1313,30 @@ fn after_media_boundary(state: &mut PlayerState, now: Instant, fx: &mut Vec<Effe
             match state.pause_owner {
                 Some(PauseOwner::BotForMedia) => {
                     // The bot paused it for the media item, so the bot
-                    // resumes it; the armed head airs from that pause (or
-                    // at the next boundary).
-                    fx.push(Effect::Spirc(SpircCmd::Play));
+                    // resumes. If what's cued on the device isn't the head
+                    // (the skip that started the media item cued the
+                    // playlist's next track, F4) and the head is confirmed
+                    // in Spotify's queue, advance onto it instead of
+                    // resuming — the request plays before the context.
+                    let cued_is_head = matches!(
+                        &state.sp,
+                        SpDevice::Paused(u) | SpDevice::Playing(u) if *u == uri
+                    );
+                    let head_confirmed = state
+                        .armed
+                        .as_ref()
+                        .is_some_and(|a| a.uri == uri && matches!(a.ack, Ack::Confirmed));
                     state.pause_owner = None;
-                    state.active = Active::Spotify { track: None };
+                    if !cued_is_head && head_confirmed {
+                        fx.push(Effect::Spirc(SpircCmd::Next));
+                        fx.push(Effect::Spirc(SpircCmd::Play));
+                        state.active =
+                            Active::SpotifyPending { uri, sent: now, retried: false };
+                        fx.push(Effect::SetTimer(TimerKind::SpotifyPending, PENDING_TIMEOUT));
+                    } else {
+                        fx.push(Effect::Spirc(SpircCmd::Play));
+                        state.active = Active::Spotify { track: None };
+                    }
                 }
                 Some(PauseOwner::Human) | Some(PauseOwner::BotForStop) => {
                     // Honoured: the baseline stays paused; the armed head
@@ -1359,6 +1378,25 @@ fn after_media_boundary(state: &mut PlayerState, now: Instant, fx: &mut Vec<Effe
 /// current context. Arming before the boundary is what stops librespot's
 /// auto-advance from eating a context track. No-op while a load is pending
 /// (arming the pending uri would double it).
+/// A Spotify request reaching its turn claims the Connect device: queuing
+/// the track *was* the request to hear it here. Only a session coming up
+/// on its own (boot, on-demand) never claims (F15). Returns `false` when
+/// there is no session to claim through.
+fn claim_device(state: &mut PlayerState, fx: &mut Vec<Effect>) -> bool {
+    if state.device_active {
+        return true;
+    }
+    if !state.link_up {
+        return false;
+    }
+    fx.push(Effect::Spirc(SpircCmd::ActivateDevice));
+    state.device_active = true;
+    if matches!(state.sp, SpDevice::Inactive) {
+        state.sp = SpDevice::Idle;
+    }
+    true
+}
+
 fn maybe_arm(state: &mut PlayerState, now: Instant, fx: &mut Vec<Effect>) {
     if state.armed.is_some() || !state.device_active {
         return;
@@ -1932,13 +1970,15 @@ mod tests {
 
     #[test]
     fn media_end_resumes_an_armed_spotify_head() {
-        // Old: media_end_resumes_an_armed_spotify_head.
+        // Old: media_end_resumes_an_armed_spotify_head. The cued track
+        // (9) isn't the confirmed head (1): advance onto the head, then
+        // play — the request beats the context track the skip cued.
         let mut sim = Sim::media_over_paused_baseline();
         let id = sim.push_spotify(1, "s1");
         sim.arm(1, id, Ack::Confirmed);
         let fx = sim.media_ended(MediaOutcome::Finished);
-        assert_eq!(spircs(&fx), vec![SpircCmd::Play]);
-        assert!(matches!(sim.s.active, Active::Spotify { .. }));
+        assert_eq!(spircs(&fx), vec![SpircCmd::Next, SpircCmd::Play]);
+        assert!(matches!(sim.s.active, Active::SpotifyPending { .. }));
         assert_eq!(sim.s.pause_owner, None);
     }
 
@@ -2209,8 +2249,9 @@ mod tests {
         sim.arm(1, id, Ack::Confirmed);
         sim.skip();
         let fx = sim.media_ended(MediaOutcome::Cancelled);
-        assert_eq!(spircs(&fx), vec![SpircCmd::Play], "the skip resumes: {fx:?}");
-        assert!(matches!(sim.s.active, Active::Spotify { .. }));
+        // Cued track (9) isn't the head: advance onto the confirmed head.
+        assert_eq!(spircs(&fx), vec![SpircCmd::Next, SpircCmd::Play], "the skip advances: {fx:?}");
+        assert!(matches!(sim.s.active, Active::SpotifyPending { .. }));
     }
 
     #[test]
@@ -2564,13 +2605,63 @@ mod tests {
     // --- explicit activation ----------------------------------------------
 
     #[test]
-    fn enqueue_spotify_head_while_inactive_prompts_takeover() {
-        // A Spotify head while another device is active blocks with the
-        // takeover prompt — never a blind Load or activate.
+    fn enqueue_spotify_head_with_no_session_prompts() {
+        // No link at all: nothing to claim through, so the prompt.
         let mut sim = Sim::new();
         let fx = sim.enqueue_start(spotify_item(1, "s1"));
         assert!(has_takeover_prompt(&fx));
         assert!(spircs(&fx).is_empty());
+    }
+
+    #[test]
+    fn after_media_the_request_plays_before_the_cued_context_track() {
+        // Live E: skipping S0 onto a media item cued the playlist's next
+        // track paused at 0:00; resuming after the item played that track
+        // before the queued request. With the request confirmed in
+        // Spotify's queue, advance onto it instead.
+        let mut sim = Sim::media_over_paused_baseline(); // cued: 9, paused BotForMedia
+        let id = sim.push_spotify(1, "s1");
+        sim.arm(1, id, Ack::Confirmed);
+        let fx = sim.media_ended(MediaOutcome::Finished);
+        assert_eq!(spircs(&fx), vec![SpircCmd::Next, SpircCmd::Play]);
+        assert!(matches!(&sim.s.active, Active::SpotifyPending { uri: u, .. } if *u == uri(1)));
+
+        // Cued track IS the head (arm landed on it already): plain resume.
+        let mut sim = Sim::media_over_paused_baseline();
+        sim.s.sp = SpDevice::Paused(uri(1));
+        let id = sim.push_spotify(1, "s1");
+        sim.arm(1, id, Ack::Confirmed);
+        let fx = sim.media_ended(MediaOutcome::Finished);
+        assert_eq!(spircs(&fx), vec![SpircCmd::Play]);
+
+        // Arm not confirmed: resume and let the arm land at the boundary.
+        let mut sim = Sim::media_over_paused_baseline();
+        let id = sim.push_spotify(1, "s1");
+        sim.arm(1, id, Ack::Lost);
+        let fx = sim.media_ended(MediaOutcome::Finished);
+        assert_eq!(spircs(&fx), vec![SpircCmd::Play]);
+    }
+
+    #[test]
+    fn spotify_head_reaching_its_turn_claims_the_device() {
+        // Live E'' on a fresh boot: the session came up without claiming
+        // the device (F15) and a queued Spotify track then needed a manual
+        // ▶. The request itself is the claim — enqueue-start, skip and the
+        // post-media boundary all activate and load.
+        let mut sim = Sim::new();
+        sim.s.link_up = true;
+        let fx = sim.enqueue_start(spotify_item(1, "s1"));
+        assert_eq!(spircs(&fx), vec![SpircCmd::ActivateDevice, SpircCmd::Load(uri(1))]);
+        assert!(matches!(sim.s.active, Active::SpotifyPending { .. }));
+
+        let mut sim = Sim::media_over_paused_baseline();
+        sim.s.link_up = true;
+        sim.s.device_active = false;
+        sim.s.sp = SpDevice::Inactive;
+        sim.push_spotify(2, "s2");
+        sim.skip();
+        let fx = sim.media_ended(MediaOutcome::Cancelled);
+        assert_eq!(spircs(&fx), vec![SpircCmd::ActivateDevice, SpircCmd::Load(uri(2))]);
     }
 
     #[test]
