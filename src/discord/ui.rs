@@ -61,13 +61,36 @@ pub enum UiMsg {
     Idle { account: Option<String> },
     /// Edit the current card's buttons in place (pause/resume glyph).
     Buttons { paused: bool },
-    /// Update the displayed account name without a track interruption.
-    /// Currently equivalent to `Idle`; kept distinct so a future card
-    /// layout can special-case an in-place name update instead of a full
-    /// repost.
-    /// Producer arrives in C4, when the session supervisor owns account switches.
-    #[allow(dead_code)]
+    /// The DJ name changed (login, logout, forget). The current card is
+    /// re-posted with the new name — a media item keeps its card through
+    /// an account change; only with no card up does this post the idle
+    /// controls.
     AccountChanged(Option<String>),
+}
+
+/// Post a now-playing card (embed + controls) for `view`; returns the new
+/// message id.
+async fn post_card(ctx: &Context, text_channel_id: ChannelId, view: &CardView) -> Option<MessageId> {
+    let embed = match view {
+        CardView::Spotify { title, artist, track_id, album_art_url, dj_name } => {
+            let meta = SpotifyTrackInfo {
+                title: title.clone(),
+                artist: artist.clone(),
+                album_art_url: album_art_url.clone(),
+            };
+            build_now_playing_embed(&meta, track_id, dj_name)
+        }
+        CardView::Queued { item } => build_priority_now_playing_embed(item),
+    };
+    let buttons = build_controls_buttons(false);
+    let post = CreateMessage::new().embed(embed).components(vec![buttons]);
+    match text_channel_id.send_message(ctx, post).await {
+        Ok(m) => Some(m.id),
+        Err(e) => {
+            tracing::warn!(error = ?e, "failed to send now-playing embed");
+            None
+        }
+    }
 }
 
 /// Spawns the UI task and returns its mailbox. Call exactly once, from
@@ -105,28 +128,10 @@ async fn run(ctx: Context, text_channel_id: ChannelId, mut rx: mpsc::UnboundedRe
                     let _ = text_channel_id.delete_message(&ctx, mid).await;
                 }
 
-                let embed = match &view {
-                    CardView::Spotify { title, artist, track_id, album_art_url, dj_name } => {
-                        let meta = SpotifyTrackInfo {
-                            title: title.clone(),
-                            artist: artist.clone(),
-                            album_art_url: album_art_url.clone(),
-                        };
-                        build_now_playing_embed(&meta, track_id, dj_name)
-                    }
-                    CardView::Queued { item } => build_priority_now_playing_embed(item),
-                };
-                let buttons = build_controls_buttons(false);
-                let post = CreateMessage::new().embed(embed).components(vec![buttons]);
-                match text_channel_id.send_message(&ctx, post).await {
-                    Ok(m) => {
-                        if let CardView::Spotify { title, artist, .. } = &view {
-                            println!("Playing: {} - {}", title, artist);
-                            tracing::info!(title = %title, artist = %artist, "now-playing embed sent");
-                        }
-                        card_id = Some(m.id);
-                    }
-                    Err(e) => tracing::warn!(error = ?e, "failed to send now-playing embed"),
+                card_id = post_card(&ctx, text_channel_id, &view).await;
+                if let CardView::Spotify { title, artist, .. } = &view {
+                    println!("Playing: {} - {}", title, artist);
+                    tracing::info!(title = %title, artist = %artist, "now-playing embed sent");
                 }
 
                 prev_card = Some(view);
@@ -153,8 +158,17 @@ async fn run(ctx: Context, text_channel_id: ChannelId, mut rx: mpsc::UnboundedRe
                 if let Some(mid) = card_id.take() {
                     let _ = text_channel_id.delete_message(&ctx, mid).await;
                 }
-                card_id = post_controls(&ctx, text_channel_id, account.as_deref()).await;
-                prev_card = None;
+                match prev_card.as_mut() {
+                    Some(view) => {
+                        if let CardView::Spotify { dj_name, .. } = view {
+                            *dj_name = account.clone().unwrap_or_default();
+                        }
+                        card_id = post_card(&ctx, text_channel_id, view).await;
+                    }
+                    None => {
+                        card_id = post_controls(&ctx, text_channel_id, account.as_deref()).await;
+                    }
+                }
             }
             UiMsg::Buttons { paused } => {
                 if let Some(mid) = card_id {

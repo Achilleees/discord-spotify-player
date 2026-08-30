@@ -194,6 +194,12 @@ impl SessionSupervisor {
 
         if let Some(old) = live.take() {
             tracing::info!(old_user = old.discord_user_id, "aborting existing librespot session");
+            let tx = self.spirc_cmd_tx.lock().take();
+            if let Some(tx) = tx {
+                if tx.send(SpircCommand::Shutdown).is_ok() {
+                    tokio::time::sleep(Duration::from_millis(400)).await;
+                }
+            }
             old.abort();
             // No LinkDown for the generation being replaced — see the
             // module docs: a switch is a deliberate account change, not a
@@ -434,8 +440,15 @@ impl SessionSupervisor {
         }
         let session = live.take().expect("checked Some(_) owned by `owner` above");
         tracing::info!(user = owner, "aborting session (stop)");
+        // Say goodbye first: a bare abort leaves the device listed (and
+        // selected) in Spotify clients until their dealer times it out.
+        let tx = self.spirc_cmd_tx.lock().take();
+        if let Some(tx) = tx {
+            if tx.send(SpircCommand::Shutdown).is_ok() {
+                tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+            }
+        }
         session.abort();
-        *self.spirc_cmd_tx.lock() = None;
         let _ = self.link_up_tx.send(None);
         self.link_tx.send(Input::LinkDown { gen: session.generation });
     }

@@ -854,6 +854,12 @@ pub fn step(state: &mut PlayerState, input: Input, now: Instant) -> Vec<Effect> 
             if !state.device_active {
                 fx.push(Effect::Spirc(SpircCmd::ActivateDevice));
                 state.device_active = true;
+                if matches!(state.sp, SpDevice::Inactive) {
+                    // A fresh session has no transport state to report; once
+                    // activated it is an idle device — the one state a
+                    // Spotify head may be `Load`ed onto.
+                    state.sp = SpDevice::Idle;
+                }
                 maybe_arm(state, now, &mut fx);
             }
         }
@@ -1326,6 +1332,9 @@ fn begin_load(state: &mut PlayerState, uri: SpotifyUri, now: Instant, fx: &mut V
 /// up, and emit the gated start plus its card.
 fn start_media(state: &mut PlayerState, item: QueueItem, gate: StartGate, fx: &mut Vec<Effect>) {
     state.media_epoch += 1;
+    // The media card replaces whatever was up: the next Spotify `Playing`
+    // is new to the card even if it's the same track as before.
+    state.last_heard_track = None;
     if !matches!(state.voice, VoiceStatus::Ready) {
         if matches!(state.voice, VoiceStatus::Down) {
             fx.push(Effect::JoinVoice);
@@ -1803,6 +1812,22 @@ mod tests {
         assert!(sim.s.device_active);
         let fx = sim.step(Input::ActivateDevice);
         assert!(fx.is_empty(), "already active: nothing to do");
+    }
+
+    #[test]
+    fn activating_a_fresh_session_makes_it_idle_so_a_spotify_head_loads() {
+        // Live H: logout → login during a media item, then skip onto a
+        // queued Spotify track did nothing — `sp` stayed Inactive after
+        // ActivateDevice, so the post-media boundary had no Load path.
+        let mut sim = Sim::media_over_paused_baseline();
+        sim.s.sp = SpDevice::Inactive;
+        sim.s.device_active = false;
+        sim.step(Input::ActivateDevice);
+        assert_eq!(sim.s.sp, SpDevice::Idle);
+        sim.push_spotify(1, "s1");
+        sim.skip();
+        let fx = sim.media_ended(MediaOutcome::Cancelled);
+        assert_eq!(spircs(&fx), vec![SpircCmd::Load(uri(1))]);
     }
 
     #[test]

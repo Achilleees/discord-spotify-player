@@ -27,6 +27,9 @@ const MIN_STABLE_SESSION_SECS: u64 = 60;
 /// active Spirc instance. Not `Debug`: `Lookup`'s reply channel is a
 /// `oneshot::Sender`, which isn't `Debug`.
 pub enum SpircCommand {
+    /// Tell Spotify this device is going away (so clients drop it from the
+    /// device list at once) and end the session task.
+    Shutdown,
     Pause,
     Play,
     Next,
@@ -397,6 +400,11 @@ impl SpotifyPlayer {
                     }
                     maybe_cmd = recv_cmd(spirc_cmd_rx) => {
                         match maybe_cmd {
+                            Some(SpircCommand::Shutdown) => {
+                                let _ = spirc.shutdown();
+                                tracing::info!("spirc shut down (session stop)");
+                                return Ok(());
+                            }
                             Some(SpircCommand::Pause) => { let _ = spirc.pause(); }
                             Some(SpircCommand::Play)  => { let _ = spirc.play();  }
                             Some(SpircCommand::Next) => {

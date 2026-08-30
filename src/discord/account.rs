@@ -445,10 +445,11 @@ impl Handler {
             // emits `LinkDown`, and the actor (the sole owner of the queue,
             // the armed track and the status line) decides what a dead link
             // means; a queued media item keeps playing straight through a
-            // logout.
+            // logout. The card is the player's, not the account's: only
+            // the name on it changes.
             let tx = { self.ui_tx.lock().clone() };
             if let Some(tx) = tx {
-                let _ = tx.send(UiMsg::Idle { account: None });
+                let _ = tx.send(UiMsg::AccountChanged(None));
             }
         }
 
@@ -481,7 +482,7 @@ impl Handler {
             }
             let tx = { self.ui_tx.lock().clone() };
             if let Some(tx) = tx {
-                let _ = tx.send(UiMsg::Idle { account: None });
+                let _ = tx.send(UiMsg::AccountChanged(None));
             }
             tracing::info!(user = %user_id, "live session ended by /forget");
         }

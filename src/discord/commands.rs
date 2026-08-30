@@ -61,7 +61,7 @@ pub(super) fn register_commands(ytdlp_available: bool) -> Vec<CreateCommand> {
     if ytdlp_available {
         cmds.push(
             CreateCommand::new("play")
-                .description("Play a Spotify/YouTube/SoundCloud URL or file attachment")
+                .description("Play a Spotify/YouTube/SoundCloud URL or file; with no argument, press play")
                 .add_option(
                     CreateCommandOption::new(CommandOptionType::String, "url",
                         "Spotify, YouTube, or SoundCloud URL")
@@ -455,10 +455,23 @@ impl Handler {
         let (url_arg, attachment_arg, next) = Self::parse_play_queue_options(cmd);
 
         if url_arg.is_none() && attachment_arg.is_none() {
+            // Bare `/play` is ▶: start whatever is up when nothing is
+            // audible. It never pauses — with something playing it asks
+            // for a link, so a fat-fingered `/play` can't cut the music.
+            let snap = self.player.query().await;
+            let audible = matches!(
+                snap.now,
+                NowPlaying::Media { paused: false, .. }
+                    | NowPlaying::Spotify { paused: false, .. }
+                    | NowPlaying::SpotifyStarting
+            );
+            let text = if !audible {
+                self.player.toggle_pause().await
+            } else {
+                "❌ Something is already playing — give `/play` a link or file, or use ⏯ to pause.".to_string()
+            };
             let _ = cmd.create_response(ctx, CreateInteractionResponse::Message(
-                CreateInteractionResponseMessage::new()
-                    .content("❌ Provide a Spotify/YouTube/SoundCloud URL or attach an audio file.")
-                    .ephemeral(true)
+                CreateInteractionResponseMessage::new().content(text).ephemeral(true)
             )).await;
             return;
         }
