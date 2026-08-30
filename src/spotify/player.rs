@@ -154,7 +154,9 @@ impl SpotifyPlayer {
             initial_volume: 32767,
             disable_volume: false,
             volume_steps: 64,
-            emit_set_queue_events: false,
+            // SetQueue reports Spotify's own queue on every mutation; kept
+            // on so it's available for arm confirmation.
+            emit_set_queue_events: true,
         }
     }
 

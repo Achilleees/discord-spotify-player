@@ -1,4 +1,5 @@
 use super::presence::run_presence_loop;
+use super::ui::{self, CardView, HistoryView, UiMsg};
 use super::voice::{SimpleBridgeReader, TrackErrorHandler, CHANNELS, SAMPLE_RATE};
 use crate::audio::generate_join_sound;
 use crate::audio::dj::DJAnnouncer;
@@ -19,12 +20,10 @@ use serenity::all::{
     CreateInteractionResponseMessage, GatewayIntents, GuildId, Interaction, Ready,
 };
 use serenity::async_trait;
-use serenity::builder::{CreateActionRow, CreateButton, CreateCommandOption, CreateEmbed, CreateEmbedAuthor, CreateEmbedFooter, CreateMessage, EditMessage, EditInteractionResponse};
+use serenity::builder::{CreateCommandOption, CreateMessage, EditInteractionResponse};
 use serenity::client::{Client, Context, EventHandler};
-use serenity::model::application::{ButtonStyle, CommandOptionType};
-use serenity::model::id::MessageId;
+use serenity::model::application::CommandOptionType;
 use serenity::model::voice::VoiceState;
-use serenity::model::Timestamp;
 use songbird::events::{Event, TrackEvent};
 use songbird::input::{Input, RawAdapter};
 use songbird::tracks::TrackHandle;
@@ -61,10 +60,10 @@ const DEVICE_LOGIN_MAX_WAIT: std::time::Duration = std::time::Duration::from_sec
 /// Track metadata as delivered by the librespot session itself (no Web API
 /// calls — those all 429 under the desktop client ID).
 #[derive(Clone)]
-struct SpotifyTrackInfo {
-    title: String,
-    artist: String,
-    album_art_url: Option<String>,
+pub(crate) struct SpotifyTrackInfo {
+    pub(crate) title: String,
+    pub(crate) artist: String,
+    pub(crate) album_art_url: Option<String>,
 }
 
 pub struct ActiveSession {
@@ -112,8 +111,10 @@ struct Handler {
     session_gen: Arc<std::sync::atomic::AtomicU64>,
     track_handle: Arc<Mutex<Option<TrackHandle>>>,
     ctx: Arc<Mutex<Option<Context>>>,
-    controls_message_id: Arc<Mutex<Option<MessageId>>>,
-    now_playing_message_id: Arc<Mutex<Option<MessageId>>>,
+    /// The UI task's mailbox. `None` until `ready()`'s first pass spawns
+    /// the task (see `ui::spawn`); every send site resolves it fresh via
+    /// `.lock().clone()`, mirroring `ctx` above.
+    ui_tx: Arc<Mutex<Option<mpsc::UnboundedSender<UiMsg>>>>,
     // YouTube/file playback fields
     ytdlp_available: bool,
     priority_queue: Arc<Mutex<PriorityQueue>>,
@@ -691,180 +692,6 @@ async fn play_join_sound_then_bridge(
     *lock = Some(track_handle);
 }
 
-// --- Embed builders ---
-
-fn build_now_playing_embed(meta: &SpotifyTrackInfo, track_id: &str, spotify_name: &str) -> CreateEmbed {
-    let mut embed = CreateEmbed::new()
-        .color(0x1DB954u32)
-        .author(CreateEmbedAuthor::new("Now Playing"))
-        .title(format!("{} — {}", meta.title, meta.artist))
-        .url(format!("https://open.spotify.com/track/{}", track_id))
-        .timestamp(Timestamp::now());
-
-    if !spotify_name.is_empty() {
-        embed = embed.footer(CreateEmbedFooter::new(format!("🎧 {}", spotify_name)));
-    }
-
-    if let Some(ref art_url) = meta.album_art_url {
-        embed = embed.image(art_url);
-    }
-
-    embed
-}
-
-fn build_history_embed(meta: &SpotifyTrackInfo, track_id: &str, spotify_name: &str) -> CreateEmbed {
-    let footer_text = if spotify_name.is_empty() {
-        String::new()
-    } else {
-        format!("played by {}", spotify_name)
-    };
-
-    let mut embed = CreateEmbed::new()
-        .color(0x2B2D31u32)
-        .description(format!(
-            "[{} — {}](https://open.spotify.com/track/{})",
-            meta.title, meta.artist, track_id
-        ));
-
-    if !footer_text.is_empty() {
-        embed = embed.footer(CreateEmbedFooter::new(footer_text));
-    }
-
-    if let Some(ref art_url) = meta.album_art_url {
-        embed = embed.thumbnail(art_url);
-    }
-
-    embed
-}
-
-fn build_priority_now_playing_embed(item: &QueueItem) -> CreateEmbed {
-    let color = item.source.embed_color();
-    let title = item.source.display_title();
-    let subtitle = item.source.display_subtitle();
-    let footer_icon = match &item.source {
-        MediaSource::YouTube { .. } => "🎬",
-        MediaSource::File { .. } => "📎",
-        MediaSource::Spotify { .. } => "🎵",
-    };
-
-    let footer_text = match item.source.display_duration() {
-        Some(d) => format!("{} {} · {}", footer_icon, item.queued_by, d),
-        None => format!("{} {}", footer_icon, item.queued_by),
-    };
-    let mut embed = CreateEmbed::new()
-        .color(color)
-        .author(CreateEmbedAuthor::new("Now Playing"))
-        .title(format!("{} — {}", title, subtitle))
-        .timestamp(Timestamp::now())
-        .footer(CreateEmbedFooter::new(footer_text));
-
-    if let MediaSource::YouTube { video_id, thumbnail_url, .. } = &item.source {
-        let url = format!("https://www.youtube.com/watch?v={}", video_id);
-        embed = embed.url(url);
-        if let Some(thumb) = thumbnail_url {
-            embed = embed.image(thumb);
-        }
-    } else if let MediaSource::Spotify { album_art_url: Some(art), .. } = &item.source {
-        embed = embed.image(art);
-    }
-
-    embed
-}
-
-fn build_priority_history_embed(item: &QueueItem) -> CreateEmbed {
-    let footer_text = match item.source.display_duration() {
-        Some(d) => format!("played by {} · {}", item.queued_by, d),
-        None => format!("played by {}", item.queued_by),
-    };
-    let description = match &item.source {
-        MediaSource::YouTube { title, channel, video_id, .. } => {
-            format!("[{} — {}](https://www.youtube.com/watch?v={})", title, channel, video_id)
-        }
-        MediaSource::File { filename, .. } => {
-            format!("📎 {}", filename)
-        }
-        MediaSource::Spotify { title, artist, .. } => {
-            format!("🎵 {} — {}", title, artist)
-        }
-    };
-
-    let mut embed = CreateEmbed::new()
-        .color(0x2B2D31u32)
-        .description(description)
-        .footer(CreateEmbedFooter::new(footer_text));
-
-    if let MediaSource::YouTube { thumbnail_url: Some(thumb), .. } = &item.source {
-        embed = embed.thumbnail(thumb);
-    } else if let MediaSource::Spotify { album_art_url: Some(art), .. } = &item.source {
-        embed = embed.thumbnail(art);
-    }
-
-    embed
-}
-
-/// The idle controls card. Once a track is playing, the now-playing embed
-/// (which carries its own buttons) supersedes this, so there is no separate
-/// "is playing" state to render here.
-fn build_controls_embed(active_user: Option<&str>) -> CreateEmbed {
-    match active_user {
-        Some(name) => CreateEmbed::new()
-            .color(0x1DB954u32)
-            .title(format!("🎛️ {}", name))
-            .description("*Play something to get started!*"),
-        None => CreateEmbed::new()
-            .color(0x5865F2u32)
-            .title("🎛️ Spotibot")
-            .description("*Use `/login` to start a session*"),
-    }
-}
-
-fn build_controls_buttons(is_paused: bool) -> CreateActionRow {
-    let pause_label = if is_paused { "▶" } else { "⏸" };
-    CreateActionRow::Buttons(vec![
-        CreateButton::new("ctrl_prev").label("⏮").style(ButtonStyle::Secondary),
-        CreateButton::new("ctrl_pause_toggle").label(pause_label).style(ButtonStyle::Secondary),
-        CreateButton::new("ctrl_next").label("⏭").style(ButtonStyle::Secondary),
-        CreateButton::new("ctrl_queue_hint").label("➕ Queue").style(ButtonStyle::Secondary),
-    ])
-}
-
-async fn post_controls(ctx: &Context, text_channel_id: ChannelId, active_user: Option<&str>) -> Option<MessageId> {
-    let embed = build_controls_embed(active_user);
-    let mut msg = CreateMessage::new().embed(embed);
-    if active_user.is_some() {
-        msg = msg.components(vec![build_controls_buttons(false)]);
-    }
-    match text_channel_id.send_message(ctx, msg).await {
-        Ok(m) => {
-            tracing::info!("posted controls message");
-            Some(m.id)
-        }
-        Err(e) => {
-            tracing::warn!(error = ?e, "failed to post controls message");
-            None
-        }
-    }
-}
-
-async fn delete_and_repost_controls(
-    ctx: &Context,
-    text_channel_id: ChannelId,
-    controls_message_id: &Arc<Mutex<Option<MessageId>>>,
-    active_user: Option<&str>,
-) {
-    let old_id = {
-        let lock = controls_message_id.lock();
-        *lock
-    };
-    if let Some(mid) = old_id {
-        let _ = text_channel_id.delete_message(ctx, mid).await;
-    }
-
-    let new_id = post_controls(ctx, text_channel_id, active_user).await;
-    let mut lock = controls_message_id.lock();
-    *lock = new_id;
-}
-
 /// Parse a Spotify track ID from a URL or URI.
 /// Accepts `spotify:track:<id>` and any `open.spotify.com` URL with a
 /// `/track/<id>` path segment, including locale-prefixed links
@@ -914,71 +741,6 @@ fn classify_link(input: &str) -> LinkKind {
     }
 }
 
-// --- Priority queue embed posting helpers ---
-
-async fn post_priority_now_playing(
-    ctx_store: &Arc<Mutex<Option<Context>>>,
-    text_channel_id: ChannelId,
-    item: &QueueItem,
-    controls_message_id: &Arc<Mutex<Option<MessageId>>>,
-    now_playing_message_id: &Arc<Mutex<Option<MessageId>>>,
-) {
-    let ctx = {
-        let lock = ctx_store.lock();
-        match lock.clone() { Some(c) => c, None => return }
-    };
-
-    // Delete previous now-playing
-    let prev_np = {
-        let lock = now_playing_message_id.lock();
-        *lock
-    };
-    if let Some(mid) = prev_np {
-        let _ = text_channel_id.delete_message(&ctx, mid).await;
-    }
-
-    // Delete old controls
-    let old_ctrl = {
-        let lock = controls_message_id.lock();
-        *lock
-    };
-    if let Some(mid) = old_ctrl {
-        // Only delete if different from now-playing (they may be the same message)
-        if prev_np != Some(mid) {
-            let _ = text_channel_id.delete_message(&ctx, mid).await;
-        }
-    }
-
-    let embed = build_priority_now_playing_embed(item);
-    let buttons = build_controls_buttons(false);
-    let msg = CreateMessage::new().embed(embed).components(vec![buttons]);
-
-    match text_channel_id.send_message(&ctx, msg).await {
-        Ok(m) => {
-            let mut np_lock = now_playing_message_id.lock();
-            *np_lock = Some(m.id);
-            let mut ctrl_lock = controls_message_id.lock();
-            *ctrl_lock = Some(m.id);
-        }
-        Err(e) => tracing::warn!(error = ?e, "failed to send priority now-playing"),
-    }
-}
-
-async fn post_priority_history(
-    ctx_store: &Arc<Mutex<Option<Context>>>,
-    text_channel_id: ChannelId,
-    item: &QueueItem,
-) {
-    let ctx = {
-        let lock = ctx_store.lock();
-        match lock.clone() { Some(c) => c, None => return }
-    };
-
-    let embed = build_priority_history_embed(item);
-    let msg = CreateMessage::new().embed(embed);
-    let _ = text_channel_id.send_message(&ctx, msg).await;
-}
-
 // --- Priority queue manager ---
 
 /// Clears the drain-active flag on drop, so an aborted or panicking drain task
@@ -1005,37 +767,18 @@ struct QueueDrainCtx {
     feeder_paused: Arc<AtomicBool>,
     dj: Arc<DJAnnouncer>,
     announce_enabled: Arc<AtomicBool>,
-    controls_message_id: Arc<Mutex<Option<MessageId>>>,
-    now_playing_message_id: Arc<Mutex<Option<MessageId>>>,
+    ui_tx: Option<mpsc::UnboundedSender<UiMsg>>,
     track_handle: Arc<Mutex<Option<TrackHandle>>>,
     spotify_state: Arc<Mutex<SpotifyState>>,
     resume_spotify_after_drain: Arc<AtomicBool>,
 }
 
-/// Deletes the current Now-Playing card (unless it's also the controls
-/// message) and reposts the idle controls card. Used both when a queue item
-/// fails outright, so its dead buttons don't linger, and when a natural
-/// drain end has nothing to hand playback to.
+/// Deletes the current card and reposts the idle controls card. Used both
+/// when a queue item fails outright, so its dead buttons don't linger, and
+/// when a natural drain end has nothing to hand playback to.
 async fn clear_now_playing_card(d: &QueueDrainCtx) {
-    let ctx = {
-        let lock = d.ctx.lock();
-        lock.clone()
-    };
-    if let Some(ctx) = ctx {
-        let np = {
-            let mut lock = d.now_playing_message_id.lock();
-            lock.take()
-        };
-        let ctrl = {
-            let lock = d.controls_message_id.lock();
-            *lock
-        };
-        if let Some(mid) = np {
-            if ctrl != Some(mid) {
-                let _ = d.text_channel_id.delete_message(&ctx, mid).await;
-            }
-        }
-        delete_and_repost_controls(&ctx, d.text_channel_id, &d.controls_message_id, None).await;
+    if let Some(tx) = &d.ui_tx {
+        let _ = tx.send(UiMsg::Idle { account: None });
     }
 }
 
@@ -1104,10 +847,9 @@ async fn run_queue_drain(d: &QueueDrainCtx) -> DrainOutcome {
             }
         }
 
-        post_priority_now_playing(
-            &d.ctx, d.text_channel_id, &item,
-            &d.controls_message_id, &d.now_playing_message_id,
-        ).await;
+        if let Some(tx) = &d.ui_tx {
+            let _ = tx.send(UiMsg::NowPlaying(CardView::Queued { item: item.clone() }));
+        }
 
         // DJ announcement before track (honors the /announce toggle)
         if d.announce_enabled.load(Ordering::Relaxed) && d.dj.is_enabled() {
@@ -1147,7 +889,9 @@ async fn run_queue_drain(d: &QueueDrainCtx) -> DrainOutcome {
         match feed_result {
             Ok(()) => {
                 tracing::info!("priority item finished: {}", item.source.display_title());
-                post_priority_history(&d.ctx, d.text_channel_id, &item).await;
+                if let Some(tx) = &d.ui_tx {
+                    let _ = tx.send(UiMsg::History(HistoryView::Queued { item: item.clone() }));
+                }
             }
             Err(FeederError::Cancelled) => {
                 tracing::info!("priority item cancelled (skip/stop)");
@@ -1169,9 +913,9 @@ async fn run_queue_drain(d: &QueueDrainCtx) -> DrainOutcome {
                     let _ = d.text_channel_id.send_message(&ctx, msg).await;
                 }
                 // A failed item's card must not linger with dead buttons —
-                // the next item's post_priority_now_playing would otherwise
-                // be the only thing to clean it up, and never runs if this
-                // was the last item in the queue.
+                // the next item's `NowPlaying` send would otherwise be the
+                // only thing to clean it up, and never runs if this was the
+                // last item in the queue.
                 clear_now_playing_card(d).await;
                 continue;
             }
@@ -1213,8 +957,7 @@ async fn priority_queue_manager(
     dj: Arc<DJAnnouncer>,
     announce_enabled: Arc<AtomicBool>,
     drain_active: Arc<AtomicBool>,
-    controls_message_id: Arc<Mutex<Option<MessageId>>>,
-    now_playing_message_id: Arc<Mutex<Option<MessageId>>>,
+    ui_tx: Option<mpsc::UnboundedSender<UiMsg>>,
     track_handle: Arc<Mutex<Option<TrackHandle>>>,
     spotify_state: Arc<Mutex<SpotifyState>>,
     resume_spotify_after_drain: Arc<AtomicBool>,
@@ -1234,8 +977,7 @@ async fn priority_queue_manager(
         feeder_paused,
         dj,
         announce_enabled,
-        controls_message_id,
-        now_playing_message_id,
+        ui_tx,
         track_handle,
         spotify_state,
         resume_spotify_after_drain,
@@ -1291,9 +1033,7 @@ async fn run_presence_loop_with_track(
     mut rx: mpsc::UnboundedReceiver<PresenceUpdate>,
     track_handle_store: Arc<Mutex<Option<TrackHandle>>>,
     active_session: Arc<Mutex<Option<ActiveSession>>>,
-    text_channel_id: ChannelId,
-    controls_message_id: Arc<Mutex<Option<MessageId>>>,
-    now_playing_message_id: Arc<Mutex<Option<MessageId>>>,
+    ui_tx: Option<mpsc::UnboundedSender<UiMsg>>,
     dj: Arc<DJAnnouncer>,
     announce_enabled: Arc<AtomicBool>,
     bridge: Arc<AudioBridge>,
@@ -1311,9 +1051,6 @@ async fn run_presence_loop_with_track(
     });
 
     let mut last_track_key: Option<String> = None;
-    let mut last_meta: Option<SpotifyTrackInfo> = None;
-    let mut last_track_id: String = String::new();
-    let mut last_spotify_name: String = String::new();
     let mut is_paused: bool = false;
 
     while let Some(update) = rx.recv().await {
@@ -1345,14 +1082,8 @@ async fn run_presence_loop_with_track(
             _ => {}
         }
         if was_paused != is_paused {
-            let msg_id = {
-                let lock = controls_message_id.lock();
-                *lock
-            };
-            if let Some(mid) = msg_id {
-                let buttons = build_controls_buttons(is_paused);
-                let edit = EditMessage::new().components(vec![buttons]);
-                let _ = text_channel_id.edit_message(&ctx, mid, edit).await;
+            if let Some(tx) = &ui_tx {
+                let _ = tx.send(UiMsg::Buttons { paused: is_paused });
             }
         }
 
@@ -1429,19 +1160,6 @@ async fn run_presence_loop_with_track(
                     lock.as_ref().map(|s| s.discord_name.clone()).unwrap_or_default()
                 };
 
-                let prev_msg_id = {
-                    let lock = now_playing_message_id.lock();
-                    *lock
-                };
-                if let Some(mid) = prev_msg_id {
-                    let _ = text_channel_id.delete_message(&ctx, mid).await;
-                    if let Some(ref meta) = last_meta {
-                        let history_embed = build_history_embed(meta, &last_track_id, &last_spotify_name);
-                        let msg = CreateMessage::new().embed(history_embed);
-                        let _ = text_channel_id.send_message(&ctx, msg).await;
-                    }
-                }
-
                 // Metadata now comes straight from the librespot session
                 // (the PresenceUpdate); there is no Web API fallback fetch.
                 let meta = SpotifyTrackInfo {
@@ -1450,39 +1168,20 @@ async fn run_presence_loop_with_track(
                     album_art_url: album_art_url.clone(),
                 };
 
-                let embed = build_now_playing_embed(&meta, track_id, &spotify_name);
-                let buttons = build_controls_buttons(false);
-                let msg = CreateMessage::new().embed(embed).components(vec![buttons]);
-
-                {
-                    let old_ctrl = {
-                        let lock = controls_message_id.lock();
-                        *lock
-                    };
-                    if let Some(mid) = old_ctrl {
-                        let _ = text_channel_id.delete_message(&ctx, mid).await;
-                    }
-                }
-
-                match text_channel_id.send_message(&ctx, msg).await {
-                    Ok(m) => {
-                        println!("Playing: {} - {}", title, artist);
-                        tracing::info!(title = %title, artist = %artist, "now-playing embed sent");
-                        let mut lock = now_playing_message_id.lock();
-                        *lock = Some(m.id);
-                        let mut ctrl_lock = controls_message_id.lock();
-                        *ctrl_lock = Some(m.id);
-                    }
-                    Err(e) => tracing::warn!(error = ?e, "failed to send now-playing embed"),
+                if let Some(tx) = &ui_tx {
+                    let _ = tx.send(UiMsg::NowPlaying(CardView::Spotify {
+                        title: title.clone(),
+                        artist: artist.clone(),
+                        track_id: track_id.clone(),
+                        album_art_url: album_art_url.clone(),
+                        dj_name: spotify_name,
+                    }));
                 }
 
                 {
                     let mut lock = last_meta_store.lock();
-                    *lock = Some(meta.clone());
+                    *lock = Some(meta);
                 }
-                last_meta = Some(meta);
-                last_track_id = track_id.clone();
-                last_spotify_name = spotify_name;
 
                 // DJ announcement AFTER embed (non-blocking, only if enabled)
                 if announce_enabled.load(Ordering::Relaxed) {
@@ -1513,58 +1212,21 @@ async fn run_presence_loop_with_track(
                 last_track_key = None;
                 let mut lock = last_meta_store.lock();
                 *lock = None;
-                last_meta = None;
             }
             // A session that comes up already paused (bot restart mid-pause)
             // never sends Playing, so /np would show nothing — seed it here.
-            if let PresenceUpdate::Paused { title, artist, track_id } = &update {
-                if last_meta.is_none() {
-                    let meta = SpotifyTrackInfo {
+            if let PresenceUpdate::Paused { title, artist, track_id: _ } = &update {
+                let mut lock = last_meta_store.lock();
+                if lock.is_none() {
+                    *lock = Some(SpotifyTrackInfo {
                         title: title.clone(),
                         artist: artist.clone(),
                         album_art_url: None,
-                    };
-                    *last_meta_store.lock() = Some(meta.clone());
-                    last_meta = Some(meta);
-                    last_track_id = track_id.clone();
+                    });
                 }
             }
         }
     }
-}
-
-async fn startup_controls(
-    ctx: &Context,
-    text_channel_id: ChannelId,
-    bot_id: serenity::model::id::UserId,
-    controls_message_id: &Arc<Mutex<Option<MessageId>>>,
-) {
-    use serenity::all::GetMessages;
-    let builder = GetMessages::new().limit(20);
-    if let Ok(messages) = text_channel_id.messages(ctx, builder).await {
-        for msg in &messages {
-            if msg.author.id != bot_id {
-                continue;
-            }
-            // A stale control/now-playing message is any of ours that still
-            // carries buttons, or whose embed is one of our control cards
-            // (idle "🎛️ Spotibot" or an active "🎛️ {name}"). Matching on the
-            // buttons catches the merged now-playing card too, whose title is
-            // the track name rather than a "🎛️" string.
-            let has_buttons = !msg.components.is_empty();
-            let is_control_card = msg
-                .embeds
-                .iter()
-                .any(|e| e.title.as_deref().is_some_and(|t| t.starts_with("🎛️")));
-            if has_buttons || is_control_card {
-                let _ = text_channel_id.delete_message(ctx, msg.id).await;
-            }
-        }
-    }
-
-    let new_id = post_controls(ctx, text_channel_id, None).await;
-    let mut lock = controls_message_id.lock();
-    *lock = new_id;
 }
 
 #[async_trait]
@@ -1587,14 +1249,16 @@ impl EventHandler for Handler {
         let _ = self.ready_tx.try_send(Ok(()));
 
         // First-ready-only work. Discord re-fires ready() after every gateway
-        // resume/reconnect; reposting controls then would orphan the live
-        // controls message and clobber controls_message_id mid-playback.
+        // resume/reconnect; spawning a second UI task then would orphan the
+        // live card and race the first task over the same channel messages.
         let first_ready = !self.auto_start_attempted.swap(true, Ordering::SeqCst);
         if first_ready {
-            // Awaited, not detached: auto_start_stored_session below also
-            // writes controls_message_id, and a detached startup post
-            // finishing second would orphan the active-user card.
-            startup_controls(&ctx, self.text_channel_id, ready.user.id, &self.controls_message_id).await;
+            // The task's own startup (stale-message sweep, idle card post)
+            // runs before it drains its mailbox, so sends queued below by
+            // auto_start_stored_session can never race ahead of it — see
+            // `ui::run`.
+            let tx = ui::spawn(ctx.clone(), self.text_channel_id);
+            *self.ui_tx.lock() = Some(tx);
         }
 
         let rx_taken = {
@@ -1605,9 +1269,7 @@ impl EventHandler for Handler {
             let ctx_presence = ctx.clone();
             let track_handle_store = self.track_handle.clone();
             let active_session = self.active_session.clone();
-            let text_channel_id = self.text_channel_id;
-            let controls_id = self.controls_message_id.clone();
-            let np_id = self.now_playing_message_id.clone();
+            let ui_tx = { self.ui_tx.lock().clone() };
             let dj_presence = self.dj.clone();
             let bridge_presence = self.bridge.clone();
             let announce_presence = self.announce_enabled.clone();
@@ -1620,7 +1282,7 @@ impl EventHandler for Handler {
             tokio::spawn(async move {
                 run_presence_loop_with_track(
                     ctx_presence, rx, track_handle_store, active_session,
-                    text_channel_id, controls_id, np_id,
+                    ui_tx,
                     dj_presence, announce_presence,
                     bridge_presence, priority_item,
                     last_meta_store, spotify_state,
@@ -1753,14 +1415,9 @@ impl EventHandler for Handler {
                         let new_paused = !current;
                         self.feeder_paused.store(new_paused, Ordering::Relaxed);
                         // Update the button visual to reflect pause/play state.
-                        let msg_id = {
-                            let lock = self.controls_message_id.lock();
-                            *lock
-                        };
-                        if let Some(mid) = msg_id {
-                            let buttons = build_controls_buttons(new_paused);
-                            let edit = EditMessage::new().components(vec![buttons]);
-                            let _ = self.text_channel_id.edit_message(&ctx, mid, edit).await;
+                        let tx = { self.ui_tx.lock().clone() };
+                        if let Some(tx) = tx {
+                            let _ = tx.send(UiMsg::Buttons { paused: new_paused });
                         }
                         if current { "▶ Resumed".to_string() } else { "⏸ Paused".to_string() }
                     } else if let Some(tx) = &spirc_tx {
@@ -2151,7 +1808,10 @@ impl Handler {
 
         let _ = self.presence_tx.send(PresenceUpdate::Idle);
 
-        delete_and_repost_controls(ctx, self.text_channel_id, &self.controls_message_id, None).await;
+        let tx = { self.ui_tx.lock().clone() };
+        if let Some(tx) = tx {
+            let _ = tx.send(UiMsg::Idle { account: None });
+        }
 
         if leave_voice {
             if let Some(manager) = songbird::get(ctx).await {
@@ -2373,12 +2033,9 @@ impl Handler {
         let _ = self.join_voice_for_user(Some(discord_user_id)).await;
 
         {
-            let ctx = {
-                let lock = self.ctx.lock();
-                lock.clone()
-            };
-            if let Some(ctx) = ctx {
-                delete_and_repost_controls(&ctx, self.text_channel_id, &self.controls_message_id, Some(&discord_name)).await;
+            let tx = { self.ui_tx.lock().clone() };
+            if let Some(tx) = tx {
+                let _ = tx.send(UiMsg::Idle { account: Some(discord_name.clone()) });
             }
         }
 
@@ -2400,8 +2057,7 @@ impl Handler {
         let active_priority_item = self.active_priority_item.clone();
         let feeder_cancel = self.feeder_cancel.clone();
         let feeder_paused = self.feeder_paused.clone();
-        let controls_message_id = self.controls_message_id.clone();
-        let now_playing_message_id = self.now_playing_message_id.clone();
+        let ui_tx = { self.ui_tx.lock().clone() };
 
         tokio::spawn(priority_queue_manager(
             eot_rx,
@@ -2416,8 +2072,7 @@ impl Handler {
             self.dj.clone(),
             self.announce_enabled.clone(),
             self.drain_active.clone(),
-            controls_message_id,
-            now_playing_message_id,
+            ui_tx,
             self.track_handle.clone(),
             self.spotify_state.clone(),
             self.resume_spotify_after_drain.clone(),
@@ -2579,6 +2234,7 @@ impl Handler {
         if let Some(url) = url {
             let meta = fetch_youtube_metadata(&url).await.map_err(|e| e.to_string())?;
             Ok(QueueItem {
+            item_id: 0,
                 source: MediaSource::YouTube {
                     url: meta.webpage_url.clone(),
                     video_id: meta.video_id,
@@ -2594,6 +2250,7 @@ impl Handler {
             let att = attachment.expect("caller ensures url xor attachment is Some");
             validate_attachment(&att.filename, att.size as u64).map_err(|e| e.to_string())?;
             Ok(QueueItem {
+            item_id: 0,
                 source: MediaSource::File {
                     filename: att.filename.clone(),
                     attachment_url: att.url.clone(),
@@ -2643,6 +2300,7 @@ impl Handler {
                         None => "Couldn't resolve that Spotify track.".to_string(),
                         Some((title, artist, album_art_url)) => {
                             let item = QueueItem {
+                            item_id: 0,
                                 source: MediaSource::Spotify { uri: spotify_uri, title, artist, album_art_url },
                                 queued_by: discord_name.clone(),
                                 queued_by_id: discord_id,
@@ -2822,8 +2480,7 @@ impl Handler {
             feeder_paused: self.feeder_paused.clone(),
             dj: self.dj.clone(),
             announce_enabled: self.announce_enabled.clone(),
-            controls_message_id: self.controls_message_id.clone(),
-            now_playing_message_id: self.now_playing_message_id.clone(),
+            ui_tx: { self.ui_tx.lock().clone() },
             track_handle: self.track_handle.clone(),
             spotify_state: self.spotify_state.clone(),
             resume_spotify_after_drain: self.resume_spotify_after_drain.clone(),
@@ -3236,12 +2893,9 @@ impl Handler {
                 *lock = None;
             }
             let _ = self.presence_tx.send(PresenceUpdate::Idle);
-            let ctx = {
-                let lock = self.ctx.lock();
-                lock.clone()
-            };
-            if let Some(ctx) = ctx {
-                delete_and_repost_controls(&ctx, self.text_channel_id, &self.controls_message_id, None).await;
+            let tx = { self.ui_tx.lock().clone() };
+            if let Some(tx) = tx {
+                let _ = tx.send(UiMsg::Idle { account: None });
             }
         }
 
@@ -3322,6 +2976,7 @@ impl Handler {
                         None => "Couldn't resolve that Spotify track.".to_string(),
                         Some((title, artist, album_art_url)) => {
                             let item = QueueItem {
+                            item_id: 0,
                                 source: MediaSource::Spotify { uri: spotify_uri, title, artist, album_art_url },
                                 queued_by: discord_name.clone(),
                                 queued_by_id: discord_id,
@@ -3461,8 +3116,7 @@ impl DiscordBot {
             session_gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             track_handle,
             ctx: Arc::new(Mutex::new(None)),
-            controls_message_id: Arc::new(Mutex::new(None)),
-            now_playing_message_id: Arc::new(Mutex::new(None)),
+            ui_tx: Arc::new(Mutex::new(None)),
             // YouTube/file fields
             ytdlp_available,
             priority_queue: Arc::new(Mutex::new(PriorityQueue::new())),

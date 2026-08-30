@@ -75,6 +75,22 @@ pub struct QueueItem {
     pub source: MediaSource,
     pub queued_by: String,
     pub queued_by_id: u64,
+    /// Queue-assigned identity, stamped by `push`/`push_front`/`insert` from
+    /// the queue's monotonic counter. `0` means "not yet queued"; every
+    /// insertion (including a re-insertion of a popped item) stamps a fresh
+    /// id, so an id names one residency in the queue, not the track itself.
+    pub item_id: u64,
+}
+
+impl QueueItem {
+    /// Build an item awaiting insertion; the queue stamps `item_id` when the
+    /// item is pushed, so constructors never invent ids.
+    // Unused until the C3 call-site migration; bot.rs's struct literals
+    // predate this constructor.
+    #[allow(dead_code)]
+    pub fn new(source: MediaSource, queued_by: String, queued_by_id: u64) -> Self {
+        Self { source, queued_by, queued_by_id, item_id: 0 }
+    }
 }
 
 /// Maximum queued items (matches nob's unified-queue cap).
@@ -83,19 +99,29 @@ pub const MAX_QUEUE_LEN: usize = 500;
 /// Bot-managed priority queue for YouTube/file tracks.
 pub struct PriorityQueue {
     items: VecDeque<QueueItem>,
+    /// Monotonic `item_id` source; the last stamped id (0 = none yet).
+    /// Never reused, so ids stay unique across pops and reorders.
+    next_item_id: u64,
 }
 
 impl PriorityQueue {
     pub fn new() -> Self {
-        Self { items: VecDeque::new() }
+        Self { items: VecDeque::new(), next_item_id: 0 }
+    }
+
+    /// Stamp the next monotonic id onto an item about to be inserted.
+    fn stamp(&mut self, item: &mut QueueItem) {
+        self.next_item_id += 1;
+        item.item_id = self.next_item_id;
     }
 
     /// Enqueue an item. Returns `false` (rejecting it) when the queue is full,
     /// so an in-voice user can't grow it without bound.
-    pub fn push(&mut self, item: QueueItem) -> bool {
+    pub fn push(&mut self, mut item: QueueItem) -> bool {
         if self.items.len() >= MAX_QUEUE_LEN {
             return false;
         }
+        self.stamp(&mut item);
         self.items.push_back(item);
         true
     }
@@ -103,10 +129,11 @@ impl PriorityQueue {
     /// Enqueue an item at the front, ahead of everything already queued.
     /// Returns `false` (rejecting it) when the queue is full, matching
     /// `push`'s cap semantics.
-    pub fn push_front(&mut self, item: QueueItem) -> bool {
+    pub fn push_front(&mut self, mut item: QueueItem) -> bool {
         if self.items.len() >= MAX_QUEUE_LEN {
             return false;
         }
+        self.stamp(&mut item);
         self.items.push_front(item);
         true
     }
@@ -115,10 +142,11 @@ impl PriorityQueue {
     /// current length so an out-of-range index appends instead of panicking.
     /// Returns `false` (rejecting it) when the queue is full, matching
     /// `push`'s cap semantics.
-    pub fn insert(&mut self, idx: usize, item: QueueItem) -> bool {
+    pub fn insert(&mut self, idx: usize, mut item: QueueItem) -> bool {
         if self.items.len() >= MAX_QUEUE_LEN {
             return false;
         }
+        self.stamp(&mut item);
         let idx = idx.min(self.items.len());
         self.items.insert(idx, item);
         true
@@ -178,8 +206,8 @@ mod tests {
     use super::*;
 
     fn item(title: &str) -> QueueItem {
-        QueueItem {
-            source: MediaSource::YouTube {
+        QueueItem::new(
+            MediaSource::YouTube {
                 url: "u".into(),
                 video_id: "v".into(),
                 title: title.into(),
@@ -187,9 +215,9 @@ mod tests {
                 thumbnail_url: None,
                 duration_secs: 0,
             },
-            queued_by: "me".into(),
-            queued_by_id: 1,
-        }
+            "me".into(),
+            1,
+        )
     }
 
     #[test]
@@ -261,16 +289,45 @@ mod tests {
     }
 
     fn spotify_item(uri: &str, title: &str) -> QueueItem {
-        QueueItem {
-            source: MediaSource::Spotify {
+        QueueItem::new(
+            MediaSource::Spotify {
                 uri: librespot_core::SpotifyUri::from_uri(uri).unwrap(),
                 title: title.into(),
                 artist: "artist".into(),
                 album_art_url: None,
             },
-            queued_by: "me".into(),
-            queued_by_id: 1,
-        }
+            "me".into(),
+            1,
+        )
+    }
+
+    #[test]
+    fn item_ids_are_unique_and_survive_reordering() {
+        let mut q = PriorityQueue::new();
+        assert!(q.push(item("a")));
+        assert!(q.push(item("b")));
+        assert!(q.push_front(item("c")));
+        assert!(q.insert(1, item("d")));
+
+        // Insertion order was a(1), b(2), c(3), d(4); queue order is now
+        // [c, d, a, b] — each item keeps the id stamped at its insertion.
+        let snap = q.snapshot();
+        let pairs: Vec<(&str, u64)> =
+            snap.iter().map(|i| (i.source.display_title(), i.item_id)).collect();
+        assert_eq!(pairs, vec![("c", 3), ("d", 4), ("a", 1), ("b", 2)]);
+
+        let mut ids: Vec<u64> = snap.iter().map(|i| i.item_id).collect();
+        assert!(ids.iter().all(|&id| id != 0), "every insertion stamps a nonzero id");
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), snap.len(), "ids are unique");
+
+        // Re-inserting a popped item stamps a fresh id: an id names one
+        // residency in the queue, so it can never collide with a live one.
+        let popped = q.pop().unwrap();
+        assert_eq!(popped.item_id, 3);
+        assert!(q.push(popped));
+        assert_eq!(q.snapshot().last().unwrap().item_id, 5, "re-insertion restamps");
     }
 
     #[test]

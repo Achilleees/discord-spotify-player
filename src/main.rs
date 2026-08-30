@@ -3,6 +3,10 @@ mod audio_bridge;
 mod config;
 mod discord;
 mod oauth;
+// Pure player-decision core (player-refactor C2); unreferenced until the
+// player actor lands in C3, so dead-code analysis is silenced wholesale.
+#[allow(dead_code)]
+mod player;
 mod presence;
 mod queue;
 mod setup;
