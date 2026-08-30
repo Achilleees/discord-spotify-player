@@ -1411,10 +1411,30 @@ impl Handler {
             cancel.notify_one();
         }
 
+        // Forgetting the account behind the live session must also end that
+        // session — otherwise it keeps running on deleted credentials until
+        // the process restarts, and nothing would auto-start it again. Only
+        // the owner's own /forget does this; a bystander's touches nothing
+        // but their own row. Playback is untouched either way: the supervisor
+        // emits LinkDown and the actor decides what a dead link means, so a
+        // queued media item plays straight through.
+        if self.active_owner() == Some(user_id_u64) {
+            self.supervisor.stop(user_id_u64).await;
+            {
+                let mut lock = self.active_session.lock();
+                *lock = None;
+            }
+            let tx = { self.ui_tx.lock().clone() };
+            if let Some(tx) = tx {
+                let _ = tx.send(UiMsg::Idle { account: None });
+            }
+            tracing::info!(user = %user_id, "live session ended by /forget");
+        }
+
         match self.user_store.remove(user_id) {
-            Ok(true) => { tracing::info!(user = %user_id, "credentials forgotten"); "Credentials permanently deleted. Run `/login` to connect again.".to_string() }
+            Ok(true) => { tracing::info!(user = %user_id, "credentials forgotten"); "✅ Credentials permanently deleted — run `/login` to connect again.".to_string() }
             Ok(false) => "No stored credentials to delete.".to_string(),
-            Err(e) => { tracing::error!("failed to delete credentials: {}", e); "Failed to delete credentials.".to_string() }
+            Err(e) => { tracing::error!("failed to delete credentials: {}", e); "⚠️ Couldn't delete the credentials — try again.".to_string() }
         }
     }
 
@@ -1425,7 +1445,7 @@ impl Handler {
             // Discord's own name is gone (429s under the desktop client id),
             // so there is only ever the one name to show.
             Some(session) => format!("Active session: **{}**", session.discord_name),
-            None => "No active Spotify session. Run `/login` to connect.".to_string(),
+            None => "No Spotify session — run `/login` to connect.".to_string(),
         }
     }
 
