@@ -266,7 +266,11 @@ impl SpotifyPlayer {
                         };
 
                         if is_new_track {
-                            println!("Playing: {} - {}", title, artist);
+                            // Console announcement happens in the presence
+                            // loop, once the track is actually heard (a
+                            // Playing under an active media item is paused
+                            // straight back down).
+                            tracing::debug!(title = %title, artist = %artist, "spotify playing event");
                         }
                         last_sent_track = Some(track_id.clone());
                         let _ = presence_tx_events.send(PresenceUpdate::Playing {

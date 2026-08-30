@@ -1380,39 +1380,37 @@ async fn run_presence_loop_with_track(
         // is, so chained Spotify items (and a DJ resuming a paused queue
         // from their phone) stay gap-free. Idle means Spotify's own device
         // queue is gone, so nothing is armed anymore.
-        match &update {
-            PresenceUpdate::Playing { track_id, .. } => {
-                let matched = {
-                    let mut armed_lock = armed_spotify.lock();
-                    let is_match = armed_lock.as_ref().map(|u| u.to_id()).as_deref() == Some(track_id.as_str());
-                    if is_match {
-                        *armed_lock = None;
-                    }
-                    is_match
-                };
-                if matched {
-                    let mut lock = priority_queue.lock();
-                    lock.remove_first(|item| matches!(&item.source, MediaSource::Spotify { uri, .. } if uri.to_id() == *track_id));
+        // Only `Playing` needs bookkeeping here. `Idle` deliberately does
+        // not clear the armed track: librespot emits it at every track
+        // boundary (EndOfTrack), so clearing it here would forget a track
+        // already sitting in Spotify's queue and queue it a second time.
+        // Session teardown (login/logout/forget/stop) clears it instead.
+        if let PresenceUpdate::Playing { track_id, .. } = &update {
+            {
+                // Spotify reporting a track we hold is authoritative: it is
+                // playing, so it leaves our queue — whether or not it is
+                // still the armed one. The pop must not depend on that
+                // bookkeeping surviving, since a missed pop leaves the item
+                // queued and it gets handed to Spotify again, playing twice.
+                let mut armed_lock = armed_spotify.lock();
+                if armed_lock.as_ref().map(|u| u.to_id()).as_deref() == Some(track_id.as_str()) {
+                    *armed_lock = None;
                 }
-                let media_active = { active_priority_item.lock().is_some() };
-                let tx = { spirc_cmd_tx.lock().clone() };
-                if media_active {
-                    if let Some(tx) = &tx {
-                        let _ = tx.send(SpircCommand::Pause);
-                    }
-                    // This Playing never reached the listeners — no card, no
-                    // history, and no dedup key, so the track's real start
-                    // (after the queue clears) posts normally.
-                    continue;
-                } else {
-                    try_arm_first_spotify(&priority_queue, &armed_spotify, tx.as_ref(), SpotifyState::Playing, media_active);
+                let mut lock = priority_queue.lock();
+                lock.remove_first(|item| matches!(&item.source, MediaSource::Spotify { uri, .. } if uri.to_id() == *track_id));
+            }
+            let media_active = { active_priority_item.lock().is_some() };
+            let tx = { spirc_cmd_tx.lock().clone() };
+            if media_active {
+                if let Some(tx) = &tx {
+                    let _ = tx.send(SpircCommand::Pause);
                 }
+                // This Playing never reached the listeners — no card, no
+                // history, and no dedup key, so the track's real start
+                // (after the queue clears) posts normally.
+                continue;
             }
-            PresenceUpdate::Idle => {
-                let mut lock = armed_spotify.lock();
-                *lock = None;
-            }
-            _ => {}
+            try_arm_first_spotify(&priority_queue, &armed_spotify, tx.as_ref(), SpotifyState::Playing, media_active);
         }
 
         if let PresenceUpdate::Playing { title, artist, track_id, album_art_url } = &update {
@@ -1468,6 +1466,7 @@ async fn run_presence_loop_with_track(
 
                 match text_channel_id.send_message(&ctx, msg).await {
                     Ok(m) => {
+                        println!("Playing: {} - {}", title, artist);
                         tracing::info!(title = %title, artist = %artist, "now-playing embed sent");
                         let mut lock = now_playing_message_id.lock();
                         *lock = Some(m.id);
