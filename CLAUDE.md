@@ -11,8 +11,11 @@ from Discord slash commands (`/login`, `/play`, `/queue`, `/skip`, `/stop`,
 `/who`, `/np`, `/announce`, `/logout`, `/forget`), and from now-playing buttons.
 
 This repo is the hardened reference for the music stack of `never-off-beat`
-(nob). **Read `PORT.md`** before large changes — it maps modules to nob and
-records the design decisions.
+(nob). **Read `docs/PORT.md`** before large changes — it maps modules to nob
+and records the design decisions. Public docs live in `docs/`, the file map
+in `CODEMAP.md`; release notes go in `CHANGELOG.md` (prose per release, one
+bold headline per user-visible change). Working files (audits, plans) go in
+the gitignored `.local/`, never in `docs/`.
 
 ## Build and Run
 

@@ -21,6 +21,9 @@ credentials.json
 .user_creds.migrated/
 spotibot.db*
 
+# Local working files (audit reports, plans, research) — never shipped
+.local/
+
 # IDE
 .idea/
 .claude/

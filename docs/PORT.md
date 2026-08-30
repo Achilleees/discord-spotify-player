@@ -161,10 +161,9 @@ nob-music's internal modules are laid out in nob's `ARCHITECTURE.md`. The mappin
 
 ## What NOT to port
 
-- **`bot.rs` as one file.** It is a ~1,900-line god-module because spotibot
-  has no crate boundaries — even after `discord/ui.rs` and `player/` pulled
-  the card ownership and the decision logic back out of it. nob's
-  panel/actions/commands split supersedes it: `discord/ui.rs`'s embed
+- **The `discord/` module split as-is.** `bot.rs` (~600 lines of wiring),
+  `commands.rs`, `account.rs` and `ui.rs` are cut along spotibot's needs, not
+  nob's. nob's panel/actions/commands split supersedes them: `ui.rs`'s embed
   builders → `embeds`, the button/command dispatch → `commands` + `actions`,
   the presence loop → `presence`, `player/state.rs` + `player/actor.rs` →
   `player`/`queue`. Rebuild against nob's seams, don't paste.

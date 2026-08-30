@@ -132,7 +132,7 @@ fn classify_link(input: &str) -> LinkKind {
     }
 }
 
-/// Pure voice-gate policy (PORT.md locked decision 4): with the bot in a
+/// Pure voice-gate policy (docs/PORT.md locked decision 4): with the bot in a
 /// channel the user must share it; with the bot in none, `allow_follow`
 /// decides whether being in any voice channel suffices (the /play
 /// fresh-boot path, where the bot joins the requester).
@@ -622,7 +622,7 @@ impl Handler {
 
     /// `/queue`: adds to the queue's tail without starting playback —
     /// Spotify, YouTube/SoundCloud and attachments all land in the actor's
-    /// one unified queue (PORT.md decision #15), never jump the line, never
+    /// one unified queue (docs/PORT.md decision #15), never jump the line, never
     /// start playback. No arguments shows the current queue listing.
     async fn handle_queue(
         &self,

@@ -56,7 +56,7 @@ impl UserStore {
         // The DB holds tokens (encrypted or not); keep it owner-only on unix.
         restrict_permissions(db_path);
         // last_used_at/created_at are written but never queried here: the
-        // schema is intentional parity with nob's 002-music.sql (see PORT.md),
+        // schema is intentional parity with nob's 002-music.sql (see docs/PORT.md),
         // which does consume them.
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;

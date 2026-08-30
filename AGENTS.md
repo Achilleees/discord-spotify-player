@@ -3,7 +3,9 @@
 A Discord music bot: per-user Spotify (via librespot + OAuth device
 authorization), plus YouTube/SoundCloud/files, streamed into one voice
 channel. This repo is the hardened reference for nob's music stack — see
-`PORT.md` before large changes.
+`docs/PORT.md` before large changes. Public docs: `docs/`; file map:
+`CODEMAP.md`; release notes: `CHANGELOG.md`. Working files (audits, plans)
+go in the gitignored `.local/`, not `docs/`.
 
 ## Safety and secrets
 - Never print or paste values from `.env`, `spotibot.db`, or `.spotify_cache/`.
@@ -13,11 +15,12 @@ channel. This repo is the hardened reference for nob's music stack — see
 
 ## Build and run
 - `cargo build --release`; binary is `target\release\discord-spotify-player.exe`.
-- `cargo check` for fast feedback; `cargo test` (186 unit tests); `cargo clippy`.
+- `cargo check` for fast feedback; `cargo test`; `cargo clippy --all-targets -- -D warnings` (what CI runs).
+- Stop a running bot before `cargo build --release` — it locks the exe.
 - First-run setup: `--setup` writes `.env`. OAuth needs no config.
 - `.cargo/config.toml` (tracked) carries the cmake fix; MSVC toolchain on Windows.
 
-## Architecture (see `docs/components.md`)
+## Architecture (see `docs/architecture.md`, `CODEMAP.md`)
 - Two audio producers push PCM f32 into `AudioBridge`; `SimpleBridgeReader`
   pulls it out for Songbird. One player actor (`player/actor.rs`, pure
   decision core in `player/state.rs`) owns the queue, the armed Spotify
