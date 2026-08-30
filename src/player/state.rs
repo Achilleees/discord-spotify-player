@@ -331,6 +331,8 @@ pub enum Input {
     LinkReconnecting { gen: u64 },
     VoiceReady,
     VoiceLost,
+    /// Bare `/play`: the ▶ half of ⏯, refused while something is audible.
+    Play { reply: oneshot::Sender<String> },
     /// An explicit human claim on the Connect device (`/login`): the one
     /// path besides ▶ that may activate. Auto-start and on-demand sessions
     /// never send it (F15).
@@ -412,6 +414,10 @@ pub enum Effect {
     CancelMedia,
     ClearBridge,
     JoinVoice,
+    /// Spotify reported a track playing without metadata: resolve it
+    /// through the live session and feed the answer back as
+    /// `TransportEvent::TrackChanged` (which posts the card).
+    ResolveMeta(SpotifyUri),
     TrackHandle(TrackHandleCmd),
     Ui(UiMsg),
     Presence(PresenceState),
@@ -510,6 +516,15 @@ pub fn step(state: &mut PlayerState, input: Input, now: Instant) -> Vec<Effect> 
                 // feeder's tail bleed into the new item.
                 fx.push(Effect::CancelMedia);
                 fx.push(Effect::ClearBridge);
+                // A human skip is an explicit advance: whatever paused the
+                // baseline (a phone pause, a /stop), the next thing plays.
+                // The bot owns the pause from here, so the post-media
+                // boundary resumes instead of honouring it.
+                if state.device_active
+                    && matches!(state.sp, SpDevice::Paused(_) | SpDevice::Boundary)
+                {
+                    state.pause_owner = Some(PauseOwner::BotForMedia);
+                }
                 reply(&mut fx, tx, "⏭ Skipped.");
                 return fx;
             }
@@ -639,6 +654,24 @@ pub fn step(state: &mut PlayerState, input: Input, now: Instant) -> Vec<Effect> 
             reply(&mut fx, tx, text);
         }
 
+        Input::Play { reply: tx } => {
+            // The ▶ half only: never pauses. With something audible it
+            // asks for a link instead (a fat-fingered bare `/play` can't
+            // cut the music); otherwise it is exactly ⏯.
+            let audible = matches!(state.active, Active::Media { paused: false, .. })
+                || (!matches!(state.active, Active::Media { .. })
+                    && matches!(state.sp, SpDevice::Playing(_)));
+            if audible {
+                reply(
+                    &mut fx,
+                    tx,
+                    "❌ Something is already playing — give `/play` a link or file, or use ⏯ to pause.",
+                );
+                return fx;
+            }
+            return step(state, Input::TogglePause { reply: tx }, now);
+        }
+
         Input::TogglePause { reply: tx } => {
             if let Active::Media { paused, .. } = &mut state.active {
                 *paused = !*paused;
@@ -665,13 +698,28 @@ pub fn step(state: &mut PlayerState, input: Input, now: Instant) -> Vec<Effect> 
                 // gen-tagged telemetry corrects us if the claim failed.
                 fx.push(Effect::Spirc(SpircCmd::ActivateDevice));
                 state.device_active = true;
-                if matches!(head_of(&state.queue), Head::Media) {
-                    let item = state.queue.pop().expect("head checked as media");
-                    let title = item.source.display_title().to_string();
-                    start_media(state, item, StartGate::Immediate, &mut fx);
-                    reply(&mut fx, tx, format!("▶ Taking over the Spotify device — starting **{title}**."));
-                } else {
-                    reply(&mut fx, tx, "▶ Taking over the Spotify device.");
+                if matches!(state.sp, SpDevice::Inactive) {
+                    // Nothing was ever loaded on this session: activated,
+                    // it's an idle device — loadable.
+                    state.sp = SpDevice::Idle;
+                }
+                match head_of(&state.queue) {
+                    Head::Media => {
+                        let item = state.queue.pop().expect("head checked as media");
+                        let title = item.source.display_title().to_string();
+                        start_media(state, item, StartGate::Immediate, &mut fx);
+                        reply(&mut fx, tx, format!("▶ Taking over the Spotify device — starting **{title}**."));
+                    }
+                    Head::Spotify(uri) if matches!(state.sp, SpDevice::Idle) => {
+                        let title = state
+                            .queue
+                            .peek()
+                            .map(|i| i.source.display_title().to_string())
+                            .unwrap_or_default();
+                        begin_load(state, uri, now, &mut fx);
+                        reply(&mut fx, tx, format!("▶ Taking over the Spotify device — starting **{title}**."));
+                    }
+                    _ => reply(&mut fx, tx, "▶ Taking over the Spotify device."),
                 }
                 return fx;
             }
@@ -1032,14 +1080,27 @@ fn handle_transport(state: &mut PlayerState, ev: TransportEvent, now: Instant, f
             state.active = Active::Spotify { track: meta.clone() };
             state.pause_owner = None;
             if !same_track {
-                fx.push(Effect::Ui(UiMsg::NowPlayingSpotify { uri: uri.clone(), meta: meta.clone() }));
-                if let Some(m) = &meta {
-                    fx.push(Effect::Announce(AnnounceKind::Track {
-                        title: m.title.clone(),
-                        artist: m.artist.clone(),
-                    }));
+                match &meta {
+                    Some(m) => {
+                        fx.push(Effect::Ui(UiMsg::NowPlayingSpotify {
+                            uri: uri.clone(),
+                            meta: meta.clone(),
+                        }));
+                        fx.push(Effect::Announce(AnnounceKind::Track {
+                            title: m.title.clone(),
+                            artist: m.artist.clone(),
+                        }));
+                        state.last_heard_track = Some(uri_str);
+                    }
+                    None => {
+                        // No card for an unknown track (it would read
+                        // "Unknown track"); resolve the metadata and let the
+                        // resulting `TrackChanged` post it. `last_heard_track`
+                        // stays as is so that repost isn't skipped as a
+                        // duplicate.
+                        fx.push(Effect::ResolveMeta(uri.clone()));
+                    }
                 }
-                state.last_heard_track = Some(uri_str);
             }
             if let Some(m) = meta {
                 fx.push(Effect::Presence(PresenceState::Playing { uri, meta: m }));
@@ -2135,6 +2196,61 @@ mod tests {
     }
 
     #[test]
+    fn skipping_a_media_item_after_a_stop_resumes_the_spotify_head() {
+        // Live E': /stop paused the baseline (BotForStop); a later ⏭ on
+        // the media item honoured that pause and nothing played. A human
+        // skip is an advance.
+        let mut sim = Sim::baseline_paused(Some(PauseOwner::BotForStop));
+        sim.s.queue.push(media_item("m"));
+        let item = sim.s.queue.pop().unwrap();
+        sim.s.media_epoch = 1;
+        sim.s.active = Active::Media { item, paused: false, epoch: 1 };
+        let id = sim.push_spotify(1, "s1");
+        sim.arm(1, id, Ack::Confirmed);
+        sim.skip();
+        let fx = sim.media_ended(MediaOutcome::Cancelled);
+        assert_eq!(spircs(&fx), vec![SpircCmd::Play], "the skip resumes: {fx:?}");
+        assert!(matches!(sim.s.active, Active::Spotify { .. }));
+    }
+
+    #[test]
+    fn takeover_on_a_fresh_session_loads_the_spotify_head_at_once() {
+        // Live I': ▶ activated the device but left it Inactive, so the
+        // second ▶ sent Play to a device with nothing loaded.
+        let mut sim = Sim::new();
+        sim.s.sp = SpDevice::Inactive;
+        sim.push_spotify(1, "s1");
+        let fx = sim.toggle();
+        assert_eq!(spircs(&fx), vec![SpircCmd::ActivateDevice, SpircCmd::Load(uri(1))]);
+        assert!(matches!(sim.s.active, Active::SpotifyPending { .. }));
+    }
+
+    #[test]
+    fn bare_play_never_pauses() {
+        let mut sim = Sim::baseline_playing();
+        let (tx, _rx) = oneshot::channel();
+        let fx = sim.step(Input::Play { reply: tx });
+        assert!(spircs(&fx).is_empty(), "audible: refused, no Pause");
+        // Paused baseline: it is ⏯'s ▶ half.
+        let mut sim = Sim::baseline_paused(Some(PauseOwner::Human));
+        let (tx, _rx) = oneshot::channel();
+        let fx = sim.step(Input::Play { reply: tx });
+        assert_eq!(spircs(&fx), vec![SpircCmd::Play]);
+    }
+
+    #[test]
+    fn playing_without_meta_resolves_instead_of_posting_an_unknown_card() {
+        let mut sim = Sim::baseline_playing();
+        let fx = sim.transport(TransportEvent::Playing { uri: uri(2), meta: None });
+        assert!(!fx.iter().any(|e| matches!(e, Effect::Ui(UiMsg::NowPlayingSpotify { .. }))));
+        assert!(fx.iter().any(|e| matches!(e, Effect::ResolveMeta(u) if *u == uri(2))));
+        // The resolved metadata arrives as TrackChanged and posts the card.
+        let meta = TrackMeta { title: "t".into(), artist: "a".into(), album_art_url: None };
+        let fx = sim.transport(TransportEvent::TrackChanged { uri: uri(2), meta });
+        assert!(fx.iter().any(|e| matches!(e, Effect::Ui(UiMsg::NowPlayingSpotify { .. }))));
+    }
+
+    #[test]
     fn spotify_pending_times_out() {
         // An F2-dropped Load must not park the player: retry once while
         // idle, then surface an error and free the turn.
@@ -2460,11 +2576,17 @@ mod tests {
     #[test]
     fn play_takeover_activates_the_device_explicitly() {
         // ▶ is the takeover gesture; nothing else ever claims the device.
+        // A never-loaded session is idle once claimed, so a Spotify head
+        // loads in the same press.
         let mut sim = Sim::new();
         sim.push_spotify(1, "s1");
         let fx = sim.toggle();
-        assert_eq!(spircs(&fx), vec![SpircCmd::ActivateDevice]);
+        assert_eq!(spircs(&fx), vec![SpircCmd::ActivateDevice, SpircCmd::Load(uri(1))]);
         assert!(sim.s.device_active);
+        // With nothing queued: activation alone.
+        let mut sim = Sim::new();
+        let fx = sim.toggle();
+        assert_eq!(spircs(&fx), vec![SpircCmd::ActivateDevice]);
     }
 
     // --- controls during media --------------------------------------------

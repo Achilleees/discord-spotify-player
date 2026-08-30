@@ -282,8 +282,11 @@ impl SessionSupervisor {
         let handle = tokio::spawn(async move {
             // Written directly here, not through the supervisor's `live`
             // lock — see the module docs.
-            let _ = link_up_tx.send(Some(generation));
+            // Mailbox first, watch second: a watcher that reacts to the
+            // link coming up (the /login activation) must land behind
+            // `LinkUp` in the actor's FIFO.
             link_tx.send(Input::LinkUp { gen: generation });
+            let _ = link_up_tx.send(Some(generation));
 
             tracing::info!(user = discord_user_id, "librespot OAuth session starting");
             let mut spirc_rx = Some(spirc_rx);

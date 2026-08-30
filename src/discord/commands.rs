@@ -458,18 +458,7 @@ impl Handler {
             // Bare `/play` is ▶: start whatever is up when nothing is
             // audible. It never pauses — with something playing it asks
             // for a link, so a fat-fingered `/play` can't cut the music.
-            let snap = self.player.query().await;
-            let audible = matches!(
-                snap.now,
-                NowPlaying::Media { paused: false, .. }
-                    | NowPlaying::Spotify { paused: false, .. }
-                    | NowPlaying::SpotifyStarting
-            );
-            let text = if !audible {
-                self.player.toggle_pause().await
-            } else {
-                "❌ Something is already playing — give `/play` a link or file, or use ⏯ to pause.".to_string()
-            };
+            let text = self.player.play().await;
             let _ = cmd.create_response(ctx, CreateInteractionResponse::Message(
                 CreateInteractionResponseMessage::new().content(text).ephemeral(true)
             )).await;

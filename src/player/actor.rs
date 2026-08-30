@@ -158,6 +158,11 @@ impl PlayerHandle {
         self.request(|reply| Input::TogglePause { reply }).await
     }
 
+    /// The ▶ half only (bare `/play`): refused while something is audible.
+    pub async fn play(&self) -> String {
+        self.request(|reply| Input::Play { reply }).await
+    }
+
     pub async fn previous(&self) -> String {
         self.request(|reply| Input::Previous { reply }).await
     }
@@ -422,6 +427,32 @@ impl Actor {
             }
 
             Effect::ClearBridge => self.deps.bridge.clear(),
+
+            Effect::ResolveMeta(uri) => {
+                // Awaited in a spawned task, never here; the answer comes
+                // back through the mailbox as a gen-tagged TrackChanged.
+                let spirc = { self.deps.spirc_cmd_tx.lock().clone() };
+                let tx = self.tx.clone();
+                let gen = self.state.link_gen;
+                tokio::spawn(async move {
+                    let Some(spirc) = spirc else { return };
+                    let (reply_tx, reply_rx) = oneshot::channel();
+                    if spirc.send(SpircCommand::Lookup(uri.clone(), reply_tx)).is_err() {
+                        return;
+                    }
+                    if let Ok(Some(lookup)) = reply_rx.await {
+                        let meta = TrackMeta {
+                            title: lookup.title,
+                            artist: lookup.artist,
+                            album_art_url: lookup.album_art_url,
+                        };
+                        let _ = tx.send(Input::Transport {
+                            gen,
+                            ev: TransportEvent::TrackChanged { uri, meta },
+                        });
+                    }
+                });
+            }
 
             Effect::JoinVoice => {
                 let join = (self.deps.join_voice)(join_hint);

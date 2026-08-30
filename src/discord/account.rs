@@ -190,9 +190,26 @@ impl Handler {
         // `/login` is a human claim on the device: activate it, so the
         // bot shows as the playing device right away. Only this explicit
         // path does — boot auto-start and on-demand sessions never
-        // activate (F15). The command sits in the session's channel until
-        // Spirc is up.
-        self.player.send(PlayerInput::ActivateDevice);
+        // activate (F15). Sent only once the new session's `LinkUp` has
+        // landed: `LinkUp` resets the device to inactive, so an activation
+        // racing ahead of it was silently undone.
+        let player = self.player.clone();
+        let mut link_up = self.supervisor.link_up_watch();
+        tokio::spawn(async move {
+            let wait = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+                while link_up.borrow_and_update().is_none() {
+                    if link_up.changed().await.is_err() {
+                        return false;
+                    }
+                }
+                true
+            });
+            if matches!(wait.await, Ok(true)) {
+                // The mailbox is FIFO and the session sends `LinkUp` before
+                // it flips the watch, so this lands after it.
+                player.send(PlayerInput::ActivateDevice);
+            }
+        });
     }
 
     /// The half of an account switch that isn't the supervisor's job (see
