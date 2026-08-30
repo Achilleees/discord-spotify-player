@@ -26,10 +26,10 @@
 //! report can never be read as current. `link_up_watch()` mirrors the same
 //! generation as a `watch::Receiver<Option<u64>>` — written by each
 //! generation's own task, *without* taking this supervisor's `switch`/`stop`
-//! lock, specifically so a future `ensure_session` (on-demand session
-//! bring-up, C7) can wait on it while holding no lock of its own; the
-//! device-auth pairing poll that `switch` is called after can run for
-//! minutes, and nothing here may block behind that.
+//! lock, specifically so `ensure_session` (on-demand session bring-up, C7)
+//! can wait on it while holding no lock of its own; the device-auth pairing
+//! poll that `switch` is called after can run for minutes, and nothing here
+//! may block behind that.
 //!
 //! An account switch (`switch`) is deliberate, not a transient blip: the
 //! previous session's Spotify-side device queue and any armed track die
@@ -122,6 +122,21 @@ pub struct SessionSupervisor {
     /// Carries the current generation while a session is up, `None` while
     /// down. Written by each generation's own task — see the module docs.
     link_up_tx: watch::Sender<Option<u64>>,
+}
+
+/// Outcome of [`SessionSupervisor::ensure_session`].
+pub enum EnsureOutcome {
+    /// A live session is up, at this generation — either it already was,
+    /// or `ensure_session` just brought it up.
+    Ready(u64),
+    /// No stored user is marked active; there is nothing to start.
+    NoAccount,
+    /// A stored account exists but no live session could be brought up —
+    /// the token refresh failed, or the link never came up within the
+    /// wait. The `String` is a diagnostic for `tracing::warn!` only; per
+    /// the reply-string convention (`player::state`'s `reply`), it must
+    /// never reach a Discord reply directly.
+    Failed(String),
 }
 
 impl SessionSupervisor {
@@ -326,6 +341,87 @@ impl SessionSupervisor {
 
         *live = Some(LiveSession { discord_user_id, generation, handle, refresh_handle });
         tracing::info!(user = discord_user_id, name = %discord_name, "librespot session spawned");
+    }
+
+    /// Ensures a live session exists, starting one from the stored active
+    /// account if needed. Returns the generation once the link is up.
+    ///
+    /// On-demand bring-up (C7): called from the interaction-handler task
+    /// when a Spotify link is queued and no session is running — never
+    /// from the player actor, which must never await something delivered
+    /// into its own mailbox, and `LinkUp` is exactly that. The caller
+    /// defers its Discord reply first, since the wait below can take up
+    /// to 15s.
+    ///
+    /// Takes no lock across the wait: the up-front check and the final
+    /// wait both go through [`Self::link_up_watch`], which — per the
+    /// module docs — each generation's own task writes directly,
+    /// bypassing `switch`'s lock entirely. The only lock touched here at
+    /// all is the one `switch` itself takes internally, and that guard is
+    /// dropped when `switch` returns, well before the wait begins.
+    pub async fn ensure_session(&self, oauth: &SpotifyOAuth, store: &UserStore) -> EnsureOutcome {
+        let mut rx = self.link_up_watch();
+        if let Some(gen) = *rx.borrow() {
+            return EnsureOutcome::Ready(gen);
+        }
+
+        let Some(user) = store.list().into_iter().find(|u| u.active) else {
+            return EnsureOutcome::NoAccount;
+        };
+        let Ok(discord_user_id) = user.discord_user_id.parse::<u64>() else {
+            return EnsureOutcome::Failed(format!(
+                "unparseable stored discord user id: {}",
+                user.discord_user_id
+            ));
+        };
+
+        // Persist the rotated tokens exactly as `auto_start_stored_session`
+        // does today: a refresh failure means the stored credentials are
+        // stale or revoked, so there is nothing to retry here — the caller
+        // reports it and the next fix is a fresh `/login`.
+        let (access_token, refresh_token, expires_in) =
+            match oauth.refresh_access_token(&user.refresh_token).await {
+                Ok(t) => {
+                    let mut updated = user.clone();
+                    updated.access_token = t.access_token.clone();
+                    if let Some(rt) = t.refresh_token.clone() {
+                        updated.refresh_token = rt;
+                    }
+                    let _ = store.save(&updated);
+                    (t.access_token, updated.refresh_token, t.expires_in)
+                }
+                Err(e) => return EnsureOutcome::Failed(format!("token refresh failed: {e}")),
+            };
+
+        self.switch(
+            discord_user_id,
+            user.discord_name.clone(),
+            access_token,
+            refresh_token,
+            expires_in,
+        )
+        .await;
+
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            if let Some(gen) = *rx.borrow() {
+                return EnsureOutcome::Ready(gen);
+            }
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return EnsureOutcome::Failed(
+                    "timed out waiting for the Spotify session to connect".into(),
+                );
+            };
+            match tokio::time::timeout(remaining, rx.changed()).await {
+                Ok(Ok(())) => continue,
+                Ok(Err(_)) => return EnsureOutcome::Failed("session link watch closed".into()),
+                Err(_) => {
+                    return EnsureOutcome::Failed(
+                        "timed out waiting for the Spotify session to connect".into(),
+                    )
+                }
+            }
+        }
     }
 
     /// Stop the live session, but only if `owner` is the one running it — a

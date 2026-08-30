@@ -11,7 +11,7 @@ use crate::player::state::{EnqueuePos, Input as PlayerInput, NowPlaying, Transpo
 use crate::presence::PresenceUpdate;
 use crate::queue::{QueueItem, MediaSource};
 use crate::spotify::SpircCommand;
-use crate::spotify::SessionSupervisor;
+use crate::spotify::{EnsureOutcome, SessionSupervisor};
 use crate::youtube::metadata::{fetch_youtube_metadata, validate_attachment};
 use crate::users::{UserCredentials, UserStore};
 use serenity::all::{
@@ -59,8 +59,8 @@ pub(crate) struct SpotifyTrackInfo {
 /// Display-only cache of who the live Spotify session belongs to, for `/who`
 /// and the takeover gate. The `SessionSupervisor` owns the actual session
 /// lifecycle (the librespot task, its refresher, the generation) — this is
-/// just the name and id the callers of `switch_active_session` /
-/// `supervisor.stop` populate and clear alongside it.
+/// just the name and id `finish_account_switch` (the shared tail of every
+/// account-switch path) / `supervisor.stop` populate and clear alongside it.
 pub struct ActiveSession {
     pub discord_user_id: u64,
     pub discord_name: String,
@@ -81,8 +81,8 @@ struct Handler {
     active_session: Arc<Mutex<Option<ActiveSession>>>,
     /// Owns the Spotify session lifecycle (librespot task, refresher, token
     /// state, generation) independently of playback — see
-    /// `spotify::session`. `switch_active_session`/`handle_logout`/
-    /// `teardown_playback_session` are its only callers.
+    /// `spotify::session`. `switch_active_session`/`auto_start_stored_session`/
+    /// `handle_logout`/`teardown_playback_session` are its only callers.
     supervisor: SessionSupervisor,
     ctx: Arc<Mutex<Option<Context>>>,
     /// The UI task's mailbox. `None` until `ready()`'s first pass spawns
@@ -844,8 +844,19 @@ impl Handler {
     /// Restart the stored active user's Spotify session on boot, through the
     /// exact same path /login uses. Skips when no user is marked active or the
     /// stored record is unusable (unparseable id, failed refresh).
+    ///
+    /// A thin wrapper over `SessionSupervisor::ensure_session` (the same
+    /// on-demand bring-up `/play`/`/queue` use, C7): the refresh-and-switch
+    /// work that used to live inline here is single-sourced there now. What
+    /// stays here is boot-specific: the pre-attempt log line (kept ahead of
+    /// the call so it still reads as "attempting", not "succeeded"), and the
+    /// two outcomes `ensure_session` deliberately doesn't decide for its
+    /// other callers — deactivate-and-warn on a dead refresh token, and the
+    /// account-switch bookkeeping (voice, UI, DB exclusivity, the `/who`
+    /// cache) on success, via `finish_account_switch` rather than
+    /// `switch_active_session` so `ensure_session`'s own `supervisor.switch`
+    /// isn't immediately followed by a second one.
     async fn auto_start_stored_session(&self) {
-        let oauth = self.oauth.clone();
         let Some(user) = self.user_store.list().into_iter().find(|u| u.active) else {
             tracing::info!("auto-start skipped: no stored active user");
             return;
@@ -858,49 +869,35 @@ impl Handler {
         tracing::info!(spotify = %user.discord_name, "auto-starting stored session");
         println!("Auto-starting Spotify session for {}...", user.discord_name);
 
-        // A refresh failure at boot means the stored credentials are stale or
-        // revoked; retrying with the expired token would just burn reconnect
-        // attempts, so skip auto-start and wait for a fresh /login.
-        let (access_token, refresh_token, expires_in) =
-            match oauth.refresh_access_token(&user.refresh_token).await {
-                Ok(t) => {
-                    let mut updated = user.clone();
-                    updated.access_token = t.access_token.clone();
-                    if let Some(rt) = t.refresh_token.clone() {
-                        updated.refresh_token = rt;
-                    }
-                    let _ = self.user_store.save(&updated);
-                    (t.access_token, updated.refresh_token, t.expires_in)
+        match self.supervisor.ensure_session(&self.oauth, &self.user_store).await {
+            EnsureOutcome::Ready(_gen) => {
+                self.finish_account_switch(discord_user_id, user.discord_name).await;
+            }
+            EnsureOutcome::NoAccount => {
+                // Unreachable in practice: `user` above already found this
+                // exact row active, and nothing else can flip it inactive
+                // this early in boot. Logged rather than assumed.
+                tracing::warn!("auto-start: ensure_session found no active account after one was found above");
+            }
+            EnsureOutcome::Failed(reason) => {
+                tracing::warn!(error = %reason, "auto-start token refresh failed; skipping auto-start");
+                // Dead stored token: deactivate it so every boot stops
+                // retrying, and say so in the text channel — a silent
+                // skip looks like the bot lost Spotify support entirely.
+                let _ = self.user_store.deactivate(&user.discord_user_id);
+                let ctx = {
+                    let lock = self.ctx.lock();
+                    lock.clone()
+                };
+                if let Some(ctx) = ctx {
+                    let msg = CreateMessage::new().content(format!(
+                        "⚠️ Couldn't restore **{}**'s Spotify session (stored credentials expired). Run `/login` to reconnect.",
+                        user.discord_name
+                    ));
+                    let _ = self.text_channel_id.send_message(&ctx, msg).await;
                 }
-                Err(e) => {
-                    tracing::warn!(error = ?e, "auto-start token refresh failed; skipping auto-start");
-                    // Dead stored token: deactivate it so every boot stops
-                    // retrying, and say so in the text channel — a silent
-                    // skip looks like the bot lost Spotify support entirely.
-                    let _ = self.user_store.deactivate(&user.discord_user_id);
-                    let ctx = {
-                        let lock = self.ctx.lock();
-                        lock.clone()
-                    };
-                    if let Some(ctx) = ctx {
-                        let msg = CreateMessage::new().content(format!(
-                            "⚠️ Couldn't restore **{}**'s Spotify session (stored credentials expired). Run `/login` to reconnect.",
-                            user.discord_name
-                        ));
-                        let _ = self.text_channel_id.send_message(&ctx, msg).await;
-                    }
-                    return;
-                }
-            };
-
-        self.switch_active_session(
-            discord_user_id,
-            user.discord_name,
-            access_token,
-            refresh_token,
-            expires_in,
-        )
-        .await;
+            }
+        }
     }
 
     /// Point the live Spotify session at `discord_user_id` and update
@@ -921,7 +918,18 @@ impl Handler {
         self.supervisor
             .switch(discord_user_id, discord_name.clone(), access_token, refresh_token, expires_in)
             .await;
+        self.finish_account_switch(discord_user_id, discord_name).await;
+    }
 
+    /// The half of an account switch that isn't the supervisor's job (see
+    /// `spotify::session`'s import restriction, which keeps it from ever
+    /// reaching voice, the DB's exclusivity flag or the UI): DB exclusivity,
+    /// the `/who`/takeover-gate cache, the voice call (a no-op when one
+    /// already exists), and the card's account name. Split out of
+    /// `switch_active_session` so `auto_start_stored_session` can run it
+    /// after `ensure_session`'s own `supervisor.switch` without a second,
+    /// redundant one.
+    async fn finish_account_switch(&self, discord_user_id: u64, discord_name: String) {
         // Exactly one user stays active:true, so auto-start can't resurrect a
         // displaced user after a restart.
         if let Err(e) = self.user_store.set_active_exclusive(&discord_user_id.to_string()) {
@@ -1025,17 +1033,28 @@ impl Handler {
         let discord_name = cmd.user.global_name.clone().unwrap_or_else(|| cmd.user.name.clone());
         let discord_id = cmd.user.id.get();
 
-        // Spotify track link: no yt-dlp probe, no cooldown — reply
-        // immediately instead of deferring. Metadata resolves here in the
-        // handler task (never inside the actor); the actor then owns the
-        // enqueue-and-maybe-start decision and the reply.
+        // Spotify track link: no yt-dlp probe, but `ensure_session` below
+        // can wait up to 15s for a session to come up, which blows
+        // Discord's 3s window — defer first, exactly like the media path
+        // below. Metadata resolves here in the handler task (never inside
+        // the actor); the actor then owns the enqueue-and-maybe-start
+        // decision and the reply.
         if let Some(url) = &url_arg {
             if let LinkKind::Spotify(spotify_uri) = classify_link(url) {
-                let reply = if !self.player.has_session() {
-                    "No Spotify session — run `/login` to connect.".to_string()
-                } else {
-                    match self.player.lookup_spotify(&spotify_uri).await {
-                        None => "⚠️ Couldn't resolve that Spotify track — check the link and try again.".to_string(),
+                let _ = cmd.create_response(ctx, CreateInteractionResponse::Defer(
+                    CreateInteractionResponseMessage::new().ephemeral(true)
+                )).await;
+
+                let reply = match self.supervisor.ensure_session(&self.oauth, &self.user_store).await {
+                    EnsureOutcome::NoAccount => {
+                        "No Spotify account is connected — someone needs to run `/login`.".to_string()
+                    }
+                    EnsureOutcome::Failed(reason) => {
+                        tracing::warn!(error = %reason, "ensure_session failed for /play");
+                        "⚠️ Couldn't reach Spotify — try again in a moment.".to_string()
+                    }
+                    EnsureOutcome::Ready(_gen) => match self.player.lookup_spotify(&spotify_uri).await {
+                        None => "⚠️ Couldn't find that Spotify track — check the link.".to_string(),
                         Some((title, artist, album_art_url)) => {
                             let item = QueueItem {
                                 item_id: 0,
@@ -1062,11 +1081,9 @@ impl Handler {
                             };
                             self.player.enqueue(item, pos, true).await
                         }
-                    }
+                    },
                 };
-                let _ = cmd.create_response(ctx, CreateInteractionResponse::Message(
-                    CreateInteractionResponseMessage::new().content(reply).ephemeral(true)
-                )).await;
+                let _ = cmd.edit_response(ctx, EditInteractionResponse::new().content(reply)).await;
                 return;
             }
         }
@@ -1442,16 +1459,28 @@ impl Handler {
         let discord_name = cmd.user.global_name.clone().unwrap_or_else(|| cmd.user.name.clone());
         let discord_id = cmd.user.id.get();
 
-        // Spotify track link: no yt-dlp probe, no defer needed. Metadata
-        // resolves here in the handler task (never inside the actor); the
-        // actor owns the tail push and the reply, with `start_if_idle` off.
+        // Spotify track link: no yt-dlp probe, but `ensure_session` below
+        // can wait up to 15s for a session to come up, which blows
+        // Discord's 3s window — defer first, exactly like the media path
+        // below. Metadata resolves here in the handler task (never inside
+        // the actor); the actor owns the tail push and the reply, with
+        // `start_if_idle` off.
         if let Some(url) = &url_arg {
             if let LinkKind::Spotify(spotify_uri) = classify_link(url) {
-                let reply = if !self.player.has_session() {
-                    "No Spotify session — run `/login` to connect.".to_string()
-                } else {
-                    match self.player.lookup_spotify(&spotify_uri).await {
-                        None => "⚠️ Couldn't resolve that Spotify track — check the link and try again.".to_string(),
+                let _ = cmd.create_response(ctx, CreateInteractionResponse::Defer(
+                    CreateInteractionResponseMessage::new().ephemeral(true)
+                )).await;
+
+                let reply = match self.supervisor.ensure_session(&self.oauth, &self.user_store).await {
+                    EnsureOutcome::NoAccount => {
+                        "No Spotify account is connected — someone needs to run `/login`.".to_string()
+                    }
+                    EnsureOutcome::Failed(reason) => {
+                        tracing::warn!(error = %reason, "ensure_session failed for /queue");
+                        "⚠️ Couldn't reach Spotify — try again in a moment.".to_string()
+                    }
+                    EnsureOutcome::Ready(_gen) => match self.player.lookup_spotify(&spotify_uri).await {
+                        None => "⚠️ Couldn't find that Spotify track — check the link.".to_string(),
                         Some((title, artist, album_art_url)) => {
                             let item = QueueItem {
                                 item_id: 0,
@@ -1461,11 +1490,9 @@ impl Handler {
                             };
                             self.player.enqueue(item, EnqueuePos::Tail, false).await
                         }
-                    }
+                    },
                 };
-                let _ = cmd.create_response(ctx, CreateInteractionResponse::Message(
-                    CreateInteractionResponseMessage::new().content(reply).ephemeral(true)
-                )).await;
+                let _ = cmd.edit_response(ctx, EditInteractionResponse::new().content(reply)).await;
                 return;
             }
         }

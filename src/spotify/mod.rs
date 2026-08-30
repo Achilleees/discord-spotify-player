@@ -3,4 +3,4 @@ mod session;
 mod sink;
 
 pub use player::SpircCommand;
-pub use session::SessionSupervisor;
+pub use session::{EnsureOutcome, SessionSupervisor};

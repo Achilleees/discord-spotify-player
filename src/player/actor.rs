@@ -121,8 +121,8 @@ pub struct PlayerDeps {
 #[derive(Clone)]
 pub struct PlayerHandle {
     tx: mpsc::UnboundedSender<Input>,
-    /// The same spirc cell the actor holds, so session-aware helpers
-    /// (`has_session`, `lookup_spotify`) run in the caller's task without a
+    /// The same spirc cell the actor holds, so `lookup_spotify` runs in the
+    /// caller's task without a
     /// mailbox round-trip — and without the caller ever holding a channel it
     /// could drive playback with directly.
     spirc: Arc<Mutex<Option<mpsc::UnboundedSender<SpircCommand>>>>,
@@ -175,12 +175,6 @@ impl PlayerHandle {
             return empty_snapshot();
         }
         rx.await.unwrap_or_else(|_| empty_snapshot())
-    }
-
-    /// Whether a Spotify Connect session is live (able to accept commands),
-    /// regardless of its current playback state.
-    pub fn has_session(&self) -> bool {
-        self.spirc.lock().is_some()
     }
 
     /// Resolves a Spotify track's title/artist/art through the live session
