@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [main, audit3-burndown, device-auth]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # librespot's build script needs this for its cmake-based native deps.
+  CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # opus and cmake are native dependencies of librespot-playback and songbird.
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake pkg-config libopus-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Tests
+        run: cargo test
+
+      - name: Release build
+        run: cargo build --release
