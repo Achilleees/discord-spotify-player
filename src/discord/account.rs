@@ -78,7 +78,10 @@ impl Handler {
 
         if leave_voice {
             if let Some(manager) = songbird::get(ctx).await {
-                let _ = manager.leave(self.guild_id).await;
+                // `remove`, not `leave`: leave keeps the Call registered and
+                // every later presence check would read it as "still in a
+                // call".
+                let _ = manager.remove(self.guild_id).await;
                 tracing::info!("bot left voice channel");
             }
         }
@@ -98,7 +101,7 @@ impl Handler {
         let ctx = { self.ctx.lock().clone() };
         if let Some(ctx) = &ctx {
             if let Some(manager) = songbird::get(ctx).await {
-                if manager.get(self.guild_id).is_some() {
+                if super::bot::bot_in_voice(&manager, self.guild_id).await {
                     return true;
                 }
             }

@@ -202,6 +202,17 @@ fn spawn_notice_task(
     tx
 }
 
+/// Whether the bot is actually connected to a voice channel. `Songbird::get`
+/// alone is not that test: `leave()` keeps the `Call` registered, so it
+/// answers "yes" forever after the first empty-channel teardown and every
+/// later `/login` would skip the re-join.
+pub(super) async fn bot_in_voice(manager: &songbird::Songbird, guild_id: GuildId) -> bool {
+    match manager.get(guild_id) {
+        Some(call) => call.lock().await.current_channel().is_some(),
+        None => false,
+    }
+}
+
 /// Join the given user's voice channel (falling back to the configured
 /// channel), self-deafen, unsuppress on stage channels, and start the
 /// join-sound + bridge hookup. Returns whether the join succeeded. Free
@@ -227,12 +238,17 @@ async fn join_voice_inner(
         }
     };
 
+    // Follow the user in — unless they're parked in the guild's AFK channel,
+    // which is nobody's listening room.
     let user_channel = discord_user_id.and_then(|id| {
-        guild_id.to_guild_cached(&ctx)
-            .and_then(|guild| {
-                guild.voice_states.get(&UserId::new(id))
-                    .and_then(|vs| vs.channel_id)
-            })
+        guild_id.to_guild_cached(&ctx).and_then(|guild| {
+            let afk = guild.afk_metadata.as_ref().map(|a| a.afk_channel_id);
+            guild
+                .voice_states
+                .get(&UserId::new(id))
+                .and_then(|vs| vs.channel_id)
+                .filter(|ch| Some(*ch) != afk)
+        })
     });
 
     let target_channel = user_channel.unwrap_or(fallback_channel);
@@ -513,7 +529,7 @@ impl DiscordBot {
                         let ctx = { ctx_store.lock().clone() };
                         if let Some(ctx) = &ctx {
                             if let Some(manager) = songbird::get(ctx).await {
-                                if manager.get(guild_id).is_some() {
+                                if bot_in_voice(&manager, guild_id).await {
                                     return true;
                                 }
                             }
