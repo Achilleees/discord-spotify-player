@@ -13,20 +13,26 @@ channel. This repo is the hardened reference for nob's music stack — see
 
 ## Build and run
 - `cargo build --release`; binary is `target\release\discord-spotify-player.exe`.
-- `cargo check` for fast feedback; `cargo test` (103 unit tests); `cargo clippy`.
+- `cargo check` for fast feedback; `cargo test` (186 unit tests); `cargo clippy`.
 - First-run setup: `--setup` writes `.env`. OAuth needs no config.
 - `.cargo/config.toml` (tracked) carries the cmake fix; MSVC toolchain on Windows.
 
 ## Architecture (see `docs/components.md`)
 - Two audio producers push PCM f32 into `AudioBridge`; `SimpleBridgeReader`
-  pulls it out for Songbird. Priority: DJ overlay > the one bot-owned queue
-  (Spotify tracks, YT/SC, files — same true order as `/queue` lists, radio
-  rules: the bot never skips a track on its own) > Spotify Connect baseline.
-  While Spotify is playing, the bot arms the first Spotify track anywhere in
-  the queue into Spotify's own queue, so librespot's own track-end advance
-  lands on it once any media items ahead of it have played.
-- Sessions are OAuth-only (discovery/mDNS was removed in v0.5). One active DJ at
-  a time; auto-start replays the stored active user on boot.
+  pulls it out for Songbird. One player actor (`player/actor.rs`, pure
+  decision core in `player/state.rs`) owns the queue, the armed Spotify
+  track, and the turn — who's entitled to be audible. Priority: DJ overlay >
+  the queue (Spotify tracks, YT/SC, files — same true order as `/queue`
+  lists, radio rules: the bot never skips a track on its own) > Spotify
+  Connect baseline. While Spotify holds the turn, the actor arms the first
+  Spotify track anywhere in the queue into Spotify's own queue, so
+  librespot's own track-end advance lands on it once any media items ahead
+  of it have played.
+- The Spotify session is its own lifecycle (`SessionSupervisor` in
+  `spotify/session.rs`), OAuth-only (discovery/mDNS was removed in v0.5),
+  background, and structurally unable to reach playback — it imports neither
+  songbird nor the queue. One active DJ at a time; auto-start replays the
+  stored active user on boot.
 - Tokens live in SQLite (`spotify_credentials`, encrypted `auth_blob`). One
   proactive refresher task owns the refresh cycle.
 

@@ -35,7 +35,7 @@ what NOT to bring across.
 7. **Discovery (mDNS)** — deleted. OAuth-only, like nob.
 8. **Token refresh** — proactive (single-owner task, `expires_in` − 5 min) plus
    an early-refresh Notify signal from the librespot task on session death.
-9. **Tests** — nob-style, portable (103 unit tests).
+9. **Tests** — nob-style, portable (186 unit tests).
 10. **Docs** — full rewrite + this file.
 11. **Songbird/DAVE** — songbird 0.6 stable (same as nob), not the fork.
 12. **Kickoff** — plan → merge → burn down by slice, each slice deployable.
@@ -57,7 +57,10 @@ what NOT to bring across.
     mid-playback surprised users, so the priority-queue manager now waits
     for `EndOfTrack` before draining a queued item, and resumes Spotify
     afterwards only if it was playing before (`SpotifyState`: `Idle` /
-    `Playing` / `Paused`, fed by `PresenceUpdate`).
+    `Playing` / `Paused`, fed by `PresenceUpdate`). — *superseded: the
+    priority-queue manager, `SpotifyState` and the wait-for-`EndOfTrack`
+    drain are gone; the player actor's pure core now owns this decision —
+    see decision 16.*
 15. **Unified queue — radio rules; the bot never sends Next on its own** —
     decision #14 still routed Spotify links straight into Spotify Connect's
     own queue (`add_to_queue`), invisible to the bot: two queues, `/queue`
@@ -85,7 +88,49 @@ what NOT to bring across.
     table (see the plan at commit time); the only mutating critical section
     is `try_arm_first_spotify`, which the presence loop also drives on every
     Spotify `Playing` event so a chain of queued Spotify tracks stays
-    gap-free without a fresh `/queue` each time.
+    gap-free without a fresh `/queue` each time. — *superseded:
+    `head_action`, `try_arm_first_spotify`, `armed_spotify` and the
+    presence-loop-driven re-arm are gone; the radio rules stand, but the
+    owner is now the player actor's pure core, not a handler-shared mutex —
+    see decision 16.*
+16. **Player-core architecture — one owned state, a pure `step`, three
+    lifecycles** — decisions 14 and 15 kept growing the same weak spot:
+    playback intent was *inferred* from Spotify's own transport telemetry
+    (a `spotify_state` snapshot, a `resume_spotify_after_drain` bool
+    sampled once at drain start) instead of *owned*, which produced a class
+    of freeze/double-play/audio-cut bugs no additional `head_action` arm
+    could close (reproduced live: phone-pause → skip → media → skip → the
+    next Spotify track never played, because the bool said "wasn't
+    playing"). The fix has three parts, and it — not any single file — is
+    what nob inherits:
+    - **Owned state.** One player actor (`src/player/actor.rs`) owns all
+      playback state — the queue, the armed Spotify track, and the "turn"
+      (who is entitled to be audible) — in a single `PlayerState`, reached
+      only through a mailbox. The actor awaits nothing, ever: every effect
+      is a synchronous channel send or a `tokio::spawn` (media runners,
+      voice joins, announcements, timers), so a decision can never be
+      interleaved with the IO that carries it out.
+    - **A pure decision core.** `src/player/state.rs`:
+      `step(state, input, now) -> Vec<Effect>`, importing no serenity,
+      songbird or librespot-connect types. Deterministic under test (74
+      tests) — this is the module that ports to nob's `player` crate
+      nearest to verbatim; port its test table as the spec, the same way
+      `head_action`'s table was meant to be ported before it was outgrown.
+    - **Three independent lifecycles.** The player (lives for the process,
+      owns voice/bridge/queue), the Spotify session (`SessionSupervisor` in
+      `src/spotify/session.rs` — background, started by `/login`/boot
+      auto-start, or on demand via `ensure_session`; structurally unable to
+      touch playback because it imports neither songbird nor the queue),
+      and the account (`/login` registers/switches an active user, nothing
+      more). Session churn (a `/login` mid-track) and playback state are now
+      different compiler-enforced blast radii, not just a convention.
+
+    Radio rules (decision 15) are unchanged in substance — strict queue
+    order across sources, the bot never sends Spotify a `Next` on its own —
+    but are now a property of `step`'s test table, not a hope resting on
+    every call site remembering to check a shared mutex correctly. Port the
+    three-lifecycle split and the "actor awaits nothing" discipline as
+    architecture, not just `state.rs`'s code.
 
 ## Module map: spotibot → nob-music
 
@@ -95,27 +140,33 @@ nob-music's internal modules are laid out in nob's `ARCHITECTURE.md`. The mappin
 |---|---|---|
 | `src/oauth/mod.rs` | `spotify` (OAuth client) | device flow: `request_device_code` / `poll_device_token` / `refresh` — port as-is. |
 | `src/users/mod.rs` + `crypto.rs` | `spotify` (credential store) + nob-core db | Table schema already matches nob's `spotify_credentials`. See "storage" below. |
-| `src/spotify/player.rs` | `spotify` (session lifecycle) | `run_with_token` = the Spirc lifecycle. Drop `SpotifyPlayer` struct-of-statics for a module. Also owns playback control: a `SpircCommand` channel (`Play`/`Pause`/`Next`/`Previous`/`AddToQueue`/`Load`/`Lookup`) is applied to the live `Spirc` — port this channel, not a Web API client. `Lookup(uri, oneshot)` resolves queued-Spotify-item metadata via `Track::get(&session, &uri)`, returning `TrackLookup { title, artist, album_art_url }`. |
+| `src/player/state.rs` | **`player`** (decision core) | The pure core: one owned `PlayerState`, `step(state, input, now) -> Vec<Effect>`. No serenity/songbird/librespot-connect types — port near-verbatim, including its test table (74 tests); that table *is* the spec (see decision 16). |
+| `src/player/actor.rs` | **`player`** (runtime shell) | The impure shell: one task owns `PlayerState` plus the bridge-reader `TrackHandle`, feeder cancel/pause flags and the live Spirc sender, reached only through a `PlayerHandle` mailbox. Port the discipline, not the transport specifics — the actor awaits nothing, ever; every effect is a synchronous send or a `tokio::spawn`. |
+| `src/spotify/player.rs` | `spotify` (session lifecycle) | `run_with_token` = the Spirc lifecycle. Drop `SpotifyPlayer` struct-of-statics for a module. Also owns playback control: a `SpircCommand` channel (`Play`/`Pause`/`Next`/`Previous`/`AddToQueue`/`Load`/`Lookup`/`ActivateDevice`/`Transfer`) is applied to the live `Spirc` — port this channel, not a Web API client. `Lookup(uri, oneshot)` resolves queued-Spotify-item metadata via `Track::get(&session, &uri)`, returning `TrackLookup { title, artist, album_art_url }`. No longer clears the shared bridge on any event — only the player actor (the turn holder) does. |
+| `src/spotify/session.rs` | `spotify` (session supervisor) | `SessionSupervisor` owns the librespot task, its proactive refresher, the shared token state, and a monotonic session generation — kept structurally unable to reach playback (imports no songbird, queue, or player-effect type; its only surface into `player` is `Input`, delivered through the same mailbox as every other source). `ensure_session` is the on-demand entry point, called from the command-handling task, never from inside the player actor. Port the import restriction as an enforced crate boundary, not a convention. |
 | `src/spotify/sink.rs` | nob-audio (DSP) + `spotify` (sink) | Biquad/DSP belongs in nob-audio (already has DSP); the `Sink` impl stays in music. |
 | `src/spotify/metadata.rs` | *(deleted)* | Was a raw reqwest Web API track fetch; removed — track metadata now comes from librespot's `PlayerEvent::TrackChanged` (see decision #13). Nothing to port. |
-| `src/audio_bridge.rs` | nob-audio (ring buffer) | nob-audio already has a tested ring buffer — reconcile, keep nob's, port the even-frame parity guard if missing. |
+| `src/audio_bridge.rs` | nob-audio (ring buffer) | nob-audio already has a tested ring buffer — reconcile, keep nob's, port the even-frame parity guard if missing. Only the turn holder may clear it. |
 | `src/audio/dj.rs` | `dj` | **Kokoro is a Unix socket here, not HTTP.** nob's TASKS say HTTP REST :8880 — reconcile (see gotcha). |
 | `src/audio/mod.rs` (join sound) | `dj` or `actions` | Small; place with sound effects. |
+| `src/discord/ui.rs` | `embeds`/`panel` | Single owner of the now-playing/controls card: one task, one mailbox (`UiMsg`), one `card_id`. Port the single-owner discipline — nob's panel/embeds split must still resolve to exactly one writer of the card, or the two-owner race this repo just fixed comes back. |
 | `src/discord/voice.rs` | `voice` | `SimpleBridgeReader` = the Songbird source adapter. |
-| `src/presence.rs` | `presence` (or a shared-types module) | The shared `PresenceUpdate` enum (`Idle` / `Paused { title, artist, track_id }` / `Playing { title, artist, track_id, album_art_url }`, sourced from `PlayerEvent::TrackChanged` — no `access_token`) — both the player-event side and `src/discord/presence.rs` depend on it; give it an explicit home. |
+| `src/presence.rs` | `presence` (or a shared-types module) | The shared `PresenceUpdate` enum (`Idle` \| `Paused` \| `Playing { title, artist }`, produced by the player actor from librespot's `PlayerEvent::TrackChanged` — no `access_token`, no `track_id`) — both the player actor and `src/discord/presence.rs` depend on it; give it an explicit home. |
 | `src/discord/presence.rs` | `presence` | Bot status text. |
-| `src/discord/bot.rs` | **split across `commands`/`actions`/`panel`/`player`** | **Do NOT port wholesale** — see below. `handle_play`/`handle_queue` implement decision #14; the priority-queue manager reads `SpotifyState` off the handler (kept fresh by the presence loop) to decide whether a drain should resume Spotify afterwards. Decision #15's radio-rules logic lives here too: `Handler.armed_spotify: Arc<Mutex<Option<SpotifyUri>>>` tracks the Spotify track (if any) currently armed in Spotify Connect's own queue; `head_action(head, spotify_state, media_active, trigger) -> HeadAction` is the pure decision table (`HeadAction`: `Arm`/`QueueBehindCurrent`/`Load`/`Drain`/`ResumeSpotify`/`NextSpotify`/`ResumeThenArm`/`Nothing`); `try_arm_first_spotify(...)` is the one critical section that sends `AddToQueue` and sets `armed_spotify`, `queue_behind_current(...)` handles the Spotify-paused case (queue behind the current track, resume), called from `reconcile` (the trigger → `head_action` → side-effect dispatcher) and from the presence loop on every `Playing` event. Port `head_action` and its table of unit tests verbatim — that table *is* the spec. |
-| `src/queue.rs` | `queue` | One priority queue (DJ overlay > queue > Spotify baseline; `MediaSource::Spotify \| YouTube \| File`, all in true order — see decision #15). Tracks play strictly in queue order (radio rules); while Spotify is playing, the *first* Spotify track anywhere in the queue is armed into Spotify's own queue instead (see `bot.rs` row). Capped at `MAX_QUEUE_LEN = 500` (matches nob's unified-queue cap); `push()`/`push_front()` are fallible (`-> bool`), rejecting at capacity; `insert(idx, item)` clamps `idx` to `len` and backs `next:true` behind an armed head; `peek()`/`pop_if(predicate)` back the arm/pop-on-`Playing` logic. |
+| `src/discord/bot.rs` | **split across `commands`/`actions`/`panel`/`player`** | **Do NOT port wholesale** — see below. It's wiring, not decision logic: slash-command/button dispatch, the device-auth `/login` flow, and voice join/leave all call into a `PlayerHandle` (queue/skip/stop/pause) and a `SessionSupervisor` (switch/stop); the radio-rules decisions themselves — arm, pop, whose turn it is — live in `player/state.rs`, not here (see decision 16). |
+| `src/queue.rs` | `queue` | One priority queue (DJ overlay > queue > Spotify baseline; `MediaSource::Spotify \| YouTube \| File`, all in true order — see decisions #15/#16). Tracks play strictly in queue order (radio rules); while Spotify holds the turn, the *first* Spotify track anywhere in the queue is armed into Spotify's own queue instead (see the `player/state.rs` row). Capped at `MAX_QUEUE_LEN = 500` (matches nob's unified-queue cap); `push()`/`push_front()` are fallible (`-> bool`), rejecting at capacity; `insert(idx, item)` clamps `idx` to `len` and backs `next:true` behind an armed head; `peek()`/`pop_if`/`remove_first` back the arm/pop-on-`Playing` logic. Each item carries a queue-stamped `item_id` (names one residency in the queue, not the track itself — a re-inserted popped item gets a fresh id). |
 | `src/youtube/*` | `youtube` | yt-dlp feeder + metadata. Cookies/age-gate contract: `--cookies` is passed only when the file exists on disk (both metadata and feeder paths); after metadata succeeds there is NO `age_limit` reject (reaching metadata means cookies already unlocked the video); the no-cookie age-gate failure is classified from stderr into an actionable `AgeRestricted` error pointing the admin at `YOUTUBE_COOKIES`. |
 | `src/config.rs` | nob-core config | Merge the Spotify/token keys into nob's config struct. Also capture the five module-local env reads that bypass `config.rs`: `YOUTUBE_COOKIES` (default `/var/lib/spotibot/youtube-cookies.txt`) and `YOUTUBE_TMP_DIR` (default `/tmp/spotibot-youtube`) in `youtube/mod.rs`, `DJ_CLIPS_DIR` / `DJ_CACHE_DIR` and `KOKORO_SOCKET` in `audio/dj.rs`. |
 | `src/setup.rs` | (drop) | The CLI wizard is a spotibot-local convenience; nob is VPS-deployed. |
 
 ## What NOT to port
 
-- **`bot.rs` as one file.** It is a ~2,500-line god-module because spotibot has
-  no crate boundaries. nob's panel/actions/commands split supersedes it:
-  the embed builders → `embeds`, the button/command dispatch → `commands` +
-  `actions`, the presence loop → `presence`, the priority-queue manager →
+- **`bot.rs` as one file.** It is a ~1,900-line god-module because spotibot
+  has no crate boundaries — even after `discord/ui.rs` and `player/` pulled
+  the card ownership and the decision logic back out of it. nob's
+  panel/actions/commands split supersedes it: `discord/ui.rs`'s embed
+  builders → `embeds`, the button/command dispatch → `commands` + `actions`,
+  the presence loop → `presence`, `player/state.rs` + `player/actor.rs` →
   `player`/`queue`. Rebuild against nob's seams, don't paste.
 - **The setup wizard** (`setup.rs`) — VPS deployment, not first-run CLI.
 - **The `.env` in-place rewriter** — nob configures from env/secrets.env.

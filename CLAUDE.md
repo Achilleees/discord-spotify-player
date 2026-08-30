@@ -22,7 +22,7 @@ target/release/discord-spotify-player.exe          # normal
 target/release/discord-spotify-player.exe --setup  # first-run wizard
 ```
 
-`cargo check` for fast feedback, `cargo test` (103 unit tests), `cargo clippy`.
+`cargo check` for fast feedback, `cargo test` (186 unit tests), `cargo clippy`.
 
 ### Prerequisites
 - MSVC toolchain (native deps: opus, cmake). `.cargo/config.toml` (tracked)
@@ -54,44 +54,69 @@ Spotify / YouTube / files / DJ ─> AudioBridge ─> SimpleBridgeReader ─> Son
 - **DiscordSink** (`src/spotify/sink.rs`): librespot backend; DSP + real-time
   pacing; pushes into the bridge. Hot path.
 - **AudioBridge** (`src/audio_bridge.rs`): `VecDeque<f32>` ring buffer, 44.1 kHz
-  stereo; drains/drops on even stereo frames.
+  stereo; drains/drops on even stereo frames. Only the turn holder may clear
+  it — the Spotify layer never does.
 - **SimpleBridgeReader** (`src/discord/voice.rs`): Songbird source; prebuffers
   per `PREBUFFER_SECONDS`.
-- Priority: DJ overlay > the one bot-owned queue (Spotify tracks, YT/SC,
-  files, in true order — radio rules, the bot never skips on its own) >
-  Spotify Connect baseline. While Spotify is playing, the bot arms the first
-  Spotify track anywhere in the queue into Spotify Connect's own queue
-  (`add_to_queue`), so librespot's own track-end advance lands on it; any
-  media items ahead of it in the bot's queue play first (Spotify sits paused
-  on the armed track), then Spotify resumes onto it. Idle Spotify gets a
-  direct `load` instead (`src/queue.rs` + the priority-queue manager in
-  `bot.rs`).
+- Priority: DJ overlay > the player's queue (Spotify tracks, YT/SC, files, in
+  true order — radio rules, the bot never skips on its own) > Spotify Connect
+  baseline. The player actor owns the "turn" — who is entitled to be audible
+  — and decides this ordering (`src/queue.rs`, `src/player/`).
+
+### Player actor (`src/player/state.rs`, `src/player/actor.rs`)
+- **One player actor owns all playback state**: the queue, the armed Spotify
+  track, and the turn. Every command (slash commands, buttons, the Spotify
+  session, timers) reaches it as an `Input` through a mailbox; the actor
+  awaits nothing, ever — every effect it produces is a synchronous send or a
+  `tokio::spawn` (media runners, voice joins, announcements, timers).
+- The decision logic is a **pure core**, `src/player/state.rs`:
+  `step(state, input, now) -> Vec<Effect>`. It imports no serenity, songbird
+  or librespot-connect types — only `std`, a plain `oneshot` handle,
+  `SpotifyUri` and `crate::queue` — so it's deterministic under test and is
+  the piece that ports to nob unchanged (74 of the crate's tests).
+- **Radio rules**: tracks play strictly in queue order regardless of source;
+  the bot never sends Spotify a `Next` on its own — only a human skip
+  (⏭/`/skip`) does. While Spotify holds (or is about to hold) the turn, the
+  actor arms the first Spotify track anywhere in the queue into Spotify's own
+  queue (`SpircCommand::AddToQueue`), so librespot's own track-end advance
+  lands on it; any queue items ahead of it play first, then Spotify resumes
+  onto the armed track.
+- `/np` and the queue listing read a `PlayerSnapshot` straight from the actor
+  (`PlayerHandle::query`) rather than a cached copy.
+
+### Spotify session (`src/spotify/session.rs`, `src/spotify/player.rs`)
+- `SessionSupervisor` owns the Spotify session's own lifecycle — the
+  librespot task, its proactive token refresher, and the session generation.
+  It's background: started by `/login`, boot auto-start, or on demand via
+  `ensure_session` when a Spotify link is queued with the link down.
+  **It imports neither songbird nor the queue**, so it is structurally
+  unable to reach playback; its only surface into the player is `Input`,
+  delivered through the same mailbox as every other source.
+- `run_with_token` (`src/spotify/player.rs`) drives the Spirc session
+  lifecycle and applies `SpircCommand` (`Play`/`Pause`/`Next`/`Previous`/
+  `AddToQueue`/`Load`/`Lookup`/`ActivateDevice`/`Transfer`) to the live Spirc
+  — no calls to api.spotify.com. `Lookup` resolves title/artist/album art for
+  a Spotify item at enqueue time (`Track::get`), so the queue never needs the
+  Web API either.
+- **Account** is a third, independent lifecycle: `/login` stores credentials,
+  marks the account active, and calls `SessionSupervisor::switch` — nothing
+  else. One active DJ at a time; takeover requires being in the bot's voice
+  channel.
+
+### UI (`src/discord/ui.rs`)
+- One task owns the single now-playing/controls card, keyed on one `card_id`.
+  Both the Spotify baseline and the queue post through its mailbox (`UiMsg`)
+  rather than touching the channel directly, so the two playback sources can
+  never race each other's post/delete.
 
 ### Startup (`src/main.rs`)
 1. Init logging from `RUST_LOG`.
 2. Load config (or run wizard); build the OAuth client.
 3. Open the SQLite credential store (`spotibot.db`).
 4. Create `AudioBridge`; start the Discord bot; wait for ready.
-5. `ready()` (first time only) cleans stale controls and auto-starts the stored
-   active user's session; `main` then parks. New sessions start via `/login`.
-
-### Sessions (`src/discord/bot.rs`, `src/spotify/player.rs`)
-- `spawn_session` joins voice, posts controls, starts the priority-queue
-  manager, spawns the librespot task (`run_with_token`) and a proactive
-  token-refresher (single owner of the refresh cycle). One active DJ; takeover
-  requires being in the bot's voice channel. Playback control (buttons,
-  `/skip`, `/play`/`/queue`) goes straight to the live Spirc via
-  `SpircCommand` (`Play`/`Pause`/`Next`/`Previous`/`AddToQueue`/`Load`/
-  `Lookup`) — no calls to api.spotify.com. `Lookup` resolves title/artist/
-  album art for a Spotify item at enqueue time (`Track::get`), so the queue
-  never needs the Web API either.
-- `Handler.armed_spotify` tracks which Spotify track (if any) is currently
-  armed in Spotify's own queue; `head_action` (pure fn, unit-tested per table
-  row) decides what a trigger (enqueue, track end, skip, ...) does to the
-  queue head, and `try_arm_first_spotify` is the single critical section
-  that arms it and sets `armed_spotify` — called from `reconcile` and from
-  the presence loop on every Spotify `Playing` event. `armed_spotify` is
-  cleared on `Idle`, `spawn_session`, `/logout`, `/forget`, and `/stop`.
+5. `ready()` (first time only) spawns the UI task (which sweeps stale
+   messages and posts the idle card) and auto-starts the stored active user's
+   session; `main` then parks. New sessions start via `/login`.
 
 ### OAuth + storage
 - `src/oauth/mod.rs`: device authorization grant (RFC 8628) on Spotify's
@@ -100,12 +125,10 @@ Spotify / YouTube / files / DJ ─> AudioBridge ─> SimpleBridgeReader ─> Son
   `auth_blob` (XChaCha20-Poly1305).
 
 ### Presence (`src/presence.rs`, `src/discord/presence.rs`)
-- `PlayerEvent::TrackChanged` (librespot) supplies title/artist/track_id/album
-  art directly — no Web API fetch. Player events → `PresenceUpdate`
-  (`Idle` | `Paused { title, artist, track_id }` |
-  `Playing { title, artist, track_id, album_art_url }`) →
-  `run_presence_loop_with_track` → bot status + now-playing embeds. `/np`
-  reports "⏸ Paused" or "🎵 Now playing" from the same state.
+- `PresenceUpdate` (`Idle` | `Paused` | `Playing { title, artist }`) is
+  produced by the player actor (`Effect::Presence`, fed by librespot's
+  `PlayerEvent::TrackChanged` — no Web API fetch) and rendered by
+  `run_presence_loop` as the bot's Discord status line.
 
 ## Key crate versions
 - serenity 0.12, songbird 0.6 (native DAVE — not the git fork).

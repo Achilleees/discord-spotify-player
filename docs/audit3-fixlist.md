@@ -1,4 +1,5 @@
 # Audit #3 fix-list (2026-07-16)
+> Historical record from the v0.5 audit cycle, kept for provenance. The architecture it describes was superseded by the player-core refactor — see PORT.md.
 
 Confirmed findings from workspace audit #3, run against main @ a57f95d
 (v0.5.0-rc2): 12 lenses, every finding independently verified twice, code-blind

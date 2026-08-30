@@ -1,4 +1,5 @@
 # Spotibot -- full workspace audit #3
+> Historical record from the v0.5 audit cycle, kept for provenance. The architecture it describes was superseded by the player-core refactor — see PORT.md.
 
 **2026-07-16 | main @ a57f95d (v0.5.0-rc2) | working tree clean, main == origin/main**
 

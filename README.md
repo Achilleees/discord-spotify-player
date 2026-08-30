@@ -25,8 +25,8 @@ playback is controlled from Spotify clients or from buttons in Discord.
   follows the user into their channel.
 - A now-playing text channel: rich embeds with album art, plus prev/pause/next
   buttons and a queue view.
-- `/play`, `/queue` (Spotify, YouTube/SoundCloud/file — one shared, ordered
-  queue), `/skip`, `/stop`, `/np`.
+- `/play`, `/queue` (Spotify, YouTube/SoundCloud/file — one shared queue,
+  played in strict order like a radio), `/skip`, `/stop`, `/np`.
 - Optional DJ track announcements via a Kokoro TTS backend, toggled with
   `/announce` (persists across restarts).
 - Auto-starts the last active user's session on boot; auto-leaves and
@@ -72,8 +72,8 @@ regardless of source — like a radio. The bot never skips a track on its own;
   resumes after the queue — Spotify never plays over the queue.
 - **Spotify idle, Spotify track at the head:** the track is loaded directly
   with `load` (there's no context to preserve).
-- **Spotify paused, Spotify track at the head:** the track is queued behind
-  the current one and playback resumed — nothing is skipped.
+- **Spotify paused, Spotify track at the head:** the track is armed the same
+  way, but queuing never resumes playback for you — press ▶ or ⏭ to hear it.
 - **⏭ with a media track next:** the current Spotify track is also advanced
   (skipped), the media track plays, then Spotify resumes.
 - A failed download removes its card and reposts the controls; the queue
@@ -126,6 +126,6 @@ pipeline stats emit at `debug` on the `audio_stream` target every 5s.
 
 ## Development
 
-`cargo check` for fast feedback, `cargo test` (103 unit tests), `cargo clippy`.
+`cargo check` for fast feedback, `cargo test` (186 unit tests), `cargo clippy`.
 `.cargo/config.toml` carries a cmake fix required by native deps; the MSVC
 toolchain is required on Windows.

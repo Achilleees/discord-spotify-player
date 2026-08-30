@@ -1,4 +1,5 @@
 # Audit #2 — follow-up (deferred findings)
+> Historical record from the v0.5 audit cycle, kept for provenance. The architecture it describes was superseded by the player-core refactor — see PORT.md.
 
 Audit #2 (2026-07-10, 8 lenses, double-verified) on the v0.5-hardening tree
 returned **128 confirmed findings** (4 critical, 19 high, 46 medium, 59 low).
