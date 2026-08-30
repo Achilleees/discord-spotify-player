@@ -34,3 +34,4 @@ spotibot.db*
 # OS
 .DS_Store
 Thumbs.db
+target-alt/

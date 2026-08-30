@@ -184,6 +184,19 @@ enum Trigger {
     PlayButton,
 }
 
+/// How a queue drain ended; decides whether the `MediaEnd` step still runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DrainOutcome {
+    /// Every popped item was a media item and the last one finished (or
+    /// failed); Spotify was resumed if it had been playing.
+    Finished,
+    /// Skip/stop cancelled the active item; the canceller owns what's next.
+    Cancelled,
+    /// A Spotify item reached the head and was handed to Spotify; its
+    /// `Playing` event arms the next head.
+    HandedToSpotify,
+}
+
 /// What `Handler::reconcile` should do about the current queue head.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum HeadAction {
@@ -988,7 +1001,12 @@ async fn clear_now_playing_card(d: &QueueDrainCtx) {
 /// failed items (failures get a user-facing error message instead); Spotify
 /// resumes only after a natural drain; a cancelled drain resumes nothing —
 /// skip/stop owns what plays next.
-async fn run_queue_drain(d: &QueueDrainCtx) {
+///
+/// Returns how the drain ended so the owner knows whether the `MediaEnd`
+/// step still applies: only a natural finish needs it — a handed-off
+/// Spotify item is already on its way (its `Playing` event arms the next
+/// head), and a cancelled drain is owned by skip/stop.
+async fn run_queue_drain(d: &QueueDrainCtx) -> DrainOutcome {
     // Only resume Spotify at the end of a natural drain if it was actually
     // playing when the drain started — an idle/paused baseline should stay
     // that way, not spring back to life because a queued item finished.
@@ -1131,8 +1149,11 @@ async fn run_queue_drain(d: &QueueDrainCtx) {
         }
     }
 
-    if cancelled || handed_to_spotify {
-        return;
+    if cancelled {
+        return DrainOutcome::Cancelled;
+    }
+    if handed_to_spotify {
+        return DrainOutcome::HandedToSpotify;
     }
 
     // Natural drain end: hand playback back to Spotify, but only if it was
@@ -1148,6 +1169,7 @@ async fn run_queue_drain(d: &QueueDrainCtx) {
     if !resumed {
         clear_now_playing_card(d).await;
     }
+    DrainOutcome::Finished
 }
 
 // Wide orchestration fn wiring together the queue, bridge, and UI state.
@@ -1217,14 +1239,15 @@ async fn priority_queue_manager(
                     continue;
                 }
                 let _drain_guard = DrainGuard(drain_active.clone());
-                run_queue_drain(&drain_ctx).await;
-                after_media_end(
-                    &drain_ctx.priority_queue,
-                    &armed_spotify,
-                    Some(&spirc_cmd_tx_direct),
-                    &drain_ctx.spotify_state,
-                    &drain_ctx.resume_spotify_after_drain,
-                );
+                if run_queue_drain(&drain_ctx).await == DrainOutcome::Finished {
+                    after_media_end(
+                        &drain_ctx.priority_queue,
+                        &armed_spotify,
+                        Some(&spirc_cmd_tx_direct),
+                        &drain_ctx.spotify_state,
+                        &drain_ctx.resume_spotify_after_drain,
+                    );
+                }
             }
             HeadAction::Handoff => {
                 handoff_head(&drain_ctx.priority_queue, &armed_spotify, Some(&spirc_cmd_tx_direct), spotify, media_active);
@@ -2753,17 +2776,19 @@ impl Handler {
         tokio::spawn(async move {
             // Clears drain_active on any exit (normal, cancel, or abort).
             let _drain_guard = drain_guard;
-            run_queue_drain(&drain_ctx).await;
-            // MediaEnd: decide what (if anything) happens to whatever is now
-            // at the queue head — arms/hands off a revealed Spotify head.
-            let tx = { spirc_cmd_tx_for_end.lock().clone() };
-            after_media_end(
-                &priority_queue_for_end,
-                &armed_for_end,
-                tx.as_ref(),
-                &spotify_state_for_end,
-                &resume_flag_for_end,
-            );
+            if run_queue_drain(&drain_ctx).await == DrainOutcome::Finished {
+                // MediaEnd: decide what (if anything) happens to whatever is
+                // now at the queue head — arms/hands off a revealed Spotify
+                // head. Skipped when the drain itself already handed one off.
+                let tx = { spirc_cmd_tx_for_end.lock().clone() };
+                after_media_end(
+                    &priority_queue_for_end,
+                    &armed_for_end,
+                    tx.as_ref(),
+                    &spotify_state_for_end,
+                    &resume_flag_for_end,
+                );
+            }
         });
         Ok(true)
     }
