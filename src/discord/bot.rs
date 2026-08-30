@@ -539,7 +539,6 @@ impl DiscordBot {
 
         let player = player_actor::spawn(PlayerDeps {
             bridge: bridge.clone(),
-            config: config.clone(),
             ui_send,
             notice_tx,
             presence_tx,

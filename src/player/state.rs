@@ -50,7 +50,7 @@ pub struct TrackMeta {
 pub enum Active {
     None,
     /// A queue (YouTube/file) item is playing through a media runner.
-    Media { item_id: u64, item: QueueItem, paused: bool, epoch: u64 },
+    Media { item: QueueItem, paused: bool, epoch: u64 },
     /// We asked Spotify to start this exact uri (`Load`/`Next`) and are
     /// awaiting its `Playing`; `Tick(SpotifyPending)` is the escape hatch.
     SpotifyPending { uri: SpotifyUri, sent: Instant, retried: bool },
@@ -316,7 +316,13 @@ pub enum Input {
     TogglePause { reply: oneshot::Sender<String> },
     Previous { reply: oneshot::Sender<String> },
     /// A media runner's terminal report, epoch-tagged against stale runners.
-    MediaEnded { epoch: u64, outcome: MediaOutcome },
+    MediaEnded {
+        epoch: u64,
+        /// Informational for the core (the actor logs/announces it); kept on
+        /// the input so the report is one message.
+        #[allow(dead_code)]
+        outcome: MediaOutcome,
+    },
     Transport { gen: u64, ev: TransportEvent },
     LinkUp { gen: u64 },
     LinkDown { gen: u64 },
@@ -406,7 +412,6 @@ pub enum Effect {
     CancelMedia,
     ClearBridge,
     JoinVoice,
-    LeaveVoice,
     TrackHandle(TrackHandleCmd),
     Ui(UiMsg),
     Presence(PresenceState),
@@ -735,8 +740,9 @@ pub fn step(state: &mut PlayerState, input: Input, now: Instant) -> Vec<Effect> 
 
         Input::MediaEnded { epoch, outcome: _ } => {
             // A stale runner (superseded epoch) or an already-resolved turn
-            // has nothing to say.
-            if epoch != state.media_epoch || !matches!(state.active, Active::Media { .. }) {
+            // has nothing to say. The outcome itself is informational here —
+            // the actor logs and announces it; the boundary logic is the same.
+            if !matches!(state.active, Active::Media { epoch: e, .. } if e == epoch) {
                 return fx;
             }
             after_media_boundary(state, now, &mut fx);
@@ -1328,12 +1334,7 @@ fn start_media(state: &mut PlayerState, item: QueueItem, gate: StartGate, fx: &m
     }
     fx.push(Effect::StartMedia { item: item.clone(), epoch: state.media_epoch, gate });
     fx.push(Effect::Ui(UiMsg::NowPlayingMedia { item: item.clone() }));
-    state.active = Active::Media {
-        item_id: item.item_id,
-        item,
-        paused: false,
-        epoch: state.media_epoch,
-    };
+    state.active = Active::Media { item, paused: false, epoch: state.media_epoch };
 }
 
 /// What sits at the head of the queue, with a Spotify head's uri cloned out
@@ -1492,7 +1493,7 @@ mod tests {
             let item = sim.s.queue.pop().unwrap();
             sim.s.media_epoch = 1;
             sim.s.active =
-                Active::Media { item_id: item.item_id, item, paused: false, epoch: 1 };
+                Active::Media { item, paused: false, epoch: 1 };
             sim
         }
 
@@ -2610,7 +2611,7 @@ mod tests {
     fn query_reports_a_paused_media_track() {
         let mut sim = Sim::new();
         let item = media_item("paused-item");
-        sim.s.active = Active::Media { item_id: item.item_id, item, paused: true, epoch: 0 };
+        sim.s.active = Active::Media { item, paused: true, epoch: 0 };
         let (tx, _rx) = oneshot::channel();
         let fx = sim.step(Input::Query { reply: tx });
         let snap = reply_snapshot(&fx);

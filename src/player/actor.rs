@@ -42,7 +42,6 @@ use tokio_util::sync::CancellationToken;
 
 use crate::audio::dj::DJAnnouncer;
 use crate::audio_bridge::AudioBridge;
-use crate::config::Config;
 use crate::player::state::{
     step, Active, AnnounceKind, Effect, EnqueuePos, Input, MediaOutcome, NowPlaying,
     PlayerSnapshot, PlayerState, PresenceState, SpDevice, SpircCmd, StartGate, TrackHandleCmd,
@@ -96,9 +95,6 @@ pub type JoinVoiceFn =
 /// `/announce`; the rest is the actor's own equipment.
 pub struct PlayerDeps {
     pub bridge: Arc<AudioBridge>,
-    /// Reserved for takeover prompts that name the Connect device; unused
-    /// until the prompt copy grows the name.
-    pub config: Arc<Config>,
     pub ui_send: UiSendFn,
     /// Plain text-channel notices (failure messages, takeover prompts); a
     /// bot-layer task does the actual Discord send.
@@ -447,11 +443,6 @@ impl Actor {
                 });
             }
 
-            Effect::LeaveVoice => {
-                // No producer yet: teardown still leaves voice from the
-                // Handler; wired when the core owns voice release.
-                tracing::debug!("LeaveVoice effect dropped (not wired)");
-            }
 
             Effect::TrackHandle(cmd) => {
                 let paused = matches!(cmd, TrackHandleCmd::Pause);
