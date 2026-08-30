@@ -376,10 +376,11 @@ pub fn step(state: &mut PlayerState, input: Input, now: Instant) -> Vec<Effect> 
                 reply(
                     &mut fx,
                     tx,
-                    format!("The queue is full ({} items) — try again later.", crate::queue::MAX_QUEUE_LEN),
+                    format!("⚠️ Queue is full ({} items) — try again once some have played.", crate::queue::MAX_QUEUE_LEN),
                 );
                 return fx;
             }
+            let queue_len_after_push = state.queue.len();
             let mut started_title: Option<String> = None;
             if start_if_idle && matches!(state.active, Active::None) {
                 match head_of(&state.queue) {
@@ -424,9 +425,14 @@ pub fn step(state: &mut PlayerState, input: Input, now: Instant) -> Vec<Effect> 
             }
             maybe_arm(state, now, &mut fx);
             let text = match started_title {
-                Some(t) if t == queued_title => format!("▶ Starting: {t}"),
-                Some(t) => format!("➕ Queued: {queued_title} — starting {t} first."),
-                None => format!("➕ Queued: {queued_title}"),
+                Some(t) if t == queued_title => "▶ Playing now".to_string(),
+                Some(t) => format!("➕ Queued. **{t}** is starting first."),
+                None if matches!(pos, EnqueuePos::Head) => "➕ Playing next".to_string(),
+                None if !matches!(state.active, Active::None) => {
+                    format!("➕ Added to queue #{queue_len_after_push}")
+                }
+                None => "➕ Queued. Nothing is playing right now — press ▶ or use `/play` to start."
+                    .to_string(),
             };
             reply(&mut fx, tx, text);
         }
@@ -478,13 +484,13 @@ pub fn step(state: &mut PlayerState, input: Input, now: Instant) -> Vec<Effect> 
                         reply(
                             &mut fx,
                             tx,
-                            "Spotify is in use on another device — press ▶ to take over.",
+                            "⚠️ Spotify is in use on another device — press ▶ to take over.",
                         );
                         return fx;
                     }
                     if matches!(state.sp, SpDevice::Idle) {
                         begin_load(state, uri, now, &mut fx);
-                        reply(&mut fx, tx, "⏭ Starting the next track.");
+                        reply(&mut fx, tx, "⏭ Skipped.");
                         return fx;
                     }
                     let was_playing = matches!(state.sp, SpDevice::Playing(_));
@@ -525,7 +531,7 @@ pub fn step(state: &mut PlayerState, input: Input, now: Instant) -> Vec<Effect> 
                         state.pause_owner = None;
                         reply(&mut fx, tx, "⏭ Skipped.");
                     } else {
-                        reply(&mut fx, tx, "Nothing to skip.");
+                        reply(&mut fx, tx, "Nothing is playing right now.");
                     }
                 }
             }
@@ -561,10 +567,9 @@ pub fn step(state: &mut PlayerState, input: Input, now: Instant) -> Vec<Effect> 
             let text = if orphaned {
                 // Librespot has no dequeue, so an armed track can't be
                 // un-armed — it may still air once when the baseline plays.
-                "⏹ Stopped and cleared the queue. One track was already handed to Spotify \
-                 and may still play once — Spotify has no un-queue."
+                "⏹ Stopped. Queue cleared. (a track already handed to Spotify will still play once)"
             } else {
-                "⏹ Stopped and cleared the queue."
+                "⏹ Stopped. Queue cleared."
             };
             reply(&mut fx, tx, text);
         }
@@ -578,14 +583,14 @@ pub fn step(state: &mut PlayerState, input: Input, now: Instant) -> Vec<Effect> 
                 } else {
                     TrackHandleCmd::Resume
                 }));
-                reply(&mut fx, tx, if now_paused { "⏸ Paused." } else { "▶ Resumed." });
+                reply(&mut fx, tx, if now_paused { "⏸ Paused" } else { "▶ Resumed" });
                 return fx;
             }
             if matches!(state.sp, SpDevice::Playing(_)) {
                 fx.push(Effect::Spirc(SpircCmd::Pause));
                 state.inflight.record_pause(now);
                 state.pause_owner = Some(PauseOwner::Human);
-                reply(&mut fx, tx, "⏸ Paused.");
+                reply(&mut fx, tx, "⏸ Paused");
                 return fx;
             }
             // The ▶ half: nothing is audible.
@@ -599,7 +604,7 @@ pub fn step(state: &mut PlayerState, input: Input, now: Instant) -> Vec<Effect> 
                     let item = state.queue.pop().expect("head checked as media");
                     let title = item.source.display_title().to_string();
                     start_media(state, item, StartGate::Immediate, &mut fx);
-                    reply(&mut fx, tx, format!("▶ Taking over the Spotify device — starting {title}."));
+                    reply(&mut fx, tx, format!("▶ Taking over the Spotify device — starting **{title}**."));
                 } else {
                     reply(&mut fx, tx, "▶ Taking over the Spotify device.");
                 }
@@ -617,19 +622,18 @@ pub fn step(state: &mut PlayerState, input: Input, now: Instant) -> Vec<Effect> 
                         state.pause_owner = Some(PauseOwner::BotForMedia);
                     }
                     let item = state.queue.pop().expect("head checked as media");
-                    let title = item.source.display_title().to_string();
                     let gate = if advancing {
                         StartGate::AfterSpotifyPauseAck
                     } else {
                         StartGate::Immediate
                     };
                     start_media(state, item, gate, &mut fx);
-                    reply(&mut fx, tx, format!("▶ Starting: {title}"));
+                    reply(&mut fx, tx, "▶ Playing now");
                 }
                 Head::Spotify(uri) => {
                     if matches!(state.sp, SpDevice::Idle) {
                         begin_load(state, uri, now, &mut fx);
-                        reply(&mut fx, tx, "▶ Starting the Spotify track.");
+                        reply(&mut fx, tx, "▶ Playing now");
                     } else {
                         // Never Load over a paused baseline — arm the head
                         // and resume; auto-advance airs it at the boundary.
@@ -637,7 +641,7 @@ pub fn step(state: &mut PlayerState, input: Input, now: Instant) -> Vec<Effect> 
                         fx.push(Effect::Spirc(SpircCmd::Play));
                         state.pause_owner = None;
                         state.active = Active::Spotify { track: None };
-                        reply(&mut fx, tx, "▶ Resumed.");
+                        reply(&mut fx, tx, "▶ Resumed");
                     }
                 }
                 Head::Empty => {
@@ -645,9 +649,9 @@ pub fn step(state: &mut PlayerState, input: Input, now: Instant) -> Vec<Effect> 
                         fx.push(Effect::Spirc(SpircCmd::Play));
                         state.pause_owner = None;
                         state.active = Active::Spotify { track: None };
-                        reply(&mut fx, tx, "▶ Resumed.");
+                        reply(&mut fx, tx, "▶ Resumed");
                     } else {
-                        reply(&mut fx, tx, "Nothing to play.");
+                        reply(&mut fx, tx, "Nothing is playing right now.");
                     }
                 }
             }
@@ -655,7 +659,7 @@ pub fn step(state: &mut PlayerState, input: Input, now: Instant) -> Vec<Effect> 
 
         Input::Previous { reply: tx } => {
             if matches!(state.active, Active::Media { .. }) {
-                reply(&mut fx, tx, "⏮ works on the Spotify baseline — a queued item is playing.");
+                reply(&mut fx, tx, "❌ Previous isn't available during queue playback.");
             } else if state.device_active
                 && matches!(
                     state.sp,
@@ -665,7 +669,7 @@ pub fn step(state: &mut PlayerState, input: Input, now: Instant) -> Vec<Effect> 
                 fx.push(Effect::Spirc(SpircCmd::Previous));
                 reply(&mut fx, tx, "⏮ Previous track.");
             } else {
-                reply(&mut fx, tx, "Nothing to go back to.");
+                reply(&mut fx, tx, "Nothing is playing right now.");
             }
         }
 
@@ -782,21 +786,21 @@ pub fn step(state: &mut PlayerState, input: Input, now: Instant) -> Vec<Effect> 
         Input::Query { reply: tx } => {
             let mut text = match &state.active {
                 Active::Media { item, paused, .. } => format!(
-                    "{} {} — {} (queued by {})",
+                    "{} **{}** — {} (queued by **{}**)",
                     if *paused { "⏸" } else { "▶" },
                     item.source.display_title(),
                     item.source.display_subtitle(),
                     item.queued_by
                 ),
                 Active::Spotify { track: Some(m) } => format!(
-                    "{} {} — {} (Spotify)",
+                    "{} **{}** — {} (Spotify)",
                     if matches!(state.sp, SpDevice::Paused(_)) { "⏸" } else { "▶" },
                     m.title,
                     m.artist
                 ),
                 Active::Spotify { track: None } => "▶ Spotify".to_string(),
-                Active::SpotifyPending { .. } => "⏳ Starting a Spotify track…".to_string(),
-                Active::None => "Nothing is playing.".to_string(),
+                Active::SpotifyPending { .. } => "▶ Starting a Spotify track…".to_string(),
+                Active::None => "Nothing is playing right now.".to_string(),
             };
             if !state.queue.is_empty() {
                 text.push_str(&format!("\nQueue: {} item(s)", state.queue.len()));
@@ -1236,6 +1240,20 @@ fn current_meta(active: &Active) -> Option<TrackMeta> {
     }
 }
 
+/// House style for every string `step` hands back to a human — the sole
+/// place the actor's voice lives, since the actor never formats a reply
+/// itself. A prefix glyph carries exactly one meaning and nothing else
+/// ever leads a reply: `✅` a thing was done, `➕` added to the queue,
+/// `▶`/`⏸`/`⏭`/`⏮`/`⏹` a transport action, `⚠️` (always with the variation
+/// selector, never bare `⚠`) something didn't work, `❌` the request was
+/// invalid or refused — nothing else prefixes a reply. Commands are
+/// backticked (`/login`, `/play`); track and user names are **bold**.
+/// Every state gets exactly one phrasing: a missing session always reads
+/// ``No Spotify session — run `/login` to connect.``, nothing audible
+/// always reads `Nothing is playing right now.` — and every failure names
+/// the next action instead of just stating that it failed. Nothing here
+/// ever echoes a raw yt-dlp/reqwest/parser error; swap in a fixed
+/// sentence and let the caller's `tracing::warn!` keep the detail.
 fn reply(fx: &mut Vec<Effect>, tx: oneshot::Sender<String>, text: impl Into<String>) {
     fx.push(Effect::Reply(tx, text.into()));
 }
@@ -1512,6 +1530,10 @@ mod tests {
         let fx = sim.enqueue(spotify_item(1, "s1"));
         assert!(spircs(&fx).is_empty());
         assert!(sim.s.armed.is_none());
+        assert_eq!(
+            reply_text(&fx),
+            "➕ Queued. Nothing is playing right now — press ▶ or use `/play` to start."
+        );
     }
 
     #[test]
@@ -1523,6 +1545,35 @@ mod tests {
         let mut sim = Sim::baseline_paused(Some(PauseOwner::Human));
         let fx = sim.enqueue(spotify_item(1, "s1"));
         assert_eq!(spircs(&fx), vec![SpircCmd::AddToQueue(uri(1))]);
+    }
+
+    #[test]
+    fn enqueue_next_while_playing_reports_playing_next() {
+        // `next: true` from `/play` maps to `EnqueuePos::Head`; something
+        // already holds the turn, so the item queues at the front without
+        // starting.
+        let mut sim = Sim::baseline_playing();
+        let (tx, _rx) = oneshot::channel();
+        let fx = sim.step(Input::Enqueue {
+            item: spotify_item(1, "s1"),
+            pos: EnqueuePos::Head,
+            start_if_idle: true,
+            reply: tx,
+        });
+        assert_eq!(reply_text(&fx), "➕ Playing next");
+    }
+
+    #[test]
+    fn enqueue_start_when_an_earlier_queued_item_wins_the_head() {
+        // A `/queue`'d item sits unstarted while idle (queuing never
+        // starts); a later `/play` finds it still at the head and starts
+        // that instead — the new item queues in behind it.
+        let mut sim = Sim::idle_device();
+        sim.enqueue(media_item("a"));
+        let fx = sim.enqueue_start(media_item("b"));
+        assert_eq!(reply_text(&fx), "➕ Queued. **a** is starting first.");
+        assert!(matches!(sim.s.active, Active::Media { .. }));
+        assert_eq!(sim.s.queue.len(), 1, "b is still waiting");
     }
 
     // --- EndOfTrack boundaries (old track_end_* rows) ---------------------
@@ -1887,7 +1938,10 @@ mod tests {
         let fx = sim.stop();
         assert!(sim.s.queue.is_empty());
         assert!(sim.s.armed.is_none());
-        assert!(reply_text(&fx).contains("may still play once"));
+        assert_eq!(
+            reply_text(&fx),
+            "⏹ Stopped. Queue cleared. (a track already handed to Spotify will still play once)"
+        );
         assert_eq!(spircs(&fx), vec![SpircCmd::Pause]);
         assert_eq!(sim.s.pause_owner, Some(PauseOwner::BotForStop));
     }
@@ -2109,7 +2163,7 @@ mod tests {
         let mut sim = Sim::media_over_paused_baseline();
         let fx = sim.previous();
         assert!(spircs(&fx).is_empty());
-        assert!(reply_text(&fx).contains("queued item"));
+        assert_eq!(reply_text(&fx), "❌ Previous isn't available during queue playback.");
     }
 
     #[test]
@@ -2176,7 +2230,7 @@ mod tests {
         assert!(has_start_media(&fx));
         assert_eq!(start_gate(&fx), Some(StartGate::Immediate));
         assert!(matches!(sim.s.active, Active::Media { .. }));
-        assert!(reply_text(&fx).starts_with("▶ Starting"));
+        assert_eq!(reply_text(&fx), "▶ Playing now");
     }
 
     #[test]
@@ -2186,6 +2240,7 @@ mod tests {
         let mut sim = Sim::baseline_playing();
         let fx = sim.enqueue_start(media_item("m"));
         assert!(!has_start_media(&fx));
+        assert_eq!(reply_text(&fx), "➕ Added to queue #1");
         assert!(without_reply(fx).iter().all(|e| !matches!(e, Effect::Spirc(_))));
         assert_eq!(sim.s.queue.len(), 1);
     }
@@ -2231,5 +2286,46 @@ mod tests {
         let fx = sim.transport(TransportEvent::Playing { uri: uri(9), meta: Some(meta("t")) });
         assert!(!has_spotify_card(&fx));
         assert!(has_presence(&fx));
+    }
+
+    // --- now playing (/np) -------------------------------------------------
+
+    #[test]
+    fn query_reports_nothing_playing_right_now() {
+        let mut sim = Sim::new();
+        let (tx, _rx) = oneshot::channel();
+        let fx = sim.step(Input::Query { reply: tx });
+        assert_eq!(reply_text(&fx), "Nothing is playing right now.");
+    }
+
+    #[test]
+    fn query_bolds_the_media_track_and_queued_by() {
+        let mut sim = Sim::media_over_paused_baseline();
+        let (tx, _rx) = oneshot::channel();
+        let fx = sim.step(Input::Query { reply: tx });
+        assert_eq!(reply_text(&fx), "▶ **active-item** — c (queued by **dj**)");
+    }
+
+    #[test]
+    fn query_bolds_the_spotify_track() {
+        let mut sim = Sim::baseline_playing();
+        sim.s.active = Active::Spotify { track: Some(meta("t")) };
+        let (tx, _rx) = oneshot::channel();
+        let fx = sim.step(Input::Query { reply: tx });
+        assert_eq!(reply_text(&fx), "▶ **t** — artist (Spotify)");
+    }
+
+    #[test]
+    fn query_spotify_pending_uses_an_allowed_glyph() {
+        let mut sim = Sim::idle_device();
+        sim.push_spotify(1, "s1");
+        sim.toggle(); // begin_load -> SpotifyPending
+        // `begin_load` does not pop the queue (that happens once a real
+        // `Playing` confirms it); clear it so the reply here isolates the
+        // pending-state text from the unrelated queue-count suffix.
+        sim.s.queue.clear();
+        let (tx, _rx) = oneshot::channel();
+        let fx = sim.step(Input::Query { reply: tx });
+        assert_eq!(reply_text(&fx), "▶ Starting a Spotify track…");
     }
 }

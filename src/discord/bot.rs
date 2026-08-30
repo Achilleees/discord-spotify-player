@@ -10,8 +10,8 @@ use crate::player::actor::{self as player_actor, PlayerDeps, PlayerHandle, UiEve
 use crate::player::state::{EnqueuePos, Input as PlayerInput, TrackMeta, TransportEvent};
 use crate::presence::PresenceUpdate;
 use crate::queue::{PriorityQueue, QueueItem, MediaSource};
-use crate::spotify::SpotifyPlayer;
 use crate::spotify::SpircCommand;
+use crate::spotify::SessionSupervisor;
 use librespot_core::SpotifyUri;
 use crate::youtube::metadata::{fetch_youtube_metadata, validate_attachment};
 use crate::users::{UserCredentials, UserStore};
@@ -40,23 +40,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 use tokio::sync::mpsc;
+use tokio::sync::watch;
 use tokio::sync::Notify;
-use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 type ReadySignal = Result<(), String>;
 
-/// Refresh the access token this many seconds before it expires.
-const TOKEN_REFRESH_MARGIN_SECS: u64 = 300;
-/// Floor on the proactive-refresh wait, so a short-lived token can't spin.
-const TOKEN_REFRESH_MIN_WAIT_SECS: u64 = 30;
-/// Backoff after a failed proactive refresh before retrying.
-const TOKEN_REFRESH_RETRY_SECS: u64 = 30;
-/// Give up the librespot reconnect loop after this many consecutive returns
-/// without a healthy session, so a permanently-down Spotify can't hot-loop.
-const MAX_SESSION_RESTARTS: u32 = 10;
-/// Fallback token lifetime when the real `expires_in` is unknown.
-const DEFAULT_TOKEN_LIFETIME_SECS: u64 = 3600;
 /// How long to poll Spotify for a device-code pairing before giving up.
 const DEVICE_LOGIN_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(600);
 
@@ -69,25 +58,14 @@ pub(crate) struct SpotifyTrackInfo {
     pub(crate) album_art_url: Option<String>,
 }
 
+/// Display-only cache of who the live Spotify session belongs to, for `/who`
+/// and the takeover gate. The `SessionSupervisor` owns the actual session
+/// lifecycle (the librespot task, its refresher, the generation) — this is
+/// just the name and id the callers of `switch_active_session` /
+/// `supervisor.stop` populate and clear alongside it.
 pub struct ActiveSession {
     pub discord_user_id: u64,
-    pub spotify_name: String,
     pub discord_name: String,
-    pub access_token: String,
-    /// Monotonic id of this spawn, so a task only clears the slot it owns.
-    pub generation: u64,
-    /// The librespot session task.
-    pub handle: JoinHandle<()>,
-    /// The proactive token-refresh task that keeps `access_token` current.
-    pub refresh_handle: JoinHandle<()>,
-}
-
-impl ActiveSession {
-    /// Abort both the librespot session and its refresher.
-    fn abort(&self) {
-        self.handle.abort();
-        self.refresh_handle.abort();
-    }
 }
 
 struct Handler {
@@ -108,10 +86,11 @@ struct Handler {
     /// the user re-runs `/login`.
     pending_auth: Arc<Mutex<HashMap<u64, Arc<tokio::sync::Notify>>>>,
     active_session: Arc<Mutex<Option<ActiveSession>>>,
-    /// Serializes spawn_session so two concurrent logins can't orphan a task.
-    spawn_lock: Arc<tokio::sync::Mutex<()>>,
-    /// Monotonic session-generation counter.
-    session_gen: Arc<std::sync::atomic::AtomicU64>,
+    /// Owns the Spotify session lifecycle (librespot task, refresher, token
+    /// state, generation) independently of playback — see
+    /// `spotify::session`. `switch_active_session`/`handle_logout`/
+    /// `teardown_playback_session` are its only callers.
+    supervisor: SessionSupervisor,
     track_handle: Arc<Mutex<Option<TrackHandle>>>,
     ctx: Arc<Mutex<Option<Context>>>,
     /// The UI task's mailbox. `None` until `ready()`'s first pass spawns
@@ -731,23 +710,30 @@ fn derive_presence(
     }
 }
 
-/// C3 transport shim: one event stream out of the librespot session, two
+/// Transport shim: one long-lived event stream out of every generation of
+/// librespot session (the sender lives in the `SessionSupervisor`, spawned
+/// once at startup — lifecycle (A), not per-login), fanned out to two
 /// consumers — the legacy presence loop (via the derived `PresenceUpdate`)
-/// and the player actor (via `Input::Transport`). The generation is fixed
-/// at 0 until the session supervisor (C4) stamps real link generations;
-/// the actor's `link_gen` also starts at 0, so every event is current.
-/// Exits when the session task (the only sender) dies.
+/// and the player actor (via `Input::Transport`). Because the channel now
+/// outlives any one session, the generation to stamp on each event is read
+/// fresh off `link_up` (written by each session's own task without taking
+/// the supervisor's lock — see `spotify::session`) rather than fixed at
+/// spawn time; `unwrap_or(0)` only matters for a stray event racing a
+/// link-down-to-link-up transition; the actor's own `link_gen` check is
+/// still what makes a mistagged straggler harmless.
 async fn transport_shim(
     mut rx: mpsc::UnboundedReceiver<TransportEvent>,
     presence_tx: mpsc::UnboundedSender<PresenceUpdate>,
     player: PlayerHandle,
+    link_up: watch::Receiver<Option<u64>>,
 ) {
     let mut last_meta: Option<(String, TrackMeta)> = None;
     while let Some(ev) = rx.recv().await {
         if let Some(update) = derive_presence(&ev, &mut last_meta) {
             let _ = presence_tx.send(update);
         }
-        player.send(PlayerInput::Transport { gen: 0, ev });
+        let gen = link_up.borrow().unwrap_or(0);
+        player.send(PlayerInput::Transport { gen, ev });
     }
 }
 
@@ -1558,12 +1544,12 @@ impl Handler {
     async fn teardown_playback_session(&self, ctx: &Context, leave_voice: bool) {
         let owner = {
             let mut lock = self.active_session.lock();
-            lock.take().map(|session| {
-                session.abort();
-                tracing::info!(user = session.discord_user_id, "aborted session (teardown)");
-                session.discord_user_id
-            })
+            lock.take().map(|session| session.discord_user_id)
         };
+        if let Some(owner) = owner {
+            self.supervisor.stop(owner).await;
+            tracing::info!(user = owner, "aborted session (teardown)");
+        }
 
         // VoiceLost first (mailbox order beats the runner's own cancel
         // report): the actor drops any active media turn and stale-ifies
@@ -1640,6 +1626,28 @@ impl Handler {
         .await
     }
 
+    /// Ensure the bot is in a voice call, following `discord_user_id` in
+    /// when it has to join fresh — a no-op when a call already exists.
+    /// Unlike `join_voice_for_user`, this never replays the join sound or
+    /// re-hooks the bridge reader over a call that's already up, so a
+    /// session switch can't cut whatever media item is currently feeding it.
+    async fn ensure_voice_for_user(&self, discord_user_id: Option<u64>) -> bool {
+        let ctx = { self.ctx.lock().clone() };
+        if let Some(ctx) = &ctx {
+            if let Some(manager) = songbird::get(ctx).await {
+                if manager.get(self.guild_id).is_some() {
+                    return true;
+                }
+            }
+        }
+        // Fresh join only: give the previous session's abort (if any) a
+        // moment to actually stop touching the bridge before this hooks the
+        // reader to a new call — mirrors the old spawn_session's fixed
+        // pre-join wait.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        self.join_voice_for_user(discord_user_id).await
+    }
+
     /// Restart the stored active user's Spotify session on boot, through the
     /// exact same path /login uses. Skips when no user is marked active or the
     /// stored record is unusable (unparseable id, failed refresh).
@@ -1692,9 +1700,8 @@ impl Handler {
                 }
             };
 
-        self.spawn_session(
+        self.switch_active_session(
             discord_user_id,
-            user.discord_name.clone(),
             user.discord_name,
             access_token,
             refresh_token,
@@ -1703,23 +1710,30 @@ impl Handler {
         .await;
     }
 
-    async fn spawn_session(
+    /// Point the live Spotify session at `discord_user_id` and update
+    /// everything downstream of an account change: the DB's exclusive-active
+    /// flag, the `/who`/takeover-gate display cache, the voice call (a no-op
+    /// when one already exists), and the card's account name. Never touches
+    /// the queue, the feeder or the bridge reader — a media item already
+    /// playing keeps playing straight through a login. The only steps beyond
+    /// what the design calls out ("and then only" set_active_exclusive,
+    /// ensure-voice, `UiMsg::AccountChanged`) are updating this cache (so
+    /// `/who`/the takeover gate have something to read) and clearing
+    /// `armed_spotify` (the previous session's Spotify-side queue is gone
+    /// with it) — neither touches the queue, the feeder or the bridge
+    /// reader either.
+    async fn switch_active_session(
         &self,
         discord_user_id: u64,
-        spotify_name: String,
         discord_name: String,
         access_token: String,
         refresh_token: String,
         expires_in: u64,
     ) {
-        // Serialize the whole spawn so two concurrent logins can't both take()
-        // the old session and then clobber each other's store, orphaning a task.
-        let _spawn_guard = self.spawn_lock.lock().await;
-        let generation = self.session_gen.fetch_add(1, Ordering::SeqCst);
+        self.supervisor
+            .switch(discord_user_id, discord_name.clone(), access_token, refresh_token, expires_in)
+            .await;
 
-        // A fresh Spotify session owns the audio path — cancel any active
-        // YouTube/file playback before starting it.
-        self.stop_priority_playback();
         // The previous session's Spotify-side device queue is gone with it —
         // any armed track never plays, so stop treating it as armed.
         {
@@ -1727,186 +1741,23 @@ impl Handler {
             *lock = None;
         }
 
-        let config = self.config.clone();
-        let bridge = self.bridge.clone();
-        let presence_tx = self.presence_tx.clone();
-        let active_session = self.active_session.clone();
-        let oauth_for_task = self.oauth.clone();
-        let user_store_for_task = self.user_store.clone();
-        let user_id_str = discord_user_id.to_string();
-
-        // Shared, single-owner token state. The refresher below is the only
-        // writer of the refresh token; the librespot task only reads the
-        // current access token and signals the refresher when its session dies.
-        let token_state = Arc::new(Mutex::new((access_token.clone(), refresh_token)));
-        let refresh_now = Arc::new(Notify::new());
-
-        {
-            let mut lock = active_session.lock();
-            if let Some(old) = lock.take() {
-                tracing::info!(old_user = old.discord_user_id, "aborting existing librespot session");
-                old.abort();
-            }
-        }
         // Exactly one user stays active:true, so auto-start can't resurrect a
         // displaced user after a restart.
-        if let Err(e) = self.user_store.set_active_exclusive(&user_id_str) {
+        if let Err(e) = self.user_store.set_active_exclusive(&discord_user_id.to_string()) {
             tracing::warn!(error = %e, "failed to set exclusive active user");
         }
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        let _ = self.join_voice_for_user(Some(discord_user_id)).await;
 
         {
-            let tx = { self.ui_tx.lock().clone() };
-            if let Some(tx) = tx {
-                let _ = tx.send(UiMsg::Idle { account: Some(discord_name.clone()) });
-            }
+            let mut lock = self.active_session.lock();
+            *lock = Some(ActiveSession { discord_user_id, discord_name: discord_name.clone() });
         }
 
-        // One transport-event stream out of the librespot session. The shim
-        // fans it out to the presence loop (as the legacy `PresenceUpdate`)
-        // and the player actor (as `Input::Transport`); it exits when this
-        // session's task — the only sender — dies.
-        let (transport_tx, transport_rx) = mpsc::unbounded_channel::<TransportEvent>();
-        let (spirc_tx, spirc_rx) = mpsc::unbounded_channel::<SpircCommand>();
+        let _ = self.ensure_voice_for_user(Some(discord_user_id)).await;
 
-        // Store spirc_cmd_tx
-        {
-            let mut lock = self.spirc_cmd_tx.lock();
-            *lock = Some(spirc_tx);
+        let tx = { self.ui_tx.lock().clone() };
+        if let Some(tx) = tx {
+            let _ = tx.send(UiMsg::AccountChanged(Some(discord_name)));
         }
-
-        tokio::spawn(transport_shim(
-            transport_rx,
-            self.presence_tx.clone(),
-            self.player.clone(),
-        ));
-
-        // Proactive refresher: the sole owner of the refresh cycle. Wakes on a
-        // timer (expires_in − margin) or when the librespot task signals its
-        // session died, refreshes, and publishes the new access token to the
-        // shared state, the DB, and the live ActiveSession.
-        let refresh_handle = tokio::spawn({
-            let oauth = oauth_for_task.clone();
-            let user_store = user_store_for_task.clone();
-            let active_session = active_session.clone();
-            let token_state = token_state.clone();
-            let refresh_now = refresh_now.clone();
-            let user_id_str = user_id_str.clone();
-            async move {
-                let mut lifetime = if expires_in == 0 { DEFAULT_TOKEN_LIFETIME_SECS } else { expires_in };
-                loop {
-                    let wait = lifetime
-                        .saturating_sub(TOKEN_REFRESH_MARGIN_SECS)
-                        .max(TOKEN_REFRESH_MIN_WAIT_SECS);
-                    tokio::select! {
-                        _ = tokio::time::sleep(std::time::Duration::from_secs(wait)) => {}
-                        _ = refresh_now.notified() => {
-                            tracing::debug!(user = discord_user_id, "early token refresh requested");
-                        }
-                    }
-                    let current_refresh = { token_state.lock().1.clone() };
-                    match oauth.refresh_access_token(&current_refresh).await {
-                        Ok(tok) => {
-                            let new_refresh = tok.refresh_token.clone().unwrap_or(current_refresh);
-                            {
-                                let mut s = token_state.lock();
-                                s.0 = tok.access_token.clone();
-                                s.1 = new_refresh.clone();
-                            }
-                            if let Some(mut creds) = user_store.load(&user_id_str) {
-                                creds.access_token = tok.access_token.clone();
-                                creds.refresh_token = new_refresh;
-                                let _ = user_store.save(&creds);
-                            }
-                            {
-                                let mut lock = active_session.lock();
-                                if let Some(s) = lock.as_mut() {
-                                    if s.discord_user_id == discord_user_id {
-                                        s.access_token = tok.access_token.clone();
-                                    }
-                                }
-                            }
-                            lifetime = if tok.expires_in == 0 { DEFAULT_TOKEN_LIFETIME_SECS } else { tok.expires_in };
-                            tracing::info!(user = discord_user_id, lifetime, "access token refreshed");
-                        }
-                        Err(e) => {
-                            tracing::warn!(user = discord_user_id, error = ?e, "token refresh failed; retrying");
-                            // Wait out the retry window on the next loop.
-                            lifetime = TOKEN_REFRESH_RETRY_SECS + TOKEN_REFRESH_MARGIN_SECS;
-                        }
-                    }
-                }
-            }
-        });
-
-        let active_session_for_task = active_session.clone();
-        let spotify_name_clone = spotify_name.clone();
-        let handle = tokio::spawn({
-            let token_state = token_state.clone();
-            let refresh_now = refresh_now.clone();
-            async move {
-                tracing::info!(user = discord_user_id, "librespot OAuth session starting");
-                let mut spirc_rx = Some(spirc_rx);
-                let mut restarts: u32 = 0;
-                loop {
-                    let access_token = { token_state.lock().0.clone() };
-                    let run_start = std::time::Instant::now();
-                    match SpotifyPlayer::run_with_token(
-                        &config, bridge.clone(),
-                        transport_tx.clone(),
-                        access_token,
-                        &mut spirc_rx,
-                    ).await {
-                        Ok(()) => tracing::info!(user = discord_user_id, "librespot session ended cleanly"),
-                        Err(e) => tracing::warn!(user = discord_user_id, error = ?e, "librespot session ended with error"),
-                    }
-                    // Only consecutive *fast* failures count toward giving up; a
-                    // session that ran for a while resets the budget.
-                    if run_start.elapsed() >= std::time::Duration::from_secs(60) {
-                        restarts = 0;
-                    } else {
-                        restarts += 1;
-                    }
-                    if restarts >= MAX_SESSION_RESTARTS {
-                        tracing::warn!(user = discord_user_id, "librespot session gave up after repeated failures");
-                        break;
-                    }
-                    // Ask the refresher to rotate the token (in case the death was
-                    // an auth failure), then retry with whatever it publishes.
-                    refresh_now.notify_one();
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                }
-                // Give-up path: clear the slot only if this exact spawn still
-                // owns it, and abort its refresher — dropping the ActiveSession
-                // would only detach the refresh task, leaving it rotating the
-                // token forever and racing a future /login.
-                let owned = {
-                    let mut lock = active_session_for_task.lock();
-                    match lock.as_ref() {
-                        Some(s) if s.generation == generation => lock.take(),
-                        _ => None,
-                    }
-                };
-                if let Some(session) = owned {
-                    session.abort();
-                    let _ = presence_tx.send(PresenceUpdate::Idle);
-                }
-            }
-        });
-
-        let mut lock = active_session.lock();
-        let access_token_for_store = { token_state.lock().0.clone() };
-        *lock = Some(ActiveSession {
-            discord_user_id,
-            spotify_name,
-            discord_name,
-            access_token: access_token_for_store,
-            generation,
-            handle,
-            refresh_handle,
-        });
-        tracing::info!(user = discord_user_id, spotify = %spotify_name_clone, "librespot session spawned");
     }
 
     /// Extracts `url`/`file`/`next` from a `/play` or `/queue` interaction's
@@ -2176,19 +2027,18 @@ impl Handler {
                     tracing::error!(error = %e, "failed to save reactivated session");
                     return "Failed to save session. Please try again.".to_string();
                 }
-                self.spawn_session(
+                self.switch_active_session(
                     user_id_u64,
-                    existing.discord_name.clone(),
                     discord_username.to_string(),
                     new_token.access_token,
                     creds.refresh_token.clone(),
                     expires_in,
                 )
                 .await;
-                tracing::info!(user = %user_id, spotify = %existing.discord_name, "session reactivated");
+                tracing::info!(user = %user_id, name = %discord_username, "session reactivated");
                 format!(
                     "Session (re)started for **{}**! Pick **{}** in Spotify's device list to play.",
-                    existing.discord_name, self.config.device_name
+                    discord_username, self.config.device_name
                 )
             }
             Err(e) => {
@@ -2307,11 +2157,10 @@ impl Handler {
                 Ok(v) => v,
                 Err(msg) => return msg,
             };
-        tracing::info!(user = %user_id, spotify = %display_name, "device login successful");
-        self.spawn_session(
+        tracing::info!(user = %user_id, name = %display_name, "device login successful");
+        self.switch_active_session(
             user_id_u64,
             display_name.clone(),
-            discord_username.to_string(),
             token.access_token,
             refresh_token,
             token.expires_in,
@@ -2331,31 +2180,23 @@ impl Handler {
             cancel.notify_one();
         }
 
-        // Serialize against spawn_session so a logout landing in the spawn
-        // window can't miss the not-yet-stored session (and then deactivate the
-        // DB row while a live session keeps running).
-        let _spawn_guard = self.spawn_lock.lock().await;
-
         // Only the owner of the live session may tear it down. A bystander's
-        // /logout must not pause the DJ's audio or wipe the controls.
-        let owned_live_session = {
-            let mut lock = self.active_session.lock();
-            match lock.as_ref() {
-                Some(session) if session.discord_user_id == user_id_u64 => {
-                    session.abort();
-                    *lock = None;
-                    tracing::info!(user = %user_id, "active librespot session aborted");
-                    true
-                }
-                _ => false,
-            }
-        };
+        // /logout must not pause the DJ's audio or wipe the controls. The
+        // supervisor re-checks ownership itself (`stop` is a no-op for a
+        // non-owner); this flag is only for which reply text to show below.
+        let owned_live_session = self.active_owner() == Some(user_id_u64);
 
         if owned_live_session {
-            // Also tear down any priority (YouTube/file) playback, mirroring the
-            // empty-channel path — otherwise a queued track keeps playing and
-            // posts a history embed after logout.
-            self.stop_priority_playback();
+            self.supervisor.stop(user_id_u64).await;
+            {
+                let mut lock = self.active_session.lock();
+                *lock = None;
+            }
+            tracing::info!(user = %user_id, "active librespot session aborted");
+            // Does NOT touch priority (YouTube/file) playback — a session
+            // supervisor can't reach the queue, the feeder or the bridge
+            // reader (that restriction is the whole point of C4); a queued
+            // item keeps playing straight through a logout.
             // The Spotify-side device queue dies with the session — an armed
             // track never plays, so it's no longer armed.
             {
@@ -2399,7 +2240,10 @@ impl Handler {
     async fn handle_who(&self) -> String {
         let lock = self.active_session.lock();
         match lock.as_ref() {
-            Some(session) => format!("Active session: **{}** (Discord: {})", session.spotify_name, session.discord_name),
+            // One name: the Web API profile lookup this used to pair with
+            // Discord's own name is gone (429s under the desktop client id),
+            // so there is only ever the one name to show.
+            Some(session) => format!("Active session: **{}**", session.discord_name),
             None => "No active Spotify session. Run `/login` to connect.".to_string(),
         }
     }
@@ -2659,6 +2503,24 @@ impl DiscordBot {
             announce_enabled: announce_enabled.clone(),
         });
 
+        // One long-lived transport-event stream, shared by every generation
+        // of Spotify session (unlike the old per-login channel) — the
+        // supervisor holds the sender, this task the receiver, fanning
+        // events out to the presence loop and the player actor for the life
+        // of the process.
+        let (transport_tx, transport_rx) = mpsc::unbounded_channel::<TransportEvent>();
+        let supervisor = SessionSupervisor::new(
+            config.clone(),
+            bridge.clone(),
+            oauth.clone(),
+            user_store.clone(),
+            transport_tx,
+            player.clone(),
+            spirc_cmd_tx.clone(),
+        );
+        let link_up_watch = supervisor.link_up_watch();
+        tokio::spawn(transport_shim(transport_rx, presence_tx.clone(), player.clone(), link_up_watch));
+
         let handler = Handler {
             guild_id,
             channel_id,
@@ -2674,8 +2536,7 @@ impl DiscordBot {
             oauth,
             pending_auth: Arc::new(Mutex::new(HashMap::new())),
             active_session,
-            spawn_lock: Arc::new(tokio::sync::Mutex::new(())),
-            session_gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            supervisor,
             track_handle,
             ctx: ctx_store,
             ui_tx: ui_tx_store,

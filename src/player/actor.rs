@@ -62,7 +62,7 @@ use librespot_core::SpotifyUri;
 
 /// Reply used when the actor task is gone — unreachable in practice, since
 /// the Handler holds a `PlayerHandle` for the life of the process.
-const NO_ACTOR_REPLY: &str = "⚠ The player didn't respond — try again.";
+const NO_ACTOR_REPLY: &str = "⚠️ The player didn't respond — try again.";
 
 /// How long a gated media runner waits for the Spotify pause ack before
 /// starting anyway (mirrors the old fixed post-`Pause` sleep).
@@ -309,7 +309,7 @@ impl Actor {
                         let _ = tx.send(Input::VoiceReady);
                     } else {
                         let _ = notice_tx.send(
-                            "⚠ Couldn't join a voice channel, so nothing would be heard. \
+                            "⚠️ Couldn't join a voice channel, so nothing would be heard. \
                              Try again from a voice channel."
                                 .to_string(),
                         );
@@ -439,8 +439,11 @@ impl Actor {
             SpircCmd::Load(uri) => {
                 let _ = tx.send(SpircCommand::Load(uri));
             }
-            SpircCmd::ActivateDevice | SpircCmd::Transfer => {
-                tracing::warn!(?cmd, "spirc command not wired until C6");
+            SpircCmd::ActivateDevice => {
+                let _ = tx.send(SpircCommand::ActivateDevice);
+            }
+            SpircCmd::Transfer => {
+                let _ = tx.send(SpircCommand::Transfer);
             }
         }
     }

@@ -37,6 +37,14 @@ pub enum SpircCommand {
     /// Resolve a track's title/artist/art through the live session; replies
     /// `None` if unavailable.
     Lookup(SpotifyUri, tokio::sync::oneshot::Sender<Option<TrackLookup>>),
+    /// Claim the active-device slot (F15: explicit only — never sent on a
+    /// bare connect). A no-op on the Spotify side when this device is
+    /// already active.
+    ActivateDevice,
+    /// `Spirc::transfer(None)`: restore context, position, pause state and
+    /// the queue after a reconnect, claiming the active-device slot in the
+    /// same call instead of a bare activate.
+    Transfer,
 }
 
 /// Track metadata resolved through the live librespot session, for
@@ -375,11 +383,13 @@ impl SpotifyPlayer {
                 e
             })?;
 
-            if let Err(e) = spirc.activate() {
-                tracing::warn!(error = ?e, "device activation failed");
-            }
-
-            tracing::info!("spotify connect active (oauth)");
+            // No unconditional activate() here (F15): claiming the active
+            // Connect device on every connect steals it from whatever's
+            // already playing on the DJ's phone. Activation is explicit now —
+            // `SpircCommand::ActivateDevice`, sent only on a human play or
+            // takeover — and a reconnect that owes a restore sends
+            // `SpircCommand::Transfer` instead, never a bare activate.
+            tracing::info!("spotify connect established (oauth)");
             let session_start = std::time::Instant::now();
 
             // Run the spirc task inline (pinned, not detached) so it is
@@ -428,6 +438,16 @@ impl SpotifyPlayer {
                                 );
                                 if let Err(e) = spirc.load(req) {
                                     tracing::warn!(error = ?e, "spirc load failed");
+                                }
+                            }
+                            Some(SpircCommand::ActivateDevice) => {
+                                if let Err(e) = spirc.activate() {
+                                    tracing::warn!(error = ?e, "spirc activate failed");
+                                }
+                            }
+                            Some(SpircCommand::Transfer) => {
+                                if let Err(e) = spirc.transfer(None) {
+                                    tracing::warn!(error = ?e, "spirc transfer failed");
                                 }
                             }
                             Some(SpircCommand::Lookup(uri, reply)) => {
