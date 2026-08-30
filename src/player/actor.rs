@@ -5,36 +5,29 @@
 //! `step(state, input, now)` and then the returned effects, in order.
 //! **The actor awaits nothing, ever**: every effect is a synchronous channel
 //! send, an atomic store, a `CancellationToken::cancel`, or a `tokio::spawn`
-//! (media runners, voice joins, timers), so a step can never park the
-//! mailbox behind IO. Asynchronous completions come back as inputs —
-//! `MediaEnded` tagged with its epoch, `VoiceReady`/`VoiceLost` from the
+//! (media runners, voice joins, announcements, timers), so a step can never
+//! park the mailbox behind IO. Asynchronous completions come back as inputs
+//! — `MediaEnded` tagged with its epoch, `VoiceReady`/`VoiceLost` from the
 //! join task, `Tick` from spawned timers — so stale reports are ignored by
 //! the core, not raced by the shell.
 //!
-//! ## C3 split — temporary, flipped in C5
+//! The actor is the single owner of playback state: the queue, the armed
+//! track and the turn all live in its [`PlayerState`], and every playback
+//! surface — Spirc commands, the now-playing cards, DJ announcements, the
+//! bot's status line, the shared bridge-reader track — is driven from here.
+//! The `spirc_cmd_tx` cell is shared with the session supervisor, which
+//! (re)publishes the live session's sender on switch/stop; the actor is its
+//! only playback-command sender, while [`PlayerHandle::lookup_spotify`]
+//! borrows it for metadata lookups that run in the *caller's* task, never
+//! in this one.
 //!
-//! The actor fully owns the media path: the runner, the feeder
-//! cancel/pause flags, and (through the core) the turn. But the *queue* and
-//! the *armed track* are still the Handler-shared mutexes the presence loop
-//! reads and writes, so this shell bridges the two worlds until C5 moves
-//! ownership into the core:
-//!
-//! - `step` runs against the shared `priority_queue` (swapped into
-//!   `state.queue` around each call, under the queue lock — `step` is
-//!   synchronous, so the lock is held for microseconds and never across an
-//!   await), so every push/pop lands in the one queue the presence loop and
-//!   the queue listing read.
-//! - `Effect::Spirc(AddToQueue)` joins the presence loop's arming critical
-//!   section on the shared `armed_spotify` mutex: whoever takes the slot
-//!   first arms, so a track is never `AddToQueue`'d twice even with two
-//!   arming decision-makers alive.
-//! - `Effect::Ui(NowPlayingSpotify)`, `Effect::Announce` and
-//!   `Effect::Presence(Playing)` are suppressed here: the presence loop
-//!   still owns Spotify cards, DJ announcements and `Playing` bookkeeping
-//!   (queue pop + re-arm), and forwarding them too would double every one
-//!   of them.
-//! - `SpircCmd::ActivateDevice`/`Transfer` have no transport yet; they log
-//!   and drop until C6 grows the `SpircCommand` enum.
+//! Two things are shell state rather than core state, because the core
+//! deliberately doesn't model them: the bridge-reader `TrackHandle` follows
+//! raw transport telemetry (Spotify playing resumes it, Spotify going quiet
+//! pauses it — unless a media item holds the turn and needs it live), and
+//! the status line's view of a running media item (`PresenceState` is
+//! Spotify-only, so `StartMedia`/`TrackHandle` effects feed the media
+//! title/pause state to the presence loop directly).
 
 use std::future::Future;
 use std::pin::Pin;
@@ -51,11 +44,12 @@ use crate::audio::dj::DJAnnouncer;
 use crate::audio_bridge::AudioBridge;
 use crate::config::Config;
 use crate::player::state::{
-    step, Effect, EnqueuePos, Input, MediaOutcome, PlayerState, PresenceState, SpDevice, SpircCmd,
-    StartGate, TrackHandleCmd, TransportEvent, UiMsg as CoreUiMsg,
+    step, Active, AnnounceKind, Effect, EnqueuePos, Input, MediaOutcome, NowPlaying,
+    PlayerSnapshot, PlayerState, PresenceState, SpDevice, SpircCmd, StartGate, TrackHandleCmd,
+    TrackMeta, TransportEvent, UiMsg as CoreUiMsg,
 };
 use crate::presence::PresenceUpdate;
-use crate::queue::{MediaSource, PriorityQueue, QueueItem};
+use crate::queue::{MediaSource, QueueItem};
 use crate::spotify::SpircCommand;
 use crate::youtube::feeder::{feed_file_to_bridge, feed_youtube_to_bridge, FeederError};
 use librespot_core::SpotifyUri;
@@ -75,6 +69,8 @@ const PAUSE_ACK_FALLBACK_MS: u64 = 500;
 pub enum UiEvent {
     /// A queue (YouTube/file) item took the turn — post its card.
     NowPlayingMedia { item: QueueItem },
+    /// The Spotify baseline took the turn on a new track — post its card.
+    NowPlayingSpotify { uri: SpotifyUri, meta: Option<TrackMeta> },
     /// A queue item finished naturally — post its history embed.
     HistoryMedia { item: QueueItem },
     /// Delete the current card and post the idle controls card.
@@ -94,34 +90,28 @@ pub type UiSendFn = Arc<dyn Fn(UiEvent) + Send + Sync>;
 pub type JoinVoiceFn =
     Arc<dyn Fn(Option<u64>) -> Pin<Box<dyn Future<Output = bool> + Send>> + Send + Sync>;
 
-/// Everything the actor owns or bridges to. Shared `Arc`s are exactly the
-/// C3-transitional surfaces described in the module docs; the rest is the
-/// actor's own equipment.
+/// Everything the actor owns or drives. The shared `Arc`s are the process's
+/// cross-task seams: the spirc cell is written by the session supervisor,
+/// the track handle by the voice-join machinery, and `announce_enabled` by
+/// `/announce`; the rest is the actor's own equipment.
 pub struct PlayerDeps {
     pub bridge: Arc<AudioBridge>,
-    /// Reserved for the C4+ effects (device naming in takeover prompts);
-    /// carried from day one so `spawn`'s signature doesn't churn.
+    /// Reserved for takeover prompts that name the Connect device; unused
+    /// until the prompt copy grows the name.
     pub config: Arc<Config>,
     pub ui_send: UiSendFn,
     /// Plain text-channel notices (failure messages, takeover prompts); a
     /// bot-layer task does the actual Discord send.
     pub notice_tx: mpsc::UnboundedSender<String>,
-    /// Legacy presence-loop feed, still the owner of bot status and Spotify
-    /// cards in C3.
+    /// Feeds the Discord status task (`run_presence_loop`).
     pub presence_tx: mpsc::UnboundedSender<PresenceUpdate>,
     pub join_voice: JoinVoiceFn,
-    /// The live session's command channel; `None` between sessions.
+    /// The live session's command channel; `None` between sessions. The
+    /// session supervisor (re)publishes the sender on switch/stop.
     pub spirc_cmd_tx: Arc<Mutex<Option<mpsc::UnboundedSender<SpircCommand>>>>,
-    /// C3: still the source of truth for queue contents (see module docs).
-    pub priority_queue: Arc<Mutex<PriorityQueue>>,
-    /// C3: still the arming slot the presence loop checks and sets.
-    pub armed_spotify: Arc<Mutex<Option<SpotifyUri>>>,
-    /// C3: still read by the presence loop ("is a media item audible") and
-    /// the teardown checks; written by the media runner.
-    pub active_priority_item: Arc<Mutex<Option<QueueItem>>>,
+    /// The shared bridge-reader track, written by the voice-join machinery
+    /// whenever the bot (re)joins a call.
     pub track_handle: Arc<Mutex<Option<TrackHandle>>>,
-    pub feeder_cancel: Arc<Mutex<Option<CancellationToken>>>,
-    pub feeder_paused: Arc<AtomicBool>,
     pub dj: Arc<DJAnnouncer>,
     pub announce_enabled: Arc<AtomicBool>,
 }
@@ -129,18 +119,25 @@ pub struct PlayerDeps {
 /// The actor's mailbox handle. Cheap to clone; the typed helpers build the
 /// `Input`, send it, and await the oneshot reply.
 #[derive(Clone)]
-pub struct PlayerHandle(mpsc::UnboundedSender<Input>);
+pub struct PlayerHandle {
+    tx: mpsc::UnboundedSender<Input>,
+    /// The same spirc cell the actor holds, so session-aware helpers
+    /// (`has_session`, `lookup_spotify`) run in the caller's task without a
+    /// mailbox round-trip — and without the caller ever holding a channel it
+    /// could drive playback with directly.
+    spirc: Arc<Mutex<Option<mpsc::UnboundedSender<SpircCommand>>>>,
+}
 
 impl PlayerHandle {
     /// Send a reply-less input (transport events, media/voice reports,
     /// timer ticks). Dropped silently if the actor is gone.
     pub fn send(&self, input: Input) {
-        let _ = self.0.send(input);
+        let _ = self.tx.send(input);
     }
 
     async fn request(&self, make: impl FnOnce(oneshot::Sender<String>) -> Input) -> String {
         let (tx, rx) = oneshot::channel();
-        if self.0.send(make(tx)).is_err() {
+        if self.tx.send(make(tx)).is_err() {
             return NO_ACTOR_REPLY.to_string();
         }
         rx.await.unwrap_or_else(|_| NO_ACTOR_REPLY.to_string())
@@ -169,9 +166,48 @@ impl PlayerHandle {
         self.request(|reply| Input::Previous { reply }).await
     }
 
-    /// What's playing, as the core sees it (`/np`).
-    pub async fn query(&self) -> String {
-        self.request(|reply| Input::Query { reply }).await
+    /// The player's structured view of itself — `/np` and the queue listing
+    /// render from this. Falls back to an empty snapshot if the actor is
+    /// gone (unreachable in practice, as for `request`).
+    pub async fn query(&self) -> PlayerSnapshot {
+        let (tx, rx) = oneshot::channel();
+        if self.tx.send(Input::Query { reply: tx }).is_err() {
+            return empty_snapshot();
+        }
+        rx.await.unwrap_or_else(|_| empty_snapshot())
+    }
+
+    /// Whether a Spotify Connect session is live (able to accept commands),
+    /// regardless of its current playback state.
+    pub fn has_session(&self) -> bool {
+        self.spirc.lock().is_some()
+    }
+
+    /// Resolves a Spotify track's title/artist/art through the live session
+    /// (`SpircCommand::Lookup`), returning `None` if there is no session or
+    /// the lookup itself fails — both cases the caller reports identically.
+    /// Awaits in the caller's task, never inside the actor.
+    pub async fn lookup_spotify(&self, uri: &SpotifyUri) -> Option<(String, String, Option<String>)> {
+        let tx = { self.spirc.lock().clone() }?;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if tx.send(SpircCommand::Lookup(uri.clone(), reply_tx)).is_err() {
+            return None;
+        }
+        match reply_rx.await {
+            Ok(Some(lookup)) => Some((lookup.title, lookup.artist, lookup.album_art_url)),
+            Ok(None) | Err(_) => None,
+        }
+    }
+}
+
+fn empty_snapshot() -> PlayerSnapshot {
+    PlayerSnapshot {
+        now: NowPlaying::Nothing,
+        queue_len: 0,
+        preview: Vec::new(),
+        more: 0,
+        device_active: false,
+        link_up: false,
     }
 }
 
@@ -179,14 +215,19 @@ impl PlayerHandle {
 /// is built; the actor lives for the process (lifecycle A).
 pub fn spawn(deps: PlayerDeps) -> PlayerHandle {
     let (tx, rx) = mpsc::unbounded_channel();
+    let handle = PlayerHandle { tx: tx.clone(), spirc: deps.spirc_cmd_tx.clone() };
     let actor = Actor {
         deps,
-        tx: tx.clone(),
+        tx,
         state: PlayerState::new(),
         pending_gate: None,
+        feeder_cancel: None,
+        feeder_paused: Arc::new(AtomicBool::new(false)),
+        media_status: None,
+        buttons_paused: false,
     };
     tokio::spawn(actor.run(rx));
-    PlayerHandle(tx)
+    handle
 }
 
 struct Actor {
@@ -199,54 +240,119 @@ struct Actor {
     /// the next `Transport(Paused)` (the runner has a fallback timeout, so
     /// a swallowed ack can't wedge it).
     pending_gate: Option<Arc<Notify>>,
+    /// Cancel token of the live media runner, registered before the runner
+    /// spawns so a `CancelMedia` landing during its gate wait still reaches
+    /// it.
+    feeder_cancel: Option<CancellationToken>,
+    /// Pause flag the live feeder polls, so a paused media item stops
+    /// downloading ahead of what the bridge can hold.
+    feeder_paused: Arc<AtomicBool>,
+    /// Title/artist of the running media item as last pushed to the status
+    /// line. The core's `PresenceState` is Spotify-only, so the shell feeds
+    /// media status itself; a core presence effect supersedes this.
+    media_status: Option<(String, String)>,
+    /// Last pause state painted onto the card's ⏯ button, so telemetry
+    /// echoes don't repaint an unchanged card.
+    buttons_paused: bool,
 }
 
 impl Actor {
     async fn run(mut self, mut rx: mpsc::UnboundedReceiver<Input>) {
         while let Some(input) = rx.recv().await {
-            // Shell-side bridging that must happen on receipt, before the
-            // core's own handling.
+            // Shell-side handling that reads raw inputs rather than core
+            // decisions, run on receipt before the step.
             match &input {
-                Input::Transport { ev: TransportEvent::Paused { .. }, .. } => {
-                    if let Some(gate) = self.pending_gate.take() {
-                        gate.notify_one();
+                Input::Transport { ev, .. } => {
+                    if let TransportEvent::Paused { .. } = ev {
+                        if let Some(gate) = self.pending_gate.take() {
+                            gate.notify_one();
+                        }
                     }
+                    self.drive_reader(ev);
                 }
-                Input::Stop { .. } => {
-                    // C3: /stop clears the *shared* arming slot too (the
-                    // core only clears its own mirror) — same contract as
-                    // the old handle_stop. Gone in C5.
-                    *self.deps.armed_spotify.lock() = None;
+                Input::LinkUp { .. } => {
+                    // An account switch never emits LinkDown for the session
+                    // it replaces (see `spotify::session`): the old device
+                    // queue — and any armed track on it — died with that
+                    // session, so an arm still set at LinkUp is a ghost, not
+                    // a live device-side queue entry. Reconnect restores go
+                    // through `armed_snapshot`, which LinkDown fills, so
+                    // clearing `armed` here can't touch them.
+                    self.state.armed = None;
                 }
                 _ => {}
             }
 
-            // C3: run the core against the shared queue — swap it into the
-            // state around the (synchronous) step, under the queue lock.
-            let effects = {
-                let mut shared = self.deps.priority_queue.lock();
-                std::mem::swap(&mut *shared, &mut self.state.queue);
-                let effects = step(&mut self.state, input, Instant::now());
-                std::mem::swap(&mut *shared, &mut self.state.queue);
-                effects
-            };
+            let effects = step(&mut self.state, input, Instant::now());
 
-            // A `StartMedia` in this batch: remember whose item it is (so a
-            // cold-start voice join follows the requester) and mark the item
-            // active before any effect runs — the presence loop must already
-            // see it when the paired `Spirc(Pause)`'s echo comes back, or it
-            // pauses the shared bridge-reader track under the new item.
+            // A `StartMedia` in this batch: remember whose item it is, so a
+            // cold-start voice join follows the requester.
             let mut join_hint = None;
             for effect in &effects {
                 if let Effect::StartMedia { item, .. } = effect {
                     join_hint = Some(item.queued_by_id);
-                    *self.deps.active_priority_item.lock() = Some(item.clone());
                 }
             }
 
             for effect in effects {
                 self.run_effect(effect, join_hint);
             }
+
+            // The media turn can end without a core presence effect (an
+            // honoured human pause leaves dead air; a voice loss cancels the
+            // item): reflect it on the status line. When the baseline is
+            // taking over instead, its own `Playing` repaints the status,
+            // so no Idle blip is needed.
+            if self.media_status.is_some() && !matches!(self.state.active, Active::Media { .. }) {
+                self.media_status = None;
+                if matches!(self.state.active, Active::None) {
+                    let _ = self.deps.presence_tx.send(PresenceUpdate::Idle);
+                }
+            }
+        }
+    }
+
+    /// Drive the shared bridge-reader track from raw Spotify telemetry: a
+    /// playing device is pushing audio, so the reader must run; a quiet one
+    /// freezes the buffered tail in place — unless a media item holds the
+    /// turn and needs the reader live. Also mirrors the baseline's pause
+    /// state onto the card's ⏯ button (only while the baseline owns the
+    /// card — a pause echo under a media item must not repaint its button).
+    fn drive_reader(&mut self, ev: &TransportEvent) {
+        let media_turn = matches!(self.state.active, Active::Media { .. });
+        match ev {
+            TransportEvent::Playing { .. } => {
+                // A `Playing` under a user-paused media item is an
+                // interloper the core pauses right back; resuming the
+                // reader for it would audibly unfreeze the media item.
+                if !matches!(self.state.active, Active::Media { paused: true, .. }) {
+                    let handle = { self.deps.track_handle.lock().clone() };
+                    if let Some(handle) = handle {
+                        let _ = handle.play();
+                    }
+                }
+                if !media_turn && self.buttons_paused {
+                    self.buttons_paused = false;
+                    (self.deps.ui_send)(UiEvent::Buttons { paused: false });
+                }
+            }
+            TransportEvent::Paused { .. }
+            | TransportEvent::Stopped
+            | TransportEvent::EndOfTrack
+            | TransportEvent::Unavailable { .. } => {
+                if media_turn {
+                    return;
+                }
+                let handle = { self.deps.track_handle.lock().clone() };
+                if let Some(handle) = handle {
+                    let _ = handle.pause();
+                }
+                if matches!(ev, TransportEvent::Paused { .. }) && !self.buttons_paused {
+                    self.buttons_paused = true;
+                    (self.deps.ui_send)(UiEvent::Buttons { paused: true });
+                }
+            }
+            _ => {}
         }
     }
 
@@ -261,8 +367,8 @@ impl Actor {
                 // `CancelMedia` landing during the runner's gate wait still
                 // reaches it (the feeder checks the token as it runs).
                 let token = CancellationToken::new();
-                *self.deps.feeder_cancel.lock() = Some(token.clone());
-                self.deps.feeder_paused.store(false, Ordering::Relaxed);
+                self.feeder_cancel = Some(token.clone());
+                self.feeder_paused.store(false, Ordering::Relaxed);
 
                 let gate_notify = match gate {
                     StartGate::Immediate => None,
@@ -277,11 +383,22 @@ impl Actor {
                     }
                 };
 
+                // The core's presence effects are Spotify-only; the status
+                // line's media view starts here. The fresh card posts with
+                // an unpaused ⏯, so the button mirror resets with it.
+                let title = item.source.display_title().to_string();
+                let subtitle = item.source.display_subtitle();
+                self.media_status = Some((title.clone(), subtitle.clone()));
+                self.buttons_paused = false;
+                let _ = self
+                    .deps
+                    .presence_tx
+                    .send(PresenceUpdate::Playing { title, artist: subtitle });
+
                 let ctx = RunnerCtx {
                     bridge: self.deps.bridge.clone(),
                     track_handle: self.deps.track_handle.clone(),
-                    active_priority_item: self.deps.active_priority_item.clone(),
-                    feeder_paused: self.deps.feeder_paused.clone(),
+                    feeder_paused: self.feeder_paused.clone(),
                     dj: self.deps.dj.clone(),
                     announce_enabled: self.deps.announce_enabled.clone(),
                     ui_send: self.deps.ui_send.clone(),
@@ -292,8 +409,7 @@ impl Actor {
             }
 
             Effect::CancelMedia => {
-                let token = { self.deps.feeder_cancel.lock().clone() };
-                if let Some(token) = token {
+                if let Some(token) = self.feeder_cancel.take() {
                     token.cancel();
                 }
             }
@@ -321,9 +437,9 @@ impl Actor {
             }
 
             Effect::LeaveVoice => {
-                // No producer in C3 (teardown still leaves voice from the
-                // Handler); wired when the core owns voice release.
-                tracing::debug!("LeaveVoice effect dropped (not wired in C3)");
+                // No producer yet: teardown still leaves voice from the
+                // Handler; wired when the core owns voice release.
+                tracing::debug!("LeaveVoice effect dropped (not wired)");
             }
 
             Effect::TrackHandle(cmd) => {
@@ -331,23 +447,32 @@ impl Actor {
                 // Pause the feeder too: the songbird pause freezes output
                 // instantly, and the flag stops the download side from
                 // racing ahead more than the bridge can hold.
-                self.deps.feeder_paused.store(paused, Ordering::Relaxed);
+                self.feeder_paused.store(paused, Ordering::Relaxed);
                 let handle = { self.deps.track_handle.lock().clone() };
                 if let Some(handle) = handle {
                     let _ = if paused { handle.pause() } else { handle.play() };
                 }
+                self.buttons_paused = paused;
                 (self.deps.ui_send)(UiEvent::Buttons { paused });
+                // Mirror the media item's pause state on the status line.
+                let update = if paused {
+                    Some(PresenceUpdate::Paused)
+                } else {
+                    self.media_status
+                        .clone()
+                        .map(|(title, artist)| PresenceUpdate::Playing { title, artist })
+                };
+                if let Some(update) = update {
+                    let _ = self.deps.presence_tx.send(update);
+                }
             }
 
             Effect::Ui(msg) => match msg {
                 CoreUiMsg::NowPlayingMedia { item } => {
                     (self.deps.ui_send)(UiEvent::NowPlayingMedia { item });
                 }
-                CoreUiMsg::NowPlayingSpotify { .. } => {
-                    // C3: the presence loop still posts Spotify cards from
-                    // its own `Playing` handling; posting here too would
-                    // double them. C5 hands the card trigger to the core.
-                    tracing::debug!("NowPlayingSpotify suppressed (presence loop owns Spotify cards until C5)");
+                CoreUiMsg::NowPlayingSpotify { uri, meta } => {
+                    (self.deps.ui_send)(UiEvent::NowPlayingSpotify { uri, meta });
                 }
                 CoreUiMsg::TakeoverPrompt => {
                     let _ = self.deps.notice_tx.send(
@@ -360,29 +485,37 @@ impl Actor {
             },
 
             Effect::Presence(state) => {
-                // C3: `Playing` is suppressed — the shim already feeds the
-                // presence loop the same event, and its `Playing` handler
-                // still owns queue-pop/arm bookkeeping, which must run
-                // exactly once. Idle/Paused are idempotent there.
+                // A core presence effect is the baseline speaking for
+                // itself; it supersedes any shell-fed media status.
+                self.media_status = None;
                 let update = match state {
-                    PresenceState::Idle => Some(PresenceUpdate::Idle),
-                    PresenceState::Playing { .. } => None,
-                    PresenceState::Paused { uri, meta } => Some(PresenceUpdate::Paused {
-                        title: meta.title,
-                        artist: meta.artist,
-                        track_id: uri.to_id(),
-                    }),
+                    PresenceState::Idle => PresenceUpdate::Idle,
+                    PresenceState::Playing { meta, .. } => {
+                        PresenceUpdate::Playing { title: meta.title, artist: meta.artist }
+                    }
+                    PresenceState::Paused { .. } => PresenceUpdate::Paused,
                 };
-                if let Some(update) = update {
-                    let _ = self.deps.presence_tx.send(update);
-                }
+                let _ = self.deps.presence_tx.send(update);
             }
 
-            Effect::Announce(_) => {
-                // C3: Spotify-track announcements still come from the
-                // presence loop; forwarding these would announce twice.
-                // Media-item announcements live in the runner, not here.
-                tracing::debug!("Announce suppressed (presence loop owns Spotify announces until C5)");
+            Effect::Announce(AnnounceKind::Track { title, artist }) => {
+                // Spotify-track announcement (media items announce from
+                // their own runner). Spawned: clip synthesis is IO.
+                if self.deps.announce_enabled.load(Ordering::Relaxed) {
+                    let dj = self.deps.dj.clone();
+                    let bridge = self.deps.bridge.clone();
+                    tokio::spawn(async move {
+                        match dj.track_announce_clip(&title, &artist, "").await {
+                            Some(clip) => {
+                                tracing::info!(title = %title, artist = %artist, samples = clip.len(), "DJ overlay pushed");
+                                bridge.push_overlay(&clip);
+                            }
+                            None => {
+                                tracing::warn!(title = %title, artist = %artist, "DJ clip failed");
+                            }
+                        }
+                    });
+                }
             }
 
             Effect::SetTimer(kind, duration) => {
@@ -396,6 +529,10 @@ impl Actor {
             Effect::Reply(tx, text) => {
                 let _ = tx.send(text);
             }
+
+            Effect::ReplySnapshot(tx, snapshot) => {
+                let _ = tx.send(snapshot);
+            }
         }
     }
 
@@ -408,44 +545,17 @@ impl Actor {
             tracing::debug!(?cmd, "spirc command dropped (no live session)");
             return;
         };
-        match cmd {
-            SpircCmd::Pause => {
-                let _ = tx.send(SpircCommand::Pause);
-            }
-            SpircCmd::Play => {
-                let _ = tx.send(SpircCommand::Play);
-            }
-            SpircCmd::Next => {
-                let _ = tx.send(SpircCommand::Next);
-            }
-            SpircCmd::Previous => {
-                let _ = tx.send(SpircCommand::Previous);
-            }
-            SpircCmd::AddToQueue(uri) => {
-                // C3 arming bridge: join the presence loop's critical
-                // section on the shared slot — whoever holds `armed_spotify`
-                // first arms, so an armed track is never `AddToQueue`'d
-                // twice. Mirrors `try_arm_first_spotify`: the slot is taken
-                // only when the send goes through.
-                let mut armed = self.deps.armed_spotify.lock();
-                if armed.is_some() {
-                    tracing::debug!("arm skipped (presence loop already armed a track)");
-                    return;
-                }
-                if tx.send(SpircCommand::AddToQueue(uri.clone())).is_ok() {
-                    *armed = Some(uri);
-                }
-            }
-            SpircCmd::Load(uri) => {
-                let _ = tx.send(SpircCommand::Load(uri));
-            }
-            SpircCmd::ActivateDevice => {
-                let _ = tx.send(SpircCommand::ActivateDevice);
-            }
-            SpircCmd::Transfer => {
-                let _ = tx.send(SpircCommand::Transfer);
-            }
-        }
+        let command = match cmd {
+            SpircCmd::Pause => SpircCommand::Pause,
+            SpircCmd::Play => SpircCommand::Play,
+            SpircCmd::Next => SpircCommand::Next,
+            SpircCmd::Previous => SpircCommand::Previous,
+            SpircCmd::AddToQueue(uri) => SpircCommand::AddToQueue(uri),
+            SpircCmd::Load(uri) => SpircCommand::Load(uri),
+            SpircCmd::ActivateDevice => SpircCommand::ActivateDevice,
+            SpircCmd::Transfer => SpircCommand::Transfer,
+        };
+        let _ = tx.send(command);
     }
 }
 
@@ -453,7 +563,6 @@ impl Actor {
 struct RunnerCtx {
     bridge: Arc<AudioBridge>,
     track_handle: Arc<Mutex<Option<TrackHandle>>>,
-    active_priority_item: Arc<Mutex<Option<QueueItem>>>,
     feeder_paused: Arc<AtomicBool>,
     dj: Arc<DJAnnouncer>,
     announce_enabled: Arc<AtomicBool>,
@@ -524,8 +633,6 @@ async fn media_runner(
             Ok(())
         }
     };
-
-    *ctx.active_priority_item.lock() = None;
 
     let outcome = match feed_result {
         Ok(()) => {

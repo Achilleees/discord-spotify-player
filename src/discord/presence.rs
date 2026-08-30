@@ -8,7 +8,7 @@ use tokio::sync::mpsc;
 fn status_text(state: &PresenceUpdate, dance_flip: bool) -> String {
     match state {
         PresenceUpdate::Idle => "Idle".to_string(),
-        PresenceUpdate::Paused { .. } => "Paused".to_string(),
+        PresenceUpdate::Paused => "Paused".to_string(),
         PresenceUpdate::Playing { title, artist, .. } => {
             let note = if dance_flip { "\u{266A}" } else { "\u{266C}" };
             let base = format!("{note} {title} - {artist}");
@@ -38,7 +38,7 @@ async fn set_presence(ctx: &Context, state: &PresenceUpdate, dance_flip: bool) {
     let activity = ActivityData::custom(text);
     let status = match state {
         PresenceUpdate::Playing { .. } => OnlineStatus::Online,
-        PresenceUpdate::Paused { .. } | PresenceUpdate::Idle => OnlineStatus::Idle,
+        PresenceUpdate::Paused | PresenceUpdate::Idle => OnlineStatus::Idle,
     };
     ctx.set_presence(Some(activity), status);
 }
@@ -74,23 +74,13 @@ mod tests {
         PresenceUpdate::Playing {
             title: title.to_string(),
             artist: artist.to_string(),
-            track_id: "t".to_string(),
-            album_art_url: None,
-        }
-    }
-
-    fn paused(title: &str, artist: &str) -> PresenceUpdate {
-        PresenceUpdate::Paused {
-            title: title.to_string(),
-            artist: artist.to_string(),
-            track_id: "t".to_string(),
         }
     }
 
     #[test]
     fn maps_all_three_states() {
         assert_eq!(status_text(&PresenceUpdate::Idle, false), "Idle");
-        assert_eq!(status_text(&paused("Song", "Artist"), false), "Paused");
+        assert_eq!(status_text(&PresenceUpdate::Paused, false), "Paused");
         assert_eq!(
             status_text(&playing("Song", "Artist"), false),
             "\u{266C} Song - Artist"

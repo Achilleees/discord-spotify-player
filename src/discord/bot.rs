@@ -6,13 +6,12 @@ use crate::audio::dj::DJAnnouncer;
 use crate::audio_bridge::AudioBridge;
 use crate::config::Config;
 use crate::oauth::{DeviceAuthorization, SpotifyOAuth};
-use crate::player::actor::{self as player_actor, PlayerDeps, PlayerHandle, UiEvent};
-use crate::player::state::{EnqueuePos, Input as PlayerInput, TrackMeta, TransportEvent};
+use crate::player::actor::{self as player_actor, JoinVoiceFn, PlayerDeps, PlayerHandle, UiEvent};
+use crate::player::state::{EnqueuePos, Input as PlayerInput, NowPlaying, TransportEvent};
 use crate::presence::PresenceUpdate;
-use crate::queue::{PriorityQueue, QueueItem, MediaSource};
+use crate::queue::{QueueItem, MediaSource};
 use crate::spotify::SpircCommand;
 use crate::spotify::SessionSupervisor;
-use librespot_core::SpotifyUri;
 use crate::youtube::metadata::{fetch_youtube_metadata, validate_attachment};
 use crate::users::{UserCredentials, UserStore};
 use serenity::all::{
@@ -42,7 +41,6 @@ use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio::sync::watch;
 use tokio::sync::Notify;
-use tokio_util::sync::CancellationToken;
 
 type ReadySignal = Result<(), String>;
 
@@ -70,15 +68,10 @@ pub struct ActiveSession {
 
 struct Handler {
     guild_id: GuildId,
-    channel_id: ChannelId,
     text_channel_id: ChannelId,
-    bridge: Arc<AudioBridge>,
     config: Arc<Config>,
     ready_tx: mpsc::Sender<ReadySignal>,
     presence_rx: Mutex<Option<mpsc::UnboundedReceiver<PresenceUpdate>>>,
-    presence_tx: mpsc::UnboundedSender<PresenceUpdate>,
-    prebuffer_samples: usize,
-    prebuffer_wait: std::time::Duration,
     user_store: Arc<UserStore>,
     oauth: Arc<SpotifyOAuth>,
     /// Pending device-code pairings keyed by Discord user; notifying cancels
@@ -91,401 +84,25 @@ struct Handler {
     /// `spotify::session`. `switch_active_session`/`handle_logout`/
     /// `teardown_playback_session` are its only callers.
     supervisor: SessionSupervisor,
-    track_handle: Arc<Mutex<Option<TrackHandle>>>,
     ctx: Arc<Mutex<Option<Context>>>,
     /// The UI task's mailbox. `None` until `ready()`'s first pass spawns
     /// the task (see `ui::spawn`); every send site resolves it fresh via
     /// `.lock().clone()`, mirroring `ctx` above.
     ui_tx: Arc<Mutex<Option<mpsc::UnboundedSender<UiMsg>>>>,
     /// The player actor's mailbox: every playback-affecting command (/play,
-    /// /queue media, /skip, /stop, ⏯, ⏮, /np) and event (transport, media
-    /// end, voice) funnels through it, so decide-then-act is serialized.
+    /// /queue, /skip, /stop, ⏯, ⏮, /np) and event (transport, media end,
+    /// voice) funnels through it, so decide-then-act is serialized. The
+    /// actor owns all playback state — anything here that needs it asks via
+    /// `query()`.
     player: PlayerHandle,
-    // YouTube/file playback fields
+    /// The same ensure-voice dispatch the actor's `JoinVoice` effect runs
+    /// (a no-op when a call already exists), for the session-switch path.
+    join_voice: JoinVoiceFn,
     ytdlp_available: bool,
-    priority_queue: Arc<Mutex<PriorityQueue>>,
-    spirc_cmd_tx: Arc<Mutex<Option<mpsc::UnboundedSender<SpircCommand>>>>,
-    /// The media item currently being fed, written by the actor's media
-    /// runner. C3-transitional: the presence loop and the teardown checks
-    /// still read it; the actor's own `Active::Media` supersedes it in C5.
-    active_priority_item: Arc<Mutex<Option<QueueItem>>>,
-    feeder_cancel: Arc<Mutex<Option<CancellationToken>>>,
-    dj: Arc<DJAnnouncer>,
     announce_enabled: Arc<AtomicBool>,
-    /// Metadata of the current Spotify track, kept fresh by the presence
-    /// loop so /np can answer for the Spotify baseline too.
-    last_spotify_meta: Arc<Mutex<Option<SpotifyTrackInfo>>>,
-    /// The Spotify baseline session's playback state, kept fresh by the
-    /// presence loop so /queue, the queue listing, and the Spotify enqueue
-    /// path can read it without a Web API call.
-    spotify_state: Arc<Mutex<SpotifyState>>,
     /// Last /play per user, for the metadata-probe cooldown.
     play_cooldowns: Arc<Mutex<HashMap<u64, Instant>>>,
     auto_start_attempted: AtomicBool,
-    /// The Spotify track (if any) already pre-armed via `AddToQueue` —
-    /// found anywhere in `priority_queue`, not just at the head — for
-    /// gap-free radio-rules handoff. See `try_arm_first_spotify`/
-    /// `head_action`. `None` when nothing is armed.
-    armed_spotify: Arc<Mutex<Option<SpotifyUri>>>,
-}
-
-/// The Spotify Connect baseline session's playback state, as last reported by
-/// a `PresenceUpdate`.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum SpotifyState {
-    Idle,
-    Playing,
-    Paused,
-}
-
-// --- Unified-queue head decision table (see PORT.md decision #15) ---
-
-/// What sits at the head of the priority queue: a Spotify track (and
-/// whether it's already pre-armed via `AddToQueue`), a media (YouTube/file)
-/// item, or nothing.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum HeadKind {
-    Spotify { armed: bool },
-    Media,
-    Empty,
-}
-
-/// What provoked a `head_action`/`Handler::reconcile` check.
-/// Only `Enqueue` and `PlayButton` are still produced by live code — the
-/// player actor owns the skip/track-end/media-end boundaries now — but the
-/// full decision table (and its tests) stays intact until reconcile
-/// dissolves into the actor in C5.
-#[allow(dead_code)]
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Trigger {
-    /// A `/play` or `/queue` push landed a new item (possibly at the head).
-    Enqueue,
-    /// The Spotify baseline's own `EndOfTrack` fired.
-    TrackEnd,
-    /// A priority-queue drain (YouTube/file item) just finished.
-    MediaEnd,
-    /// ⏭ / `/skip` with no media item actively playing.
-    Skip,
-    /// ▶ pressed while the Spotify baseline isn't playing.
-    PlayButton,
-}
-
-/// What `Handler::reconcile` should do about the current queue head.
-///
-/// "Radio rules": tracks play in strict bot-queue order regardless of
-/// source, the bot never sends `SpircCommand::Next` except on an explicit
-/// user skip, and Spotify never plays over an active media item. The
-/// mechanism is arming the *first* Spotify item anywhere in the queue (not
-/// just the head) once Spotify is confirmed playing: `AddToQueue` puts it
-/// on librespot's own auto-advance, which then lands on it whenever
-/// whatever's ahead of it (in our queue, media or otherwise) finishes —
-/// paused at 0:00 if a media item got there first, since media playback
-/// pauses the Spotify baseline while it runs.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum HeadAction {
-    /// Pre-arm the first Spotify item anywhere in the queue via
-    /// `AddToQueue` (see `try_arm_first_spotify`).
-    Arm,
-    /// Queue the first un-armed Spotify item behind Spotify's current
-    /// context (`AddToQueue`, no `Next`) and mark it armed (see
-    /// `queue_behind_current`). Never pops — its own `Playing` event does.
-    QueueBehindCurrent,
-    /// `QueueBehindCurrent`, then resume the Spotify baseline (`Play`) —
-    /// only if it was playing before whatever just triggered this.
-    QueueThenResume,
-    /// `QueueBehindCurrent`, then skip straight to it (`Next`).
-    QueueThenNext,
-    /// `Load` the head now (Spotify is idle — no context to lose).
-    Load,
-    /// Run/continue a priority-queue drain of the media item at the head.
-    Drain,
-    /// Send `SpircCommand::Next` (so Spotify also leaves whatever it's on),
-    /// then run/continue a drain of the media item at the head.
-    NextThenDrain,
-    /// Resume the Spotify baseline (`Play`).
-    ResumeSpotify,
-    /// Skip to the already-armed track (`Next`).
-    NextSpotify,
-    /// Nothing to do.
-    Nothing,
-}
-
-/// Pure decision table mapping the queue head, the Spotify baseline's
-/// playback state, whether a media item is mid-playback, and what triggered
-/// the check, to the action to take. This is the single place unified-queue
-/// ordering behaviour is decided — every playback-affecting command and
-/// event funnels through it via `Handler::reconcile` (or the free-fn
-/// equivalents used where `&self` isn't available).
-fn head_action(head: HeadKind, spotify: SpotifyState, media_active: bool, trigger: Trigger) -> HeadAction {
-    use HeadAction::*;
-    match (trigger, head) {
-        // Arm is a no-op (via try_arm_first_spotify) when there's nothing
-        // un-armed to arm, so this doesn't need to inspect the head at all.
-        (Trigger::Enqueue, _) => {
-            if spotify == SpotifyState::Playing && !media_active { Arm } else { Nothing }
-        }
-
-        (Trigger::TrackEnd, _) if media_active => Nothing,
-        (Trigger::TrackEnd, HeadKind::Spotify { armed: true }) => Nothing,
-        (Trigger::TrackEnd, HeadKind::Spotify { armed: false }) => QueueBehindCurrent,
-        (Trigger::TrackEnd, HeadKind::Media) => Drain,
-        (Trigger::TrackEnd, HeadKind::Empty) => Nothing,
-
-        (Trigger::MediaEnd, HeadKind::Spotify { armed: true }) => ResumeSpotify,
-        (Trigger::MediaEnd, HeadKind::Spotify { armed: false }) => {
-            if spotify == SpotifyState::Idle { Load } else { QueueThenResume }
-        }
-        (Trigger::MediaEnd, HeadKind::Media) => Nothing,
-        (Trigger::MediaEnd, HeadKind::Empty) => Nothing,
-
-        (Trigger::Skip, HeadKind::Spotify { armed: true }) => NextSpotify,
-        (Trigger::Skip, HeadKind::Spotify { armed: false }) => QueueThenNext,
-        (Trigger::Skip, HeadKind::Media) => NextThenDrain,
-        (Trigger::Skip, HeadKind::Empty) => NextSpotify,
-
-        (Trigger::PlayButton, HeadKind::Spotify { armed: true }) => ResumeSpotify,
-        (Trigger::PlayButton, HeadKind::Spotify { armed: false }) => {
-            if spotify == SpotifyState::Idle { Load } else { QueueThenResume }
-        }
-        (Trigger::PlayButton, HeadKind::Media) => Drain,
-        (Trigger::PlayButton, HeadKind::Empty) => ResumeSpotify,
-    }
-}
-
-#[cfg(test)]
-mod head_action_tests {
-    use super::{head_action, HeadAction, HeadKind, SpotifyState, Trigger};
-
-    const PLAYING: SpotifyState = SpotifyState::Playing;
-    const PAUSED: SpotifyState = SpotifyState::Paused;
-    const IDLE: SpotifyState = SpotifyState::Idle;
-    const SPOT_ARMED: HeadKind = HeadKind::Spotify { armed: true };
-    const SPOT_UNARMED: HeadKind = HeadKind::Spotify { armed: false };
-
-    #[test]
-    fn enqueue_arms_while_spotify_is_playing_regardless_of_head() {
-        // Arm looks anywhere in the queue for the first un-armed Spotify
-        // item (and is a no-op if there isn't one), so this trigger doesn't
-        // need to inspect the head kind at all.
-        assert_eq!(head_action(SPOT_UNARMED, PLAYING, false, Trigger::Enqueue), HeadAction::Arm);
-        assert_eq!(head_action(SPOT_ARMED, PLAYING, false, Trigger::Enqueue), HeadAction::Arm);
-        assert_eq!(head_action(HeadKind::Media, PLAYING, false, Trigger::Enqueue), HeadAction::Arm);
-        assert_eq!(head_action(HeadKind::Empty, PLAYING, false, Trigger::Enqueue), HeadAction::Arm);
-    }
-
-    #[test]
-    fn enqueue_never_arms_while_media_is_active() {
-        assert_eq!(head_action(SPOT_UNARMED, PLAYING, true, Trigger::Enqueue), HeadAction::Nothing);
-    }
-
-    #[test]
-    fn enqueue_does_nothing_unless_spotify_is_playing() {
-        assert_eq!(head_action(SPOT_UNARMED, PAUSED, false, Trigger::Enqueue), HeadAction::Nothing);
-        assert_eq!(head_action(SPOT_UNARMED, IDLE, false, Trigger::Enqueue), HeadAction::Nothing);
-    }
-
-    #[test]
-    fn track_end_leaves_an_armed_spotify_head_alone() {
-        assert_eq!(head_action(SPOT_ARMED, PLAYING, false, Trigger::TrackEnd), HeadAction::Nothing);
-    }
-
-    #[test]
-    fn track_end_queues_behind_current_for_an_unarmed_spotify_head() {
-        assert_eq!(head_action(SPOT_UNARMED, PAUSED, false, Trigger::TrackEnd), HeadAction::QueueBehindCurrent);
-    }
-
-    #[test]
-    fn track_end_drains_a_media_head() {
-        assert_eq!(head_action(HeadKind::Media, PLAYING, false, Trigger::TrackEnd), HeadAction::Drain);
-    }
-
-    #[test]
-    fn track_end_does_nothing_while_media_is_active_racing_a_drain() {
-        assert_eq!(head_action(SPOT_UNARMED, PLAYING, true, Trigger::TrackEnd), HeadAction::Nothing);
-        assert_eq!(head_action(HeadKind::Media, PLAYING, true, Trigger::TrackEnd), HeadAction::Nothing);
-    }
-
-    #[test]
-    fn track_end_does_nothing_on_an_empty_queue() {
-        assert_eq!(head_action(HeadKind::Empty, PLAYING, false, Trigger::TrackEnd), HeadAction::Nothing);
-    }
-
-    #[test]
-    fn media_end_resumes_an_armed_spotify_head() {
-        assert_eq!(head_action(SPOT_ARMED, PAUSED, false, Trigger::MediaEnd), HeadAction::ResumeSpotify);
-    }
-
-    #[test]
-    fn media_end_queues_behind_current_for_an_unarmed_spotify_head_when_not_idle() {
-        assert_eq!(head_action(SPOT_UNARMED, PAUSED, false, Trigger::MediaEnd), HeadAction::QueueThenResume);
-    }
-
-    #[test]
-    fn media_end_loads_an_unarmed_spotify_head_while_idle() {
-        assert_eq!(head_action(SPOT_UNARMED, IDLE, false, Trigger::MediaEnd), HeadAction::Load);
-    }
-
-    #[test]
-    fn media_end_does_nothing_on_an_empty_queue() {
-        assert_eq!(head_action(HeadKind::Empty, PLAYING, false, Trigger::MediaEnd), HeadAction::Nothing);
-    }
-
-    #[test]
-    fn skip_jumps_to_an_armed_spotify_head() {
-        assert_eq!(head_action(SPOT_ARMED, PLAYING, false, Trigger::Skip), HeadAction::NextSpotify);
-    }
-
-    #[test]
-    fn skip_queues_behind_current_then_skips_an_unarmed_spotify_head() {
-        assert_eq!(head_action(SPOT_UNARMED, PLAYING, false, Trigger::Skip), HeadAction::QueueThenNext);
-    }
-
-    #[test]
-    fn skip_sends_next_then_drains_a_media_head() {
-        assert_eq!(head_action(HeadKind::Media, PLAYING, false, Trigger::Skip), HeadAction::NextThenDrain);
-    }
-
-    #[test]
-    fn skip_on_an_empty_queue_skips_the_spotify_baseline() {
-        assert_eq!(head_action(HeadKind::Empty, PLAYING, false, Trigger::Skip), HeadAction::NextSpotify);
-    }
-
-    #[test]
-    fn play_button_resumes_an_armed_spotify_head() {
-        assert_eq!(head_action(SPOT_ARMED, PAUSED, false, Trigger::PlayButton), HeadAction::ResumeSpotify);
-    }
-
-    #[test]
-    fn play_button_loads_an_unarmed_spotify_head_while_idle() {
-        assert_eq!(head_action(SPOT_UNARMED, IDLE, false, Trigger::PlayButton), HeadAction::Load);
-    }
-
-    #[test]
-    fn play_button_never_hijacks_a_paused_baseline() {
-        assert_eq!(head_action(SPOT_UNARMED, PAUSED, false, Trigger::PlayButton), HeadAction::QueueThenResume);
-    }
-
-    #[test]
-    fn play_button_drains_a_media_head() {
-        assert_eq!(head_action(HeadKind::Media, PAUSED, false, Trigger::PlayButton), HeadAction::Drain);
-    }
-
-    #[test]
-    fn play_button_on_an_empty_queue_resumes_the_baseline() {
-        assert_eq!(head_action(HeadKind::Empty, PAUSED, false, Trigger::PlayButton), HeadAction::ResumeSpotify);
-    }
-}
-
-/// Classifies the current head of `priority_queue` into a `HeadKind`,
-/// comparing a Spotify head's URI against `armed` to decide `armed: bool`
-/// (whether this particular head item is the one currently armed — armed
-/// itself can sit anywhere else in the queue). Locks `armed` first, then
-/// `priority_queue` — same order as `try_arm_first_spotify`/
-/// `queue_behind_current`, and never holds both at once.
-fn classify_head(priority_queue: &Mutex<PriorityQueue>, armed: &Mutex<Option<SpotifyUri>>) -> HeadKind {
-    let armed_uri = { armed.lock().clone() };
-    let lock = priority_queue.lock();
-    match lock.peek() {
-        None => HeadKind::Empty,
-        Some(item) => match &item.source {
-            MediaSource::Spotify { uri, .. } => HeadKind::Spotify { armed: armed_uri.as_ref() == Some(uri) },
-            _ => HeadKind::Media,
-        },
-    }
-}
-
-/// Finds the first Spotify item anywhere in `priority_queue` and returns
-/// its URI. Shared by `try_arm_first_spotify` and `queue_behind_current` —
-/// both only ever call this while `armed` is confirmed `None`, so "first
-/// Spotify item" and "first un-armed Spotify item" coincide. Caller must
-/// already hold `priority_queue`'s lock (passed in as `lock` to avoid
-/// re-entrant locking).
-fn first_spotify_uri(lock: &PriorityQueue) -> Option<SpotifyUri> {
-    lock.find_first(|item| matches!(item.source, MediaSource::Spotify { .. }))
-        .and_then(|item| match &item.source {
-            MediaSource::Spotify { uri, .. } => Some(uri.clone()),
-            _ => None,
-        })
-}
-
-/// The armed-head critical section (invariant: an armed track is never
-/// `AddToQueue`'d again). If nothing is currently armed, Spotify is
-/// playing, and no media item is mid-playback, arms the first Spotify item
-/// anywhere in the queue: `AddToQueue`s it onto Spotify's own device queue
-/// and remembers it as armed, so librespot's auto-advance lands on it once
-/// everything ahead of it in our queue (media items included) is done.
-/// Returns whether it armed something.
-///
-/// Lock order: `armed` first, then `priority_queue` — callers must not
-/// already hold `priority_queue` when calling this.
-fn try_arm_first_spotify(
-    priority_queue: &Mutex<PriorityQueue>,
-    armed: &Mutex<Option<SpotifyUri>>,
-    spirc_tx: Option<&mpsc::UnboundedSender<SpircCommand>>,
-    spotify: SpotifyState,
-    media_active: bool,
-) -> bool {
-    let mut armed_lock = armed.lock();
-    if armed_lock.is_some() || spotify != SpotifyState::Playing || media_active {
-        return false;
-    }
-    let tx = match spirc_tx {
-        Some(tx) => tx,
-        None => return false,
-    };
-    let uri = {
-        let queue_lock = priority_queue.lock();
-        first_spotify_uri(&queue_lock)
-    };
-    let uri = match uri {
-        Some(u) => u,
-        None => return false,
-    };
-    if tx.send(SpircCommand::AddToQueue(uri.clone())).is_err() {
-        return false;
-    }
-    *armed_lock = Some(uri);
-    true
-}
-
-/// `HeadAction::QueueBehindCurrent`: finds the first un-armed Spotify item
-/// anywhere in the queue and queues it behind whatever Spotify's device is
-/// currently on (`AddToQueue`, never `Next` — that's how this never plays
-/// over an active media item or interrupts a mid-play Spotify track), then
-/// marks it armed so it isn't queued twice. Never pops it: its own
-/// `Playing` event does that once librespot's auto-advance reaches it.
-/// No-op if something is already armed or there's no live session. Free
-/// function (not a `Handler` method) so it's usable from contexts without
-/// `&self`, such as the presence loop.
-///
-/// Lock order: `armed` first, then `priority_queue` — callers must not
-/// already hold `priority_queue` when calling this.
-fn queue_behind_current(
-    priority_queue: &Mutex<PriorityQueue>,
-    armed: &Mutex<Option<SpotifyUri>>,
-    spirc_tx: Option<&mpsc::UnboundedSender<SpircCommand>>,
-) -> bool {
-    let mut armed_lock = armed.lock();
-    if armed_lock.is_some() {
-        return false;
-    }
-    let tx = match spirc_tx {
-        Some(tx) => tx,
-        None => return false,
-    };
-    let uri = {
-        let queue_lock = priority_queue.lock();
-        first_spotify_uri(&queue_lock)
-    };
-    let uri = match uri {
-        Some(u) => u,
-        None => return false,
-    };
-    if tx.send(SpircCommand::AddToQueue(uri.clone())).is_err() {
-        return false;
-    }
-    *armed_lock = Some(uri);
-    true
 }
 
 fn register_commands(ytdlp_available: bool) -> Vec<CreateCommand> {
@@ -667,71 +284,22 @@ fn classify_link(input: &str) -> LinkKind {
 
 // --- Player-actor wiring: transport shim, notices, voice join ---
 
-/// Derives the legacy `PresenceUpdate` the still-live presence loop expects
-/// from one `TransportEvent`, using `last_meta` (uri → title/artist/art,
-/// updated by `Playing`/`TrackChanged`) to fill in what `Paused` events
-/// don't carry. Returns `None` for events with no presence meaning. Pure,
-/// so the mapping is testable without a session.
-fn derive_presence(
-    ev: &TransportEvent,
-    last_meta: &mut Option<(String, TrackMeta)>,
-) -> Option<PresenceUpdate> {
-    match ev {
-        TransportEvent::Playing { uri, meta } => {
-            if let Some(meta) = meta {
-                *last_meta = Some((uri.to_string(), meta.clone()));
-            }
-            let (title, artist, album_art_url) = match (meta, &*last_meta) {
-                (Some(m), _) => (m.title.clone(), m.artist.clone(), m.album_art_url.clone()),
-                (None, Some((u, m))) if *u == uri.to_string() => {
-                    (m.title.clone(), m.artist.clone(), m.album_art_url.clone())
-                }
-                _ => ("Unknown track".to_string(), "Unknown artist".to_string(), None),
-            };
-            Some(PresenceUpdate::Playing { title, artist, track_id: uri.to_id(), album_art_url })
-        }
-        TransportEvent::Paused { uri } => {
-            let (title, artist) = match &*last_meta {
-                Some((u, m)) if *u == uri.to_string() => (m.title.clone(), m.artist.clone()),
-                _ => ("Unknown track".to_string(), "Unknown artist".to_string()),
-            };
-            Some(PresenceUpdate::Paused { title, artist, track_id: uri.to_id() })
-        }
-        TransportEvent::Stopped | TransportEvent::EndOfTrack | TransportEvent::Unavailable { .. } => {
-            Some(PresenceUpdate::Idle)
-        }
-        TransportEvent::TrackChanged { uri, meta } => {
-            *last_meta = Some((uri.to_string(), meta.clone()));
-            None
-        }
-        TransportEvent::SetQueue { .. }
-        | TransportEvent::SessionConnected
-        | TransportEvent::SessionDisconnected => None,
-    }
-}
-
 /// Transport shim: one long-lived event stream out of every generation of
 /// librespot session (the sender lives in the `SessionSupervisor`, spawned
-/// once at startup — lifecycle (A), not per-login), fanned out to two
-/// consumers — the legacy presence loop (via the derived `PresenceUpdate`)
-/// and the player actor (via `Input::Transport`). Because the channel now
-/// outlives any one session, the generation to stamp on each event is read
-/// fresh off `link_up` (written by each session's own task without taking
-/// the supervisor's lock — see `spotify::session`) rather than fixed at
-/// spawn time; `unwrap_or(0)` only matters for a stray event racing a
+/// once at startup — lifecycle (A), not per-login), forwarded to the player
+/// actor as `Input::Transport`. Because the channel outlives any one
+/// session, the generation to stamp on each event is read fresh off
+/// `link_up` (written by each session's own task without taking the
+/// supervisor's lock — see `spotify::session`) rather than fixed at spawn
+/// time; `unwrap_or(0)` only matters for a stray event racing a
 /// link-down-to-link-up transition; the actor's own `link_gen` check is
 /// still what makes a mistagged straggler harmless.
 async fn transport_shim(
     mut rx: mpsc::UnboundedReceiver<TransportEvent>,
-    presence_tx: mpsc::UnboundedSender<PresenceUpdate>,
     player: PlayerHandle,
     link_up: watch::Receiver<Option<u64>>,
 ) {
-    let mut last_meta: Option<(String, TrackMeta)> = None;
     while let Some(ev) = rx.recv().await {
-        if let Some(update) = derive_presence(&ev, &mut last_meta) {
-            let _ = presence_tx.send(update);
-        }
         let gen = link_up.borrow().unwrap_or(0);
         player.send(PlayerInput::Transport { gen, ev });
     }
@@ -832,209 +400,6 @@ async fn join_voice_inner(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn run_presence_loop_with_track(
-    ctx: Context,
-    mut rx: mpsc::UnboundedReceiver<PresenceUpdate>,
-    track_handle_store: Arc<Mutex<Option<TrackHandle>>>,
-    active_session: Arc<Mutex<Option<ActiveSession>>>,
-    ui_tx: Option<mpsc::UnboundedSender<UiMsg>>,
-    dj: Arc<DJAnnouncer>,
-    announce_enabled: Arc<AtomicBool>,
-    bridge: Arc<AudioBridge>,
-    active_priority_item: Arc<Mutex<Option<QueueItem>>>,
-    last_meta_store: Arc<Mutex<Option<SpotifyTrackInfo>>>,
-    spotify_state: Arc<Mutex<SpotifyState>>,
-    priority_queue: Arc<Mutex<PriorityQueue>>,
-    armed_spotify: Arc<Mutex<Option<SpotifyUri>>>,
-    spirc_cmd_tx: Arc<Mutex<Option<mpsc::UnboundedSender<SpircCommand>>>>,
-) {
-    let (fwd_tx, fwd_rx) = mpsc::unbounded_channel::<PresenceUpdate>();
-    let ctx_presence = ctx.clone();
-    tokio::spawn(async move {
-        run_presence_loop(ctx_presence, fwd_rx).await;
-    });
-
-    let mut last_track_key: Option<String> = None;
-    let mut is_paused: bool = false;
-
-    while let Some(update) = rx.recv().await {
-        let _ = fwd_tx.send(update.clone());
-
-        {
-            // The bridge-reader track is shared with priority (YouTube/file)
-            // playback. Only pause it on Spotify pause/idle when no priority
-            // item is active — otherwise we'd starve the feeder's audio.
-            let priority_active = {
-                let lock = active_priority_item.lock();
-                lock.is_some()
-            };
-            let lock = track_handle_store.lock();
-            if let Some(handle) = lock.as_ref() {
-                match &update {
-                    PresenceUpdate::Playing { .. } => { let _ = handle.play(); }
-                    PresenceUpdate::Paused { .. } | PresenceUpdate::Idle => {
-                        if !priority_active { let _ = handle.pause(); }
-                    }
-                }
-            }
-        }
-
-        let was_paused = is_paused;
-        match &update {
-            PresenceUpdate::Paused { .. } => { is_paused = true; }
-            PresenceUpdate::Playing { .. } => { is_paused = false; }
-            _ => {}
-        }
-        if was_paused != is_paused {
-            if let Some(tx) = &ui_tx {
-                let _ = tx.send(UiMsg::Buttons { paused: is_paused });
-            }
-        }
-
-        // Keep the shared playback state in sync with every update, not only
-        // the ones that flip the controls buttons — /np, /queue, and the
-        // control buttons all read it directly.
-        {
-            let new_state = match &update {
-                PresenceUpdate::Idle => SpotifyState::Idle,
-                PresenceUpdate::Paused { .. } => SpotifyState::Paused,
-                PresenceUpdate::Playing { .. } => SpotifyState::Playing,
-            };
-            let mut lock = spotify_state.lock();
-            *lock = new_state;
-        }
-
-        // Armed-head bookkeeping: on every Playing event, if it matches the
-        // track we pre-armed (librespot's auto-advance landed on it — it
-        // can be anywhere in the queue, not just the head, hence
-        // `remove_first` rather than a head-only pop), remove it from our
-        // queue and clear armed. Then: if a media item is actively playing,
-        // Spotify must not play over it under radio rules — pause it back
-        // down (the actor's media-end boundary resumes it once the queue
-        // clears);
-        // otherwise try to arm whatever the first un-armed Spotify item now
-        // is, so chained Spotify items (and a DJ resuming a paused queue
-        // from their phone) stay gap-free. Idle means Spotify's own device
-        // queue is gone, so nothing is armed anymore.
-        // Only `Playing` needs bookkeeping here. `Idle` deliberately does
-        // not clear the armed track: librespot emits it at every track
-        // boundary (EndOfTrack), so clearing it here would forget a track
-        // already sitting in Spotify's queue and queue it a second time.
-        // Session teardown (login/logout/forget/stop) clears it instead.
-        if let PresenceUpdate::Playing { track_id, .. } = &update {
-            {
-                // Spotify reporting a track we hold is authoritative: it is
-                // playing, so it leaves our queue — whether or not it is
-                // still the armed one. The pop must not depend on that
-                // bookkeeping surviving, since a missed pop leaves the item
-                // queued and it gets handed to Spotify again, playing twice.
-                let mut armed_lock = armed_spotify.lock();
-                if armed_lock.as_ref().map(|u| u.to_id()).as_deref() == Some(track_id.as_str()) {
-                    *armed_lock = None;
-                }
-                let mut lock = priority_queue.lock();
-                lock.remove_first(|item| matches!(&item.source, MediaSource::Spotify { uri, .. } if uri.to_id() == *track_id));
-            }
-            let media_active = { active_priority_item.lock().is_some() };
-            let tx = { spirc_cmd_tx.lock().clone() };
-            if media_active {
-                if let Some(tx) = &tx {
-                    let _ = tx.send(SpircCommand::Pause);
-                }
-                // This Playing never reached the listeners — no card, no
-                // history, and no dedup key, so the track's real start
-                // (after the queue clears) posts normally.
-                continue;
-            }
-            try_arm_first_spotify(&priority_queue, &armed_spotify, tx.as_ref(), SpotifyState::Playing, media_active);
-        }
-
-        if let PresenceUpdate::Playing { title, artist, track_id, album_art_url } = &update {
-            // Dedup on the track id (stable across replays of the same title);
-            // fall back to title — artist only when the id is missing.
-            let track_key = if track_id.is_empty() {
-                format!("{} — {}", title, artist)
-            } else {
-                track_id.clone()
-            };
-            if last_track_key.as_deref() != Some(&track_key) {
-                last_track_key = Some(track_key.clone());
-
-                let spotify_name = {
-                    let lock = active_session.lock();
-                    lock.as_ref().map(|s| s.discord_name.clone()).unwrap_or_default()
-                };
-
-                // Metadata now comes straight from the librespot session
-                // (the PresenceUpdate); there is no Web API fallback fetch.
-                let meta = SpotifyTrackInfo {
-                    title: title.clone(),
-                    artist: artist.clone(),
-                    album_art_url: album_art_url.clone(),
-                };
-
-                if let Some(tx) = &ui_tx {
-                    let _ = tx.send(UiMsg::NowPlaying(CardView::Spotify {
-                        title: title.clone(),
-                        artist: artist.clone(),
-                        track_id: track_id.clone(),
-                        album_art_url: album_art_url.clone(),
-                        dj_name: spotify_name,
-                    }));
-                }
-
-                {
-                    let mut lock = last_meta_store.lock();
-                    *lock = Some(meta);
-                }
-
-                // DJ announcement AFTER embed (non-blocking, only if enabled)
-                if announce_enabled.load(Ordering::Relaxed) {
-                let dj_title = title.clone();
-                let dj_artist = artist.clone();
-                let dj_ref = dj.clone();
-                let bridge_ref = bridge.clone();
-                tokio::spawn(async move {
-                    match dj_ref.track_announce_clip(&dj_title, &dj_artist, "").await {
-                        Some(clip) => {
-                            tracing::info!(title = %dj_title, artist = %dj_artist, samples = clip.len(), "DJ overlay pushed");
-                            bridge_ref.push_overlay(&clip);
-                        }
-                        None => {
-                            tracing::warn!(title = %dj_title, artist = %dj_artist, "DJ clip failed");
-                        }
-                    }
-                });
-                } // end announce_enabled check
-            }
-        } else if matches!(update, PresenceUpdate::Idle | PresenceUpdate::Paused { .. }) {
-            // Idle means nothing is loaded — clear the dedup key so the next
-            // track always posts a fresh card, and drop the stale metadata so
-            // /np and /queue don't describe a track that finished. A pause
-            // keeps both: resuming the same track is not a track change and
-            // must not repost history or the controls.
-            if matches!(update, PresenceUpdate::Idle) {
-                last_track_key = None;
-                let mut lock = last_meta_store.lock();
-                *lock = None;
-            }
-            // A session that comes up already paused (bot restart mid-pause)
-            // never sends Playing, so /np would show nothing — seed it here.
-            if let PresenceUpdate::Paused { title, artist, track_id: _ } = &update {
-                let mut lock = last_meta_store.lock();
-                if lock.is_none() {
-                    *lock = Some(SpotifyTrackInfo {
-                        title: title.clone(),
-                        artist: artist.clone(),
-                        album_art_url: None,
-                    });
-                }
-            }
-        }
-    }
-}
-
 #[async_trait]
 impl EventHandler for Handler {
     async fn ready(&self, ctx: Context, ready: Ready) {
@@ -1072,34 +437,14 @@ impl EventHandler for Handler {
             presence_rx.take()
         };
         if let Some(rx) = rx_taken {
-            let ctx_presence = ctx.clone();
-            let track_handle_store = self.track_handle.clone();
-            let active_session = self.active_session.clone();
-            let ui_tx = { self.ui_tx.lock().clone() };
-            let dj_presence = self.dj.clone();
-            let bridge_presence = self.bridge.clone();
-            let announce_presence = self.announce_enabled.clone();
-            let priority_item = self.active_priority_item.clone();
-            let last_meta_store = self.last_spotify_meta.clone();
-            let spotify_state = self.spotify_state.clone();
-            let priority_queue_presence = self.priority_queue.clone();
-            let armed_spotify_presence = self.armed_spotify.clone();
-            let spirc_cmd_tx_presence = self.spirc_cmd_tx.clone();
-            tokio::spawn(async move {
-                run_presence_loop_with_track(
-                    ctx_presence, rx, track_handle_store, active_session,
-                    ui_tx,
-                    dj_presence, announce_presence,
-                    bridge_presence, priority_item,
-                    last_meta_store, spotify_state,
-                    priority_queue_presence, armed_spotify_presence, spirc_cmd_tx_presence,
-                ).await;
-            });
+            // The status task: renders the actor-fed `PresenceUpdate`s as
+            // the bot's Discord activity line.
+            tokio::spawn(run_presence_loop(ctx.clone(), rx));
         }
 
         // Auto-start: replay the stored active user's session through the same
-        // machinery /login uses (voice join, controls, priority queue, refresh
-        // loop). Runs only on the first ready (see `first_ready` above).
+        // machinery /login uses (voice join, controls, refresh loop). Runs
+        // only on the first ready (see `first_ready` above).
         if first_ready {
             self.auto_start_stored_session().await;
         }
@@ -1121,11 +466,9 @@ impl EventHandler for Handler {
                         let lock = self.active_session.lock();
                         lock.is_some()
                     };
-                    let priority = {
-                        let lock = self.active_priority_item.lock();
-                        lock.is_some()
-                    };
-                    session || priority
+                    let playback =
+                        !matches!(self.player.query().await.now, NowPlaying::Nothing);
+                    session || playback
                 };
                 if anything_active {
                     tracing::info!("bot disconnected from voice — tearing down playback");
@@ -1195,7 +538,7 @@ impl EventHandler for Handler {
                 // a playing baseline, or starts/resumes whatever is next.
                 "ctrl_pause_toggle" => self.player.toggle_pause().await,
                 "ctrl_queue_hint" => {
-                    let content = self.format_queue_listing();
+                    let content = self.format_queue_listing().await;
 
                     let response = CreateInteractionResponse::Message(
                         CreateInteractionResponseMessage::new().content(content).ephemeral(true),
@@ -1309,7 +652,7 @@ impl EventHandler for Handler {
             "who" => self.handle_who().await,
             "skip" => self.player.skip().await,
             "stop" => self.player.stop().await,
-            "np" => self.player.query().await,
+            "np" => render_now_playing(&self.player.query().await.now),
             "announce" => self.handle_announce().await,
             _ => return,
         };
@@ -1346,6 +689,25 @@ fn voice_gate(
     }
 }
 
+/// Renders the actor's view of what's audible, for `/np` and the queue
+/// listing's status line. Follows the reply house style documented on
+/// `player::state`'s `reply`: `▶`/`⏸` for the transport state, track and
+/// user names in bold, one phrasing per state.
+fn render_now_playing(now: &NowPlaying) -> String {
+    match now {
+        NowPlaying::Nothing => "Nothing is playing right now.".to_string(),
+        NowPlaying::Media { title, subtitle, queued_by, paused } => {
+            let glyph = if *paused { "⏸" } else { "▶" };
+            format!("{glyph} **{title}** — {subtitle} · queued by **{queued_by}**")
+        }
+        NowPlaying::Spotify { title, artist, paused } => {
+            let glyph = if *paused { "⏸" } else { "▶" };
+            format!("{glyph} **{title}** — {artist}")
+        }
+        NowPlaying::SpotifyStarting => "▶ Starting Spotify playback…".to_string(),
+    }
+}
+
 impl Handler {
     /// The bot's and the given user's current voice channels, from the cache.
     fn voice_channels(&self, ctx: &Context, user_id: UserId) -> (Option<ChannelId>, Option<ChannelId>) {
@@ -1373,175 +735,60 @@ impl Handler {
         lock.as_ref().map(|s| s.discord_user_id)
     }
 
-    /// Whether audio is actively being produced right now: a priority
-    /// (YouTube/file) item, or the Spotify baseline reported as playing.
-    fn something_is_playing(&self) -> bool {
-        let priority_active = {
-            let lock = self.active_priority_item.lock();
-            lock.is_some()
-        };
-        priority_active || *self.spotify_state.lock() == SpotifyState::Playing
-    }
-
-    /// Whether a Spotify Connect session is live (able to accept commands),
-    /// regardless of its current playback state.
-    fn has_spotify_session(&self) -> bool {
-        self.spirc_cmd_tx.lock().is_some()
-    }
-
-    /// Resolves a Spotify track's title/artist/art through the live session
-    /// (`SpircCommand::Lookup`), returning `None` if there is no session or
-    /// the lookup itself fails — both cases the caller reports identically.
-    async fn lookup_spotify_track(&self, uri: &SpotifyUri) -> Option<(String, String, Option<String>)> {
-        let tx = { self.spirc_cmd_tx.lock().clone() }?;
-        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        if tx.send(SpircCommand::Lookup(uri.clone(), reply_tx)).is_err() {
-            return None;
-        }
-        match reply_rx.await {
-            Ok(Some(lookup)) => Some((lookup.title, lookup.artist, lookup.album_art_url)),
-            Ok(None) | Err(_) => None,
-        }
-    }
-
-    /// The Spotify-enqueue decision path (C3-transitional): classifies the
-    /// current queue head, looks up `head_action` for `trigger`, executes
-    /// it, and returns the reply text (if any) the caller should show the
-    /// user. Only the `/play`//`/queue` Spotify branches still call this —
-    /// every other command goes through the player actor — and they only
-    /// reach the `Enqueue` and `PlayButton` triggers; media starts (the
-    /// `Drain` arms) are delegated to the actor. Dissolves into the actor
-    /// in C5, when the core owns arm bookkeeping.
-    async fn reconcile(&self, trigger: Trigger, _requester_id: Option<u64>) -> Option<String> {
-        let head = classify_head(&self.priority_queue, &self.armed_spotify);
-        let spotify = *self.spotify_state.lock();
-        let media_active = { self.active_priority_item.lock().is_some() };
-        let action = head_action(head, spotify, media_active, trigger);
-        let spirc_tx = { self.spirc_cmd_tx.lock().clone() };
-
-        match action {
-            HeadAction::Nothing => None,
-            HeadAction::Arm => {
-                let armed = try_arm_first_spotify(&self.priority_queue, &self.armed_spotify, spirc_tx.as_ref(), spotify, media_active);
-                if armed {
-                    Some("Queued — plays after the current track.".to_string())
-                } else {
-                    None
-                }
-            }
-            HeadAction::Load => {
-                let popped = {
-                    let mut lock = self.priority_queue.lock();
-                    lock.pop_if(|item| matches!(item.source, MediaSource::Spotify { .. }))
-                };
-                if let Some(QueueItem { source: MediaSource::Spotify { uri, .. }, .. }) = popped {
-                    if let Some(tx) = &spirc_tx {
-                        let _ = tx.send(SpircCommand::Load(uri));
-                    }
-                }
-                Some("Playing now on Spotify.".to_string())
-            }
-            HeadAction::QueueBehindCurrent => {
-                queue_behind_current(&self.priority_queue, &self.armed_spotify, spirc_tx.as_ref());
-                None
-            }
-            HeadAction::QueueThenResume => {
-                queue_behind_current(&self.priority_queue, &self.armed_spotify, spirc_tx.as_ref());
-                // Reached only via PlayButton (the media-end boundary lives
-                // in the player actor now) — the button press itself is
-                // the explicit request to resume.
-                if let Some(tx) = &spirc_tx {
-                    let _ = tx.send(SpircCommand::Play);
-                }
-                None
-            }
-            HeadAction::QueueThenNext => {
-                queue_behind_current(&self.priority_queue, &self.armed_spotify, spirc_tx.as_ref());
-                if let Some(tx) = &spirc_tx {
-                    let _ = tx.send(SpircCommand::Next);
-                }
-                None
-            }
-            HeadAction::Drain => {
-                // Media starts belong to the actor. ▶ semantics start a
-                // media head when nothing holds the turn — exactly this
-                // arm's situation — so poke the actor with a play press and
-                // keep this path's own reply.
-                let _ = self.player.toggle_pause().await;
-                None
-            }
-            HeadAction::NextThenDrain => {
-                if let Some(tx) = &spirc_tx {
-                    let _ = tx.send(SpircCommand::Next);
-                }
-                let _ = self.player.toggle_pause().await;
-                None
-            }
-            HeadAction::ResumeSpotify => {
-                if let Some(tx) = &spirc_tx {
-                    let _ = tx.send(SpircCommand::Play);
-                }
-                None
-            }
-            HeadAction::NextSpotify => {
-                if let Some(tx) = &spirc_tx {
-                    let _ = tx.send(SpircCommand::Next);
-                }
-                None
-            }
-        }
-    }
-
     /// The queue listing shown by the `ctrl_queue_hint` button and by
-    /// `/queue` with no arguments: how to add tracks, the current Spotify
-    /// playback state, and the first few priority-queue items.
-    fn format_queue_listing(&self) -> String {
-        let has_session = self.has_spotify_session();
-        let pq_snapshot = {
-            let lock = self.priority_queue.lock();
-            lock.snapshot()
-        };
+    /// `/queue` with no arguments, rendered from the actor's
+    /// `PlayerSnapshot`: how to add tracks, what's audible right now, and
+    /// the first few queued items (with a `+N more` line for the rest).
+    async fn format_queue_listing(&self) -> String {
+        let snap = self.player.query().await;
         let mut lines = vec![];
-        if has_session {
+        if snap.link_up {
             lines.push("Use `/queue <spotify_url>` to add Spotify tracks.".to_string());
         }
         if self.ytdlp_available {
             lines.push("Use `/play <youtube_url>` to add YouTube tracks.".to_string());
         }
-        let spotify_line = match *self.spotify_state.lock() {
-            SpotifyState::Playing => "Spotify: playing",
-            SpotifyState::Paused => "Spotify: paused",
-            SpotifyState::Idle => "Spotify: idle",
-        };
-        lines.push(spotify_line.to_string());
-        if !pq_snapshot.is_empty() {
-            let armed_uri = { self.armed_spotify.lock().clone() };
-            lines.push(format!("\nPriority queue ({} item(s)):", pq_snapshot.len()));
-            for (i, item) in pq_snapshot.iter().enumerate().take(5) {
-                let line = match &item.source {
-                    MediaSource::Spotify { uri, title, artist, .. } => {
-                        let is_armed = armed_uri.as_ref() == Some(uri);
-                        let suffix = if is_armed { " ⏭ next on Spotify" } else { "" };
-                        format!("  {}. 🎵 **{}** — {}{}", i + 1, title, artist, suffix)
-                    }
-                    _ => {
-                        let duration = item.source.display_duration()
-                            .map(|d| format!(" ({d})"))
-                            .unwrap_or_default();
-                        format!("  {}. {}{} — queued by {}", i + 1, item.source.display_title(), duration, item.queued_by)
-                    }
-                };
-                lines.push(line);
+        lines.push(render_now_playing(&snap.now));
+        if snap.queue_len > 0 {
+            lines.push(format!("\nQueue ({} item(s)):", snap.queue_len));
+            for (i, entry) in snap.preview.iter().enumerate() {
+                let duration = entry
+                    .duration
+                    .as_ref()
+                    .map(|d| format!(" ({d})"))
+                    .unwrap_or_default();
+                let armed = if entry.armed { " ⏭ next on Spotify" } else { "" };
+                lines.push(format!(
+                    "  {}. **{}** — {}{} · queued by {}{}",
+                    i + 1,
+                    entry.title,
+                    entry.subtitle,
+                    duration,
+                    entry.queued_by,
+                    armed
+                ));
+            }
+            if snap.more > 0 {
+                lines.push(format!("  +{} more", snap.more));
             }
         }
         lines.join("\n")
     }
 
-    /// Full playback teardown: abort any Spotify session (deactivating its
-    /// owner), stop priority playback, reset presence and controls, and
-    /// optionally leave voice. Runs when the voice channel empties and when
-    /// the bot is force-disconnected.
+    /// Full playback teardown: silence the player (media cancelled, queue
+    /// cleared), abort any Spotify session (deactivating its owner), reset
+    /// the controls card, and optionally leave voice. Runs when the voice
+    /// channel empties and when the bot is force-disconnected.
     async fn teardown_playback_session(&self, ctx: &Context, leave_voice: bool) {
+        // VoiceLost first (mailbox order beats the runner's own cancel
+        // report): the actor drops any active media turn and stale-ifies
+        // the runner's coming `MediaEnded`. The awaited Stop then clears
+        // the queue before the supervisor's `LinkDown` lands, so nothing
+        // gets promoted into the emptying call, and the actor's own
+        // presence/status transitions cover the Idle update.
+        self.player.send(PlayerInput::VoiceLost);
+        let _ = self.player.stop().await;
+
         let owner = {
             let mut lock = self.active_session.lock();
             lock.take().map(|session| session.discord_user_id)
@@ -1550,15 +797,6 @@ impl Handler {
             self.supervisor.stop(owner).await;
             tracing::info!(user = owner, "aborted session (teardown)");
         }
-
-        // VoiceLost first (mailbox order beats the runner's own cancel
-        // report): the actor drops any active media turn and stale-ifies
-        // the runner's coming `MediaEnded`, so nothing tries to start the
-        // next item into a dead voice connection.
-        self.player.send(PlayerInput::VoiceLost);
-        self.stop_priority_playback();
-
-        let _ = self.presence_tx.send(PresenceUpdate::Idle);
 
         let tx = { self.ui_tx.lock().clone() };
         if let Some(tx) = tx {
@@ -1578,26 +816,6 @@ impl Handler {
         }
     }
 
-    /// Tear down priority (YouTube/file) playback: cancel any running feeder,
-    /// clear the queue, and clear the active item.
-    fn stop_priority_playback(&self) {
-        let token = {
-            let lock = self.feeder_cancel.lock();
-            lock.clone()
-        };
-        if let Some(t) = token {
-            t.cancel();
-        }
-        {
-            let mut lock = self.priority_queue.lock();
-            lock.clear();
-        }
-        {
-            let mut lock = self.active_priority_item.lock();
-            *lock = None;
-        }
-    }
-
     /// Whether a user may queue via /play: if the bot is already in a channel,
     /// they must share it (the control rule); if the bot is in no channel yet,
     /// they only need to be in one so the bot can follow them in.
@@ -1606,31 +824,11 @@ impl Handler {
         voice_gate(bot_ch, user_ch, true)
     }
 
-    /// Join the given user's voice channel (falling back to the configured
-    /// channel), self-deafen, unsuppress on stage channels, and start the
-    /// join-sound + bridge hookup. Returns whether the join succeeded.
-    /// Thin wrapper over `join_voice_inner` (shared with the player actor's
-    /// `JoinVoice` effect).
-    async fn join_voice_for_user(&self, discord_user_id: Option<u64>) -> bool {
-        join_voice_inner(
-            self.ctx.clone(),
-            self.guild_id,
-            self.channel_id,
-            self.bridge.clone(),
-            self.prebuffer_samples,
-            self.prebuffer_wait,
-            self.track_handle.clone(),
-            self.dj.clone(),
-            discord_user_id,
-        )
-        .await
-    }
-
     /// Ensure the bot is in a voice call, following `discord_user_id` in
-    /// when it has to join fresh — a no-op when a call already exists.
-    /// Unlike `join_voice_for_user`, this never replays the join sound or
-    /// re-hooks the bridge reader over a call that's already up, so a
-    /// session switch can't cut whatever media item is currently feeding it.
+    /// when it has to join fresh — a no-op when a call already exists, so a
+    /// session switch never replays the join sound or re-hooks the bridge
+    /// reader over a call that's already up (which would cut whatever media
+    /// item is currently feeding it).
     async fn ensure_voice_for_user(&self, discord_user_id: Option<u64>) -> bool {
         let ctx = { self.ctx.lock().clone() };
         if let Some(ctx) = &ctx {
@@ -1645,7 +843,7 @@ impl Handler {
         // reader to a new call — mirrors the old spawn_session's fixed
         // pre-join wait.
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        self.join_voice_for_user(discord_user_id).await
+        (self.join_voice)(discord_user_id).await
     }
 
     /// Restart the stored active user's Spotify session on boot, through the
@@ -1714,14 +912,9 @@ impl Handler {
     /// everything downstream of an account change: the DB's exclusive-active
     /// flag, the `/who`/takeover-gate display cache, the voice call (a no-op
     /// when one already exists), and the card's account name. Never touches
-    /// the queue, the feeder or the bridge reader — a media item already
-    /// playing keeps playing straight through a login. The only steps beyond
-    /// what the design calls out ("and then only" set_active_exclusive,
-    /// ensure-voice, `UiMsg::AccountChanged`) are updating this cache (so
-    /// `/who`/the takeover gate have something to read) and clearing
-    /// `armed_spotify` (the previous session's Spotify-side queue is gone
-    /// with it) — neither touches the queue, the feeder or the bridge
-    /// reader either.
+    /// the player — a media item already playing keeps playing straight
+    /// through a login, and the actor drops the replaced session's armed
+    /// track itself when the new session's `LinkUp` reaches it.
     async fn switch_active_session(
         &self,
         discord_user_id: u64,
@@ -1733,13 +926,6 @@ impl Handler {
         self.supervisor
             .switch(discord_user_id, discord_name.clone(), access_token, refresh_token, expires_in)
             .await;
-
-        // The previous session's Spotify-side device queue is gone with it —
-        // any armed track never plays, so stop treating it as armed.
-        {
-            let mut lock = self.armed_spotify.lock();
-            *lock = None;
-        }
 
         // Exactly one user stays active:true, so auto-start can't resurrect a
         // displaced user after a restart.
@@ -1779,7 +965,8 @@ impl Handler {
 
     /// Builds a `QueueItem` from a YouTube/SoundCloud URL (via yt-dlp
     /// metadata) or a file attachment (via extension/size validation). Not
-    /// used for Spotify links, which never enter the priority queue.
+    /// used for Spotify links, whose metadata resolves through the live
+    /// session (`PlayerHandle::lookup_spotify`) instead.
     async fn build_media_queue_item(
         url: Option<String>,
         attachment: Option<serenity::model::channel::Attachment>,
@@ -1844,47 +1031,41 @@ impl Handler {
         let discord_id = cmd.user.id.get();
 
         // Spotify track link: no yt-dlp probe, no cooldown — reply
-        // immediately instead of deferring. Goes into the same unified
-        // priority queue as YouTube/file items (PORT.md decision #15).
+        // immediately instead of deferring. Metadata resolves here in the
+        // handler task (never inside the actor); the actor then owns the
+        // enqueue-and-maybe-start decision and the reply.
         if let Some(url) = &url_arg {
             if let LinkKind::Spotify(spotify_uri) = classify_link(url) {
-                let reply = if !self.has_spotify_session() {
-                    "Run `/login` first.".to_string()
+                let reply = if !self.player.has_session() {
+                    "No Spotify session — run `/login` to connect.".to_string()
                 } else {
-                    match self.lookup_spotify_track(&spotify_uri).await {
-                        None => "Couldn't resolve that Spotify track.".to_string(),
+                    match self.player.lookup_spotify(&spotify_uri).await {
+                        None => "⚠️ Couldn't resolve that Spotify track — check the link and try again.".to_string(),
                         Some((title, artist, album_art_url)) => {
                             let item = QueueItem {
-                            item_id: 0,
+                                item_id: 0,
                                 source: MediaSource::Spotify { uri: spotify_uri, title, artist, album_art_url },
                                 queued_by: discord_name.clone(),
                                 queued_by_id: discord_id,
                             };
-                            let armed_head = { self.armed_spotify.lock().is_some() };
-                            let (accepted, queue_len) = {
-                                let mut lock = self.priority_queue.lock();
-                                let accepted = if next {
-                                    // An armed track is already on Spotify's
-                                    // own device queue and can't be
-                                    // un-queued — a "next" item lands right
-                                    // behind our queue's head instead of
-                                    // jumping it, so it still plays before
-                                    // the armed track's own turn comes up.
-                                    if armed_head { lock.insert(1, item) } else { lock.push_front(item) }
-                                } else {
-                                    lock.push(item)
-                                };
-                                (accepted, lock.len())
-                            };
-                            if !accepted {
-                                format!("Queue is full ({} items) — try again once some have played.", queue_len)
+                            let pos = if next {
+                                // An armed head is already on Spotify's own
+                                // device queue and can't be un-queued — a
+                                // "next" item lands right behind it instead
+                                // of jumping it, so the listing matches the
+                                // air order.
+                                let head_armed = self
+                                    .player
+                                    .query()
+                                    .await
+                                    .preview
+                                    .first()
+                                    .is_some_and(|entry| entry.armed);
+                                if head_armed { EnqueuePos::At(1) } else { EnqueuePos::Head }
                             } else {
-                                let trigger = if !self.something_is_playing() { Trigger::PlayButton } else { Trigger::Enqueue };
-                                match self.reconcile(trigger, Some(discord_id)).await {
-                                    Some(msg) => msg,
-                                    None => if next { "Playing next".to_string() } else { format!("Added to queue #{}", queue_len) },
-                                }
-                            }
+                                EnqueuePos::Tail
+                            };
+                            self.player.enqueue(item, pos, true).await
                         }
                     }
                 };
@@ -1944,7 +1125,7 @@ impl Handler {
         };
 
         // The actor owns the enqueue-and-maybe-start decision from here: it
-        // pushes into the shared queue, starts the head when nothing holds
+        // pushes into its owned queue, starts the head when nothing holds
         // the turn, and formats the reply.
         let reply = self
             .player
@@ -2193,17 +1374,11 @@ impl Handler {
                 *lock = None;
             }
             tracing::info!(user = %user_id, "active librespot session aborted");
-            // Does NOT touch priority (YouTube/file) playback — a session
-            // supervisor can't reach the queue, the feeder or the bridge
-            // reader (that restriction is the whole point of C4); a queued
-            // item keeps playing straight through a logout.
-            // The Spotify-side device queue dies with the session — an armed
-            // track never plays, so it's no longer armed.
-            {
-                let mut lock = self.armed_spotify.lock();
-                *lock = None;
-            }
-            let _ = self.presence_tx.send(PresenceUpdate::Idle);
+            // Does NOT touch playback directly — the supervisor's `stop`
+            // emits `LinkDown`, and the actor (the sole owner of the queue,
+            // the armed track and the status line) decides what a dead link
+            // means; a queued media item keeps playing straight through a
+            // logout.
             let tx = { self.ui_tx.lock().clone() };
             if let Some(tx) = tx {
                 let _ = tx.send(UiMsg::Idle { account: None });
@@ -2222,12 +1397,6 @@ impl Handler {
         // A pending device-code pairing for this user is now moot — cancel its poll.
         if let Some(cancel) = self.pending_auth.lock().remove(&user_id_u64) {
             cancel.notify_one();
-        }
-        // Whatever Spotify session that armed track belonged to is being
-        // forgotten — stop treating it as armed.
-        {
-            let mut lock = self.armed_spotify.lock();
-            *lock = None;
         }
 
         match self.user_store.remove(user_id) {
@@ -2248,11 +1417,10 @@ impl Handler {
         }
     }
 
-    /// `/queue`: adds to the queue without starting playback. A Spotify
-    /// track link goes to the Spotify queue directly (bypassing the
-    /// priority queue); a YouTube/SoundCloud URL or attachment is pushed
-    /// onto the priority queue's tail — never jumps the line, never starts
-    /// a drain. No arguments shows the current queue listing.
+    /// `/queue`: adds to the queue's tail without starting playback —
+    /// Spotify, YouTube/SoundCloud and attachments all land in the actor's
+    /// one unified queue (PORT.md decision #15), never jump the line, never
+    /// start playback. No arguments shows the current queue listing.
     async fn handle_queue(
         &self,
         cmd: &serenity::model::application::CommandInteraction,
@@ -2261,7 +1429,7 @@ impl Handler {
         let (url_arg, attachment_arg, _next) = Self::parse_play_queue_options(cmd);
 
         if url_arg.is_none() && attachment_arg.is_none() {
-            let content = self.format_queue_listing();
+            let content = self.format_queue_listing().await;
             let _ = cmd.create_response(ctx, CreateInteractionResponse::Message(
                 CreateInteractionResponseMessage::new().content(content).ephemeral(true)
             )).await;
@@ -2279,35 +1447,24 @@ impl Handler {
         let discord_name = cmd.user.global_name.clone().unwrap_or_else(|| cmd.user.name.clone());
         let discord_id = cmd.user.id.get();
 
-        // Spotify track link: goes on the same unified priority queue as
-        // YouTube/file items (PORT.md decision #15), no defer needed.
+        // Spotify track link: no yt-dlp probe, no defer needed. Metadata
+        // resolves here in the handler task (never inside the actor); the
+        // actor owns the tail push and the reply, with `start_if_idle` off.
         if let Some(url) = &url_arg {
             if let LinkKind::Spotify(spotify_uri) = classify_link(url) {
-                let reply = if !self.has_spotify_session() {
-                    "Run `/login` first.".to_string()
+                let reply = if !self.player.has_session() {
+                    "No Spotify session — run `/login` to connect.".to_string()
                 } else {
-                    match self.lookup_spotify_track(&spotify_uri).await {
-                        None => "Couldn't resolve that Spotify track.".to_string(),
+                    match self.player.lookup_spotify(&spotify_uri).await {
+                        None => "⚠️ Couldn't resolve that Spotify track — check the link and try again.".to_string(),
                         Some((title, artist, album_art_url)) => {
                             let item = QueueItem {
-                            item_id: 0,
+                                item_id: 0,
                                 source: MediaSource::Spotify { uri: spotify_uri, title, artist, album_art_url },
                                 queued_by: discord_name.clone(),
                                 queued_by_id: discord_id,
                             };
-                            let (accepted, queue_len) = {
-                                let mut lock = self.priority_queue.lock();
-                                let accepted = lock.push(item);
-                                (accepted, lock.len())
-                            };
-                            if !accepted {
-                                format!("Queue is full ({} items) — try again once some have played.", queue_len)
-                            } else {
-                                match self.reconcile(Trigger::Enqueue, None).await {
-                                    Some(msg) => msg,
-                                    None => format!("Added to queue #{}", queue_len),
-                                }
-                            }
+                            self.player.enqueue(item, EnqueuePos::Tail, false).await
                         }
                     }
                 };
@@ -2318,8 +1475,8 @@ impl Handler {
             }
         }
 
-        // YouTube/SoundCloud URL, or a file attachment: goes on the priority
-        // queue's tail via the same metadata probe /play uses.
+        // YouTube/SoundCloud URL, or a file attachment: goes on the queue's
+        // tail via the same metadata probe /play uses.
         if url_arg.is_some() && !self.ytdlp_available {
             let _ = cmd.create_response(ctx, CreateInteractionResponse::Message(
                 CreateInteractionResponseMessage::new()
@@ -2398,22 +1555,16 @@ impl DiscordBot {
         let dj = Arc::new(DJAnnouncer::new());
         let announce_persisted = user_store.get_setting("announce_enabled");
 
-        // Shared surfaces the player actor bridges to in C3 (queue and
-        // arming stay Handler-owned until C5; see `player::actor`), hoisted
-        // so both the actor's deps and the Handler hold the same `Arc`s.
+        // Cross-task seams shared between the actor's deps, the session
+        // supervisor and the Handler, hoisted so each holds the same `Arc`s.
         let guild_id = GuildId::new(config.discord_guild_id);
         let channel_id = ChannelId::new(config.discord_channel_id);
         let text_channel_id = ChannelId::new(config.discord_text_channel_id);
         let ctx_store: Arc<Mutex<Option<Context>>> = Arc::new(Mutex::new(None));
         let ui_tx_store: Arc<Mutex<Option<mpsc::UnboundedSender<UiMsg>>>> =
             Arc::new(Mutex::new(None));
-        let priority_queue = Arc::new(Mutex::new(PriorityQueue::new()));
-        let armed_spotify: Arc<Mutex<Option<SpotifyUri>>> = Arc::new(Mutex::new(None));
         let spirc_cmd_tx: Arc<Mutex<Option<mpsc::UnboundedSender<SpircCommand>>>> =
             Arc::new(Mutex::new(None));
-        let active_priority_item: Arc<Mutex<Option<QueueItem>>> = Arc::new(Mutex::new(None));
-        let feeder_cancel: Arc<Mutex<Option<CancellationToken>>> = Arc::new(Mutex::new(None));
-        let feeder_paused = Arc::new(AtomicBool::new(false));
         // Restore the persisted /announce toggle so restarts (including
         // the VPS updater's) don't silently disable announcements.
         let announce_enabled = Arc::new(AtomicBool::new(
@@ -2423,15 +1574,38 @@ impl DiscordBot {
         // Synchronous UI dispatch for the actor: resolve the UI task's
         // mailbox fresh per send (it exists only after ready()) and map the
         // actor's events onto the UI task's own message type, which is
-        // private to this module.
+        // private to this module. The Spotify card's DJ footer comes from
+        // the `/who` display cache, the one account-name surface there is.
         let ui_send: player_actor::UiSendFn = {
             let ui_tx = ui_tx_store.clone();
+            let active_session = active_session.clone();
             Arc::new(move |event: UiEvent| {
                 let tx = { ui_tx.lock().clone() };
                 if let Some(tx) = tx {
                     let _ = tx.send(match event {
                         UiEvent::NowPlayingMedia { item } => {
                             UiMsg::NowPlaying(CardView::Queued { item })
+                        }
+                        UiEvent::NowPlayingSpotify { uri, meta } => {
+                            let dj_name = {
+                                let lock = active_session.lock();
+                                lock.as_ref().map(|s| s.discord_name.clone()).unwrap_or_default()
+                            };
+                            let (title, artist, album_art_url) = match meta {
+                                Some(m) => (m.title, m.artist, m.album_art_url),
+                                None => (
+                                    "Unknown track".to_string(),
+                                    "Unknown artist".to_string(),
+                                    None,
+                                ),
+                            };
+                            UiMsg::NowPlaying(CardView::Spotify {
+                                title,
+                                artist,
+                                track_id: uri.to_id(),
+                                album_art_url,
+                                dj_name,
+                            })
                         }
                         UiEvent::HistoryMedia { item } => {
                             UiMsg::History(HistoryView::Queued { item })
@@ -2490,70 +1664,53 @@ impl DiscordBot {
             config: config.clone(),
             ui_send,
             notice_tx,
-            presence_tx: presence_tx.clone(),
-            join_voice,
+            presence_tx,
+            join_voice: join_voice.clone(),
             spirc_cmd_tx: spirc_cmd_tx.clone(),
-            priority_queue: priority_queue.clone(),
-            armed_spotify: armed_spotify.clone(),
-            active_priority_item: active_priority_item.clone(),
-            track_handle: track_handle.clone(),
-            feeder_cancel: feeder_cancel.clone(),
-            feeder_paused: feeder_paused.clone(),
-            dj: dj.clone(),
+            track_handle,
+            dj,
             announce_enabled: announce_enabled.clone(),
         });
 
         // One long-lived transport-event stream, shared by every generation
         // of Spotify session (unlike the old per-login channel) — the
-        // supervisor holds the sender, this task the receiver, fanning
-        // events out to the presence loop and the player actor for the life
-        // of the process.
+        // supervisor holds the sender, this task the receiver, forwarding
+        // events to the player actor for the life of the process. The
+        // `spirc_cmd_tx` cell it also receives is the same one the actor's
+        // deps hold: the supervisor writes the live sender there, and the
+        // actor (plus `PlayerHandle`'s lookup helper) is the only reader.
         let (transport_tx, transport_rx) = mpsc::unbounded_channel::<TransportEvent>();
         let supervisor = SessionSupervisor::new(
             config.clone(),
-            bridge.clone(),
+            bridge,
             oauth.clone(),
             user_store.clone(),
             transport_tx,
             player.clone(),
-            spirc_cmd_tx.clone(),
+            spirc_cmd_tx,
         );
         let link_up_watch = supervisor.link_up_watch();
-        tokio::spawn(transport_shim(transport_rx, presence_tx.clone(), player.clone(), link_up_watch));
+        tokio::spawn(transport_shim(transport_rx, player.clone(), link_up_watch));
 
         let handler = Handler {
             guild_id,
-            channel_id,
             text_channel_id,
-            bridge,
             config: config.clone(),
             ready_tx,
             presence_rx: Mutex::new(Some(presence_rx)),
-            presence_tx,
-            prebuffer_samples,
-            prebuffer_wait,
             user_store,
             oauth,
             pending_auth: Arc::new(Mutex::new(HashMap::new())),
             active_session,
             supervisor,
-            track_handle,
             ctx: ctx_store,
             ui_tx: ui_tx_store,
             player,
-            // YouTube/file fields
+            join_voice,
             ytdlp_available,
-            priority_queue,
-            spirc_cmd_tx,
-            active_priority_item,
-            feeder_cancel,
-            dj,
             announce_enabled,
-            last_spotify_meta: Arc::new(Mutex::new(None)),
-            spotify_state: Arc::new(Mutex::new(SpotifyState::Idle)),
             play_cooldowns: Arc::new(Mutex::new(HashMap::new())),
             auto_start_attempted: AtomicBool::new(false),
-            armed_spotify,
         };
 
         let token = config.discord_token.clone();
@@ -2580,11 +1737,8 @@ impl DiscordBot {
 #[cfg(test)]
 mod tests {
     use super::{
-        derive_presence, is_valid_track_id, parse_track_id_from_url, voice_gate, TrackMeta,
-        TransportEvent,
+        is_valid_track_id, parse_track_id_from_url, render_now_playing, voice_gate, NowPlaying,
     };
-    use crate::presence::PresenceUpdate;
-    use librespot_core::SpotifyUri;
     use serenity::all::ChannelId;
 
     const ID: &str = "4cOdK2wGLETKBW3PvgPWqT"; // 22 base62 chars
@@ -2611,96 +1765,42 @@ mod tests {
         assert!(!voice_gate(None, None, true), "follow still needs the user in voice");
     }
 
-    // --- derive_presence: the transport shim's presence-loop mapping ---
+    // --- render_now_playing: the /np and queue-listing status line ---
 
-    fn uri() -> SpotifyUri {
-        SpotifyUri::from_uri(&format!("spotify:track:{ID}")).unwrap()
-    }
-
-    fn meta(title: &str) -> TrackMeta {
-        TrackMeta { title: title.into(), artist: "artist".into(), album_art_url: None }
+    #[test]
+    fn renders_nothing_with_the_house_phrasing() {
+        assert_eq!(render_now_playing(&NowPlaying::Nothing), "Nothing is playing right now.");
     }
 
     #[test]
-    fn playing_with_meta_maps_and_caches() {
-        let mut cache = None;
-        let ev = TransportEvent::Playing { uri: uri(), meta: Some(meta("Song")) };
-        match derive_presence(&ev, &mut cache) {
-            Some(PresenceUpdate::Playing { title, artist, track_id, .. }) => {
-                assert_eq!(title, "Song");
-                assert_eq!(artist, "artist");
-                assert_eq!(track_id, ID);
-            }
-            other => panic!("expected Playing, got {other:?}"),
-        }
-        assert!(cache.is_some(), "meta is cached for the next Paused");
+    fn renders_a_media_item_with_requester_and_pause_glyph() {
+        let now = NowPlaying::Media {
+            title: "Song".into(),
+            subtitle: "Channel".into(),
+            queued_by: "DJ".into(),
+            paused: false,
+        };
+        assert_eq!(render_now_playing(&now), "▶ **Song** — Channel · queued by **DJ**");
+        let paused = NowPlaying::Media {
+            title: "Song".into(),
+            subtitle: "Channel".into(),
+            queued_by: "DJ".into(),
+            paused: true,
+        };
+        assert!(render_now_playing(&paused).starts_with('⏸'));
     }
 
     #[test]
-    fn paused_reuses_the_cached_meta() {
-        let mut cache = None;
-        let _ = derive_presence(
-            &TransportEvent::Playing { uri: uri(), meta: Some(meta("Song")) },
-            &mut cache,
-        );
-        match derive_presence(&TransportEvent::Paused { uri: uri() }, &mut cache) {
-            Some(PresenceUpdate::Paused { title, track_id, .. }) => {
-                assert_eq!(title, "Song");
-                assert_eq!(track_id, ID);
-            }
-            other => panic!("expected Paused, got {other:?}"),
-        }
+    fn renders_a_spotify_track_with_pause_glyph() {
+        let now = NowPlaying::Spotify { title: "Song".into(), artist: "Artist".into(), paused: false };
+        assert_eq!(render_now_playing(&now), "▶ **Song** — Artist");
+        let paused = NowPlaying::Spotify { title: "Song".into(), artist: "Artist".into(), paused: true };
+        assert!(render_now_playing(&paused).starts_with('⏸'));
     }
 
     #[test]
-    fn paused_without_history_falls_back_to_unknown() {
-        let mut cache = None;
-        match derive_presence(&TransportEvent::Paused { uri: uri() }, &mut cache) {
-            Some(PresenceUpdate::Paused { title, artist, .. }) => {
-                assert_eq!(title, "Unknown track");
-                assert_eq!(artist, "Unknown artist");
-            }
-            other => panic!("expected Paused, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn track_changed_caches_without_a_presence_update() {
-        let mut cache = None;
-        let ev = TransportEvent::TrackChanged { uri: uri(), meta: meta("Song") };
-        assert!(derive_presence(&ev, &mut cache).is_none());
-        // The cache it fills is what the next Paused renders from.
-        match derive_presence(&TransportEvent::Paused { uri: uri() }, &mut cache) {
-            Some(PresenceUpdate::Paused { title, .. }) => assert_eq!(title, "Song"),
-            other => panic!("expected Paused, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn boundary_events_map_to_idle() {
-        let mut cache = None;
-        for ev in [
-            TransportEvent::Stopped,
-            TransportEvent::EndOfTrack,
-            TransportEvent::Unavailable { uri: uri() },
-        ] {
-            assert!(
-                matches!(derive_presence(&ev, &mut cache), Some(PresenceUpdate::Idle)),
-                "{ev:?} should read as Idle"
-            );
-        }
-    }
-
-    #[test]
-    fn session_events_have_no_presence_meaning() {
-        let mut cache = None;
-        for ev in [
-            TransportEvent::SetQueue { current: None, queued: vec![] },
-            TransportEvent::SessionConnected,
-            TransportEvent::SessionDisconnected,
-        ] {
-            assert!(derive_presence(&ev, &mut cache).is_none(), "{ev:?} should map to None");
-        }
+    fn renders_a_pending_spotify_start() {
+        assert!(render_now_playing(&NowPlaying::SpotifyStarting).starts_with('▶'));
     }
 
     #[test]

@@ -6,7 +6,7 @@
 //! or librespot-connect types: only `std`, `tokio::sync::oneshot` (a plain
 //! channel handle, not IO), `librespot_core::SpotifyUri` (a plain id) and
 //! `crate::queue`. Discord-shaped payloads travel behind local structs
-//! ([`TrackMeta`], [`UiMsg`], [`PresenceState`]).
+//! ([`TrackMeta`], [`UiMsg`], [`PresenceState`], [`PlayerSnapshot`]).
 //!
 //! `step` is synchronous and pure: it mutates the state and returns
 //! [`Effect`]s for the actor to run. It never sleeps, spawns, logs to
@@ -177,6 +177,10 @@ pub struct PlayerState {
     /// Session generation; `Transport`/`LinkDown` inputs carrying another
     /// gen are stale and ignored.
     pub link_gen: u64,
+    /// Whether the Spotify session link is currently up — `true` from
+    /// `LinkUp` until the matching `LinkDown`. Telemetry only, surfaced by
+    /// `Query`'s [`PlayerSnapshot`]; nothing here branches on it.
+    pub link_up: bool,
     /// Media-runner generation; a `MediaEnded` carrying another epoch is a
     /// stale runner's report and is ignored.
     pub media_epoch: u64,
@@ -193,6 +197,7 @@ impl PlayerState {
             queue: PriorityQueue::new(),
             active: Active::None,
             sp: SpDevice::Inactive,
+            link_up: false,
             armed: None,
             pause_owner: None,
             inflight: InflightRing::default(),
@@ -247,9 +252,56 @@ pub enum TransportEvent {
     SessionDisconnected,
 }
 
+/// One row of the `/queue` listing, as [`PlayerSnapshot::preview`] carries
+/// it — display strings pulled from [`MediaSource`]'s own formatters, plus
+/// the one fact the UI can't derive from them: whether this residency is
+/// the one currently armed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QueueEntry {
+    pub item_id: u64,
+    pub title: String,
+    pub subtitle: String,
+    pub duration: Option<String>,
+    pub queued_by: String,
+    pub armed: bool,
+}
+
+/// What's currently audible, as `/np` reports it. Carries no formatting —
+/// rendering it is the actor/UI's job, not this pure core's.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NowPlaying {
+    Nothing,
+    Media { title: String, subtitle: String, queued_by: String, paused: bool },
+    Spotify { title: String, artist: String, paused: bool },
+    /// The baseline holds (or is about to hold) the turn but no track is
+    /// known yet: either `Active::SpotifyPending` awaiting its `Playing`,
+    /// or a freshly reconciled `Active::Spotify { track: None }` before
+    /// the next transport event fills the title in.
+    SpotifyStarting,
+}
+
+/// Reply payload for [`Input::Query`] — everything `/np` and `/queue` need
+/// to render, structured instead of pre-formatted so the actor (not this
+/// pure core) owns the Discord-facing text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlayerSnapshot {
+    pub now: NowPlaying,
+    pub queue_len: usize,
+    /// At most `QUEUE_PREVIEW` entries, in play order.
+    pub preview: Vec<QueueEntry>,
+    /// `queue_len - preview.len()`, i.e. how many the preview omits.
+    pub more: usize,
+    pub device_active: bool,
+    pub link_up: bool,
+}
+
+/// How many queue entries [`PlayerSnapshot::preview`] carries.
+pub const QUEUE_PREVIEW: usize = 5;
+
 /// Everything that can happen to the player. Command inputs carry their own
 /// reply channel (so `Input` is not `Clone`); `step` answers them via
-/// `Effect::Reply` — the actor never formats a reply itself.
+/// `Effect::Reply` (`Effect::ReplySnapshot` for `Query`) — the actor never
+/// formats a reply itself.
 #[derive(Debug)]
 pub enum Input {
     Enqueue {
@@ -273,7 +325,7 @@ pub enum Input {
     LinkReconnecting { gen: u64 },
     VoiceReady,
     VoiceLost,
-    Query { reply: oneshot::Sender<String> },
+    Query { reply: oneshot::Sender<PlayerSnapshot> },
     Tick(TimerKind),
 }
 
@@ -357,6 +409,10 @@ pub enum Effect {
     Announce(AnnounceKind),
     SetTimer(TimerKind, Duration),
     Reply(oneshot::Sender<String>, String),
+    /// `Query`'s reply: unlike every other command, its answer is
+    /// structured data instead of a formatted string — the actor/UI layer
+    /// (not this pure core) renders `/np` and `/queue` from it.
+    ReplySnapshot(oneshot::Sender<PlayerSnapshot>, PlayerSnapshot),
 }
 
 /// Advance the player by one input. Pure and synchronous: mutates `state`,
@@ -691,6 +747,7 @@ pub fn step(state: &mut PlayerState, input: Input, now: Instant) -> Vec<Effect> 
 
         Input::LinkUp { gen } => {
             state.link_gen = gen;
+            state.link_up = true;
             // Explicit activation only (F15): connecting never claims the
             // active device away from the DJ's phone.
             state.device_active = false;
@@ -736,6 +793,7 @@ pub fn step(state: &mut PlayerState, input: Input, now: Instant) -> Vec<Effect> 
             }
             state.device_active = false;
             state.sp = SpDevice::Inactive;
+            state.link_up = false;
             // Snapshot the arm and clear it: a `Confirmed` ghost would
             // wedge arming forever, but a fresh reconnect can restore it.
             if let Some(a) = state.armed.take() {
@@ -784,28 +842,52 @@ pub fn step(state: &mut PlayerState, input: Input, now: Instant) -> Vec<Effect> 
         }
 
         Input::Query { reply: tx } => {
-            let mut text = match &state.active {
-                Active::Media { item, paused, .. } => format!(
-                    "{} **{}** — {} (queued by **{}**)",
-                    if *paused { "⏸" } else { "▶" },
-                    item.source.display_title(),
-                    item.source.display_subtitle(),
-                    item.queued_by
-                ),
-                Active::Spotify { track: Some(m) } => format!(
-                    "{} **{}** — {} (Spotify)",
-                    if matches!(state.sp, SpDevice::Paused(_)) { "⏸" } else { "▶" },
-                    m.title,
-                    m.artist
-                ),
-                Active::Spotify { track: None } => "▶ Spotify".to_string(),
-                Active::SpotifyPending { .. } => "▶ Starting a Spotify track…".to_string(),
-                Active::None => "Nothing is playing right now.".to_string(),
+            let now_playing = match &state.active {
+                Active::Media { item, paused, .. } => NowPlaying::Media {
+                    title: item.source.display_title().to_string(),
+                    subtitle: item.source.display_subtitle(),
+                    queued_by: item.queued_by.clone(),
+                    paused: *paused,
+                },
+                Active::Spotify { track: Some(m) } => NowPlaying::Spotify {
+                    title: m.title.clone(),
+                    artist: m.artist.clone(),
+                    paused: matches!(state.sp, SpDevice::Paused(_)),
+                },
+                // No cached title yet — the same "nothing to show" bucket
+                // as a pending load until the next transport event lands.
+                Active::Spotify { track: None } | Active::SpotifyPending { .. } => {
+                    NowPlaying::SpotifyStarting
+                }
+                Active::None => NowPlaying::Nothing,
             };
-            if !state.queue.is_empty() {
-                text.push_str(&format!("\nQueue: {} item(s)", state.queue.len()));
-            }
-            reply(&mut fx, tx, text);
+            let items = state.queue.snapshot();
+            let queue_len = items.len();
+            let armed_id = state.armed.as_ref().map(|a| a.item_id);
+            let preview: Vec<QueueEntry> = items
+                .into_iter()
+                .take(QUEUE_PREVIEW)
+                .map(|item| QueueEntry {
+                    item_id: item.item_id,
+                    title: item.source.display_title().to_string(),
+                    subtitle: item.source.display_subtitle(),
+                    duration: item.source.display_duration(),
+                    queued_by: item.queued_by,
+                    armed: armed_id == Some(item.item_id),
+                })
+                .collect();
+            let more = queue_len - preview.len();
+            fx.push(Effect::ReplySnapshot(
+                tx,
+                PlayerSnapshot {
+                    now: now_playing,
+                    queue_len,
+                    preview,
+                    more,
+                    device_active: state.device_active,
+                    link_up: state.link_up,
+                },
+            ));
         }
 
         Input::Tick(kind) => match kind {
@@ -1474,6 +1556,15 @@ mod tests {
                 _ => None,
             })
             .expect("a command always replies")
+    }
+
+    fn reply_snapshot(fx: &[Effect]) -> PlayerSnapshot {
+        fx.iter()
+            .find_map(|e| match e {
+                Effect::ReplySnapshot(_, s) => Some(s.clone()),
+                _ => None,
+            })
+            .expect("a query always replies")
     }
 
     /// Effects minus the reply — for "this input does nothing" assertions
@@ -2295,37 +2386,99 @@ mod tests {
         let mut sim = Sim::new();
         let (tx, _rx) = oneshot::channel();
         let fx = sim.step(Input::Query { reply: tx });
-        assert_eq!(reply_text(&fx), "Nothing is playing right now.");
+        let snap = reply_snapshot(&fx);
+        assert_eq!(snap.now, NowPlaying::Nothing);
+        assert_eq!(snap.queue_len, 0);
+        assert_eq!(snap.more, 0);
+        assert!(snap.preview.is_empty());
     }
 
     #[test]
-    fn query_bolds_the_media_track_and_queued_by() {
+    fn query_reports_the_media_track_and_queued_by() {
         let mut sim = Sim::media_over_paused_baseline();
         let (tx, _rx) = oneshot::channel();
         let fx = sim.step(Input::Query { reply: tx });
-        assert_eq!(reply_text(&fx), "▶ **active-item** — c (queued by **dj**)");
+        let snap = reply_snapshot(&fx);
+        assert_eq!(
+            snap.now,
+            NowPlaying::Media {
+                title: "active-item".into(),
+                subtitle: "c".into(),
+                queued_by: "dj".into(),
+                paused: false,
+            }
+        );
     }
 
     #[test]
-    fn query_bolds_the_spotify_track() {
+    fn query_reports_a_paused_media_track() {
+        let mut sim = Sim::new();
+        let item = media_item("paused-item");
+        sim.s.active = Active::Media { item_id: item.item_id, item, paused: true, epoch: 0 };
+        let (tx, _rx) = oneshot::channel();
+        let fx = sim.step(Input::Query { reply: tx });
+        let snap = reply_snapshot(&fx);
+        assert_eq!(
+            snap.now,
+            NowPlaying::Media {
+                title: "paused-item".into(),
+                subtitle: "c".into(),
+                queued_by: "dj".into(),
+                paused: true,
+            }
+        );
+    }
+
+    #[test]
+    fn query_reports_the_spotify_track() {
         let mut sim = Sim::baseline_playing();
         sim.s.active = Active::Spotify { track: Some(meta("t")) };
         let (tx, _rx) = oneshot::channel();
         let fx = sim.step(Input::Query { reply: tx });
-        assert_eq!(reply_text(&fx), "▶ **t** — artist (Spotify)");
+        let snap = reply_snapshot(&fx);
+        assert_eq!(
+            snap.now,
+            NowPlaying::Spotify { title: "t".into(), artist: "artist".into(), paused: false }
+        );
     }
 
     #[test]
-    fn query_spotify_pending_uses_an_allowed_glyph() {
+    fn query_maps_spotify_pending_to_starting() {
         let mut sim = Sim::idle_device();
         sim.push_spotify(1, "s1");
         sim.toggle(); // begin_load -> SpotifyPending
-        // `begin_load` does not pop the queue (that happens once a real
-        // `Playing` confirms it); clear it so the reply here isolates the
-        // pending-state text from the unrelated queue-count suffix.
-        sim.s.queue.clear();
         let (tx, _rx) = oneshot::channel();
         let fx = sim.step(Input::Query { reply: tx });
-        assert_eq!(reply_text(&fx), "▶ Starting a Spotify track…");
+        assert_eq!(reply_snapshot(&fx).now, NowPlaying::SpotifyStarting);
+    }
+
+    #[test]
+    fn query_preview_caps_at_five_and_reports_the_remainder() {
+        let mut sim = Sim::new();
+        for i in 0..8 {
+            assert!(sim.s.queue.push(media_item(&format!("t{i}"))));
+        }
+        let (tx, _rx) = oneshot::channel();
+        let fx = sim.step(Input::Query { reply: tx });
+        let snap = reply_snapshot(&fx);
+        assert_eq!(snap.queue_len, 8);
+        assert_eq!(snap.preview.len(), 5);
+        assert_eq!(snap.more, 3);
+        assert_eq!(snap.preview[0].title, "t0");
+        assert_eq!(snap.preview[4].title, "t4");
+    }
+
+    #[test]
+    fn query_flags_the_armed_entry_in_the_preview() {
+        let mut sim = Sim::baseline_playing();
+        let id1 = sim.push_spotify(1, "s1");
+        let id2 = sim.push_spotify(2, "s2");
+        sim.arm(2, id2, Ack::Confirmed);
+        let (tx, _rx) = oneshot::channel();
+        let fx = sim.step(Input::Query { reply: tx });
+        let snap = reply_snapshot(&fx);
+        let armed: Vec<u64> = snap.preview.iter().filter(|e| e.armed).map(|e| e.item_id).collect();
+        assert_eq!(armed, vec![id2]);
+        assert!(!snap.preview.iter().find(|e| e.item_id == id1).unwrap().armed);
     }
 }

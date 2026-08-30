@@ -1,17 +1,13 @@
+//! Status vocabulary for the bot's Discord presence line.
+//!
+//! Produced by the player actor (from `Effect::Presence` and its own media
+//! starts) and consumed by `discord::presence::run_presence_loop`, which
+//! renders it as the bot's activity text. Carries exactly what that line
+//! needs: `Playing` names the track, `Paused`/`Idle` are bare states.
+
 #[derive(Debug, Clone)]
-/// `track_id` on `Paused` is read by the transport channel from C3.
-#[allow(dead_code)]
 pub enum PresenceUpdate {
     Idle,
-    Paused {
-        title: String,
-        artist: String,
-        track_id: String,
-    },
-    Playing {
-        title: String,
-        artist: String,
-        track_id: String,
-        album_art_url: Option<String>,
-    },
+    Paused,
+    Playing { title: String, artist: String },
 }
