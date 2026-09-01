@@ -24,6 +24,29 @@ MediaSource` over the bridge. On its first read only, it blocks until
 `PREBUFFER_SECONDS` worth of samples have accumulated (or a timeout elapses)
 so playback doesn't start on a buffer that's still filling.
 
+### The two paths do not arrive at the same level
+
+The producers reach the bridge through different amounts of gain, and
+nothing reconciles them:
+
+| Path | Gain before the bridge |
+|---|---|
+| Spotify | librespot's soft mixer, then `DiscordSink`'s DSP |
+| yt-dlp / files | none at all — decoded samples go straight in |
+
+The mixer is the larger and less obvious half. `ConnectConfig.initial_volume`
+reads like a display value, but `Spirc::new` hands it to the soft mixer, and
+the default `VolumeCtrl::Log(60 dB)` maps our 80% (`52428`) to an amplitude
+of 0.2512 — **exactly -12 dB**, applied to every Spotify sample. `PREAMP_DB`
+then applies on top (`-5 dB` on the current test host, so -17 dB total there,
+partly masked by a `+7 dB` shelf at 80 Hz that puts low-end energy back).
+
+That is why YouTube and SoundCloud are audibly hotter than Spotify. A fixed
+counter-attenuation on the media path would only match at one slider
+position: the mixer *is* the DJ's volume control, so every time they move it
+on their phone the two paths drift apart again. Making the media path follow
+the same mixer volume is the fix that stays correct; it is not implemented.
+
 ## The player actor
 
 One task owns all playback state — the queue, the armed Spotify track, and

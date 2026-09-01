@@ -188,8 +188,14 @@ impl SpotifyPlayer {
             name: device_name.to_string(),
             device_type: DeviceType::Computer,
             is_group: false,
-            // 80% of full scale: what the device reports to Spotify clients
-            // on first connect.
+            // 80% of full scale. This is not only what Spotify clients
+            // display: `Spirc::new` feeds it straight to the soft mixer
+            // (connect/src/spirc.rs @1599145, "we just want to set the mixer
+            // to the correct volume"), and the default `VolumeCtrl::Log(60)`
+            // maps 80% to an amplitude of 0.2512 — exactly -12 dB of real
+            // attenuation on everything Spotify plays. The media path
+            // (yt-dlp, files) has no mixer, so it arrives 12 dB hotter; see
+            // the loudness note in docs/architecture.md.
             initial_volume: 52428,
             disable_volume: false,
             volume_steps: 64,
