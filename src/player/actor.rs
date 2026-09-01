@@ -165,6 +165,11 @@ impl PlayerHandle {
         self.request(|reply| Input::TogglePause { reply }).await
     }
 
+    /// Empty the queue, leaving whatever is audible alone.
+    pub async fn clear_queue(&self) -> String {
+        self.request(|reply| Input::ClearQueue { reply }).await
+    }
+
     /// Hand the actor the queue the last process was holding. Fire-and-
     /// forget: there is no reply to wait for and nothing starts playing.
     pub fn restore_queue(&self, items: Vec<crate::queue::QueueItem>) {

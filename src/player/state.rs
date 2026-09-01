@@ -394,6 +394,9 @@ pub enum Input {
     /// path besides ▶ that may activate. Auto-start and on-demand sessions
     /// never send it (F15).
     ActivateDevice,
+    /// Empty the queue without touching what is currently audible — the
+    /// half of `/stop` that isn't "go to dead air".
+    ClearQueue { reply: oneshot::Sender<String> },
     /// The queue as it was when the process last stopped, replayed at boot.
     /// Restoring never starts playback on its own — nothing is audible
     /// without a voice channel and someone in it to hear it.
@@ -960,6 +963,26 @@ pub fn step(state: &mut PlayerState, input: Input, now: Instant) -> Vec<Effect> 
 
         Input::VoiceReady => {
             state.voice = VoiceStatus::Ready;
+        }
+
+        Input::ClearQueue { reply: tx } => {
+            // Empties the queue and nothing else: whatever is audible keeps
+            // playing. That is the whole difference from `/stop`, which
+            // clears *and* goes to dead air.
+            let cleared = state.queue.len();
+            let orphaned = state.armed.take().is_some();
+            state.armed_snapshot = None;
+            state.queue.clear();
+            let text = match (cleared, orphaned) {
+                (0, _) => "The queue is already empty.".to_string(),
+                (n, false) => format!("🗑 Cleared {n} queued track(s)."),
+                // Librespot has no dequeue, so an armed track cannot be
+                // withdrawn — it may still air once when Spotify advances.
+                (n, true) => format!(
+                    "🗑 Cleared {n} queued track(s). (a track already handed to Spotify will still play once)"
+                ),
+            };
+            reply(&mut fx, tx, &text);
         }
 
         Input::RestoreQueue { items } => {
@@ -2686,6 +2709,48 @@ mod tests {
         let fx = sim.media_ended(MediaOutcome::Finished);
         assert!(spircs(&fx).is_empty(), "the phone's pause is honoured");
         assert_eq!(sim.s.pause_owner, Some(PauseOwner::Human));
+    }
+
+    #[test]
+    fn clearing_empties_the_queue_and_leaves_playback_alone() {
+        // The whole difference from /stop: nothing goes quiet.
+        let mut sim = Sim::baseline_playing();
+        sim.enqueue(media_item("a"));
+        sim.enqueue(media_item("b"));
+
+        let (tx, _rx) = oneshot::channel();
+        let fx = sim.step(Input::ClearQueue { reply: tx });
+
+        assert_eq!(sim.s.queue.len(), 0);
+        assert!(
+            matches!(sim.s.active, Active::Spotify { .. }),
+            "the baseline keeps the turn"
+        );
+        assert!(spircs(&fx).is_empty(), "clearing sends Spotify nothing");
+        assert!(!has_clear(&fx), "and never touches the bridge");
+    }
+
+    #[test]
+    fn clearing_warns_when_a_track_is_already_committed_to_spotify() {
+        // Librespot has no dequeue, so an armed track still airs once.
+        let mut sim = Sim::baseline_playing();
+        sim.enqueue(spotify_item(1, "s1"));
+        assert!(sim.s.armed.is_some(), "precondition: something is armed");
+
+        let (tx, _rx) = oneshot::channel();
+        let fx = sim.step(Input::ClearQueue { reply: tx });
+
+        assert!(sim.s.armed.is_none());
+        let text = reply_text(&fx);
+        assert!(text.contains("still play once"), "got: {text}");
+    }
+
+    #[test]
+    fn clearing_an_empty_queue_says_so_rather_than_claiming_a_clear() {
+        let mut sim = Sim::baseline_playing();
+        let (tx, _rx) = oneshot::channel();
+        let fx = sim.step(Input::ClearQueue { reply: tx });
+        assert_eq!(reply_text(&fx), "The queue is already empty.");
     }
 
     #[test]

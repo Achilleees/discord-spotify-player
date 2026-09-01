@@ -17,7 +17,10 @@ use serenity::all::{
     ChannelId, CreateCommand, CreateInteractionResponse, CreateInteractionResponseMessage,
     Interaction, UserId,
 };
-use serenity::builder::{CreateCommandOption, EditInteractionResponse};
+use serenity::builder::{
+    CreateActionRow, CreateButton, CreateCommandOption, EditInteractionResponse,
+};
+use serenity::model::application::ButtonStyle;
 use serenity::client::Context;
 use serenity::model::application::CommandOptionType;
 use std::sync::atomic::Ordering;
@@ -52,6 +55,8 @@ pub(super) fn register_commands(ytdlp_available: bool) -> Vec<CreateCommand> {
             .description("Skip the current track"),
         CreateCommand::new("stop")
             .description("Stop playback and clear the priority queue"),
+        CreateCommand::new("clear")
+            .description("Clear the queue (asks to confirm); what's playing keeps playing"),
         CreateCommand::new("np")
             .description("Show what's currently playing"),
         CreateCommand::new("announce")
@@ -132,6 +137,48 @@ fn classify_link(input: &str) -> LinkKind {
     }
 }
 
+/// Reply to a button press so only the clicker sees it.
+async fn respond_ephemeral(
+    ctx: &Context,
+    component: &serenity::model::application::ComponentInteraction,
+    content: String,
+) {
+    let response = CreateInteractionResponse::Message(
+        CreateInteractionResponseMessage::new().content(content).ephemeral(true),
+    );
+    if let Err(e) = component.create_response(ctx, response).await {
+        tracing::warn!(error = ?e, "failed to respond to button interaction");
+    }
+}
+
+/// Answer a confirmation prompt by rewriting the prompt itself and removing
+/// its buttons — the outcome lands where the question was asked, and the
+/// question can't be answered a second time.
+async fn replace_prompt(
+    ctx: &Context,
+    component: &serenity::model::application::ComponentInteraction,
+    content: String,
+) {
+    let response = CreateInteractionResponse::UpdateMessage(
+        CreateInteractionResponseMessage::new().content(content).components(vec![]),
+    );
+    if let Err(e) = component.create_response(ctx, response).await {
+        tracing::warn!(error = ?e, "failed to update a confirmation prompt");
+    }
+}
+
+/// The Confirm/Cancel pair shown by `/clear`.
+fn clear_confirm_buttons() -> CreateActionRow {
+    CreateActionRow::Buttons(vec![
+        CreateButton::new("ctrl_queue_clear_confirm")
+            .label("Clear the queue")
+            .style(ButtonStyle::Danger),
+        CreateButton::new("ctrl_queue_clear_cancel")
+            .label("Cancel")
+            .style(ButtonStyle::Secondary),
+    ])
+}
+
 /// Pure voice-gate policy (docs/PORT.md locked decision 4): with the bot in a
 /// channel the user must share it; with the bot in none, `allow_follow`
 /// decides whether being in any voice channel suffices (the /play
@@ -172,9 +219,15 @@ impl Handler {
             let custom_id = component.data.custom_id.as_str();
             tracing::debug!(custom_id, "button interaction received");
 
-            // Control buttons require sharing the bot's voice channel. The
-            // queue-hint button is read-only info, so it stays open.
-            let is_control = matches!(custom_id, "ctrl_prev" | "ctrl_next" | "ctrl_pause_toggle");
+            // Anything that mutates playback or the queue requires sharing
+            // the bot's voice channel. The queue-hint button is read-only
+            // info, so it stays open. The clear confirmation is gated in its
+            // own right: a user can leave voice between raising the prompt
+            // and pressing the button.
+            let is_control = matches!(
+                custom_id,
+                "ctrl_prev" | "ctrl_next" | "ctrl_pause_toggle" | "ctrl_queue_clear_confirm"
+            );
             if is_control && !self.user_in_bot_voice_channel(&ctx, component.user.id) {
                 let response = CreateInteractionResponse::Message(
                     CreateInteractionResponseMessage::new()
@@ -185,6 +238,33 @@ impl Handler {
                 return;
             }
 
+            // Buttons that own their response shape, rather than producing a
+            // line of text for the ephemeral reply below.
+            match custom_id {
+                "ctrl_queue_hint" => {
+                    let content = self.format_queue_listing().await;
+                    respond_ephemeral(&ctx, component, content).await;
+                    return;
+                }
+                // Both halves of the clear prompt replace the prompt itself
+                // and drop its buttons, so it can't be answered twice.
+                "ctrl_queue_clear_confirm" => {
+                    let text = self.player.clear_queue().await;
+                    replace_prompt(&ctx, component, text).await;
+                    return;
+                }
+                "ctrl_queue_clear_cancel" => {
+                    replace_prompt(
+                        &ctx,
+                        component,
+                        "Cancelled — the queue is untouched.".to_string(),
+                    )
+                    .await;
+                    return;
+                }
+                _ => {}
+            }
+
             let reply_content: String = match custom_id {
                 "ctrl_prev" => self.player.previous().await,
                 // Same semantics as /skip: the actor cancels the current
@@ -193,31 +273,11 @@ impl Handler {
                 // ⏯: the actor pauses/resumes the active media item, pauses
                 // a playing baseline, or starts/resumes whatever is next.
                 "ctrl_pause_toggle" => self.player.toggle_pause().await,
-                "ctrl_queue_hint" => {
-                    let content = self.format_queue_listing().await;
-
-                    let response = CreateInteractionResponse::Message(
-                        CreateInteractionResponseMessage::new().content(content).ephemeral(true),
-                    );
-                    if let Err(e) = component.create_response(&ctx, response).await {
-                        tracing::warn!(error = ?e, "failed to respond to button interaction");
-                    }
-                    return;
-                }
                 _ => "Unknown button".to_string(),
             };
 
-            if custom_id != "ctrl_queue_hint" {
-                // Ephemeral reply: only the clicker sees the outcome, no channel spam.
-                let response = CreateInteractionResponse::Message(
-                    CreateInteractionResponseMessage::new()
-                        .content(reply_content)
-                        .ephemeral(true),
-                );
-                if let Err(e) = component.create_response(&ctx, response).await {
-                    tracing::warn!(error = ?e, "failed to respond to button interaction");
-                }
-            }
+            // Ephemeral reply: only the clicker sees the outcome, no channel spam.
+            respond_ephemeral(&ctx, component, reply_content).await;
             return;
         }
 
@@ -291,13 +351,39 @@ impl Handler {
         // Commands that drive playback require sharing the bot's voice channel.
         // /announce is a guild-level toggle, not playback control, and must be
         // settable before the bot is in voice.
-        let needs_voice = matches!(cmd.data.name.as_str(), "skip" | "stop");
+        let needs_voice = matches!(cmd.data.name.as_str(), "skip" | "stop" | "clear");
         if needs_voice && !in_voice {
             let _ = cmd.create_response(&ctx, CreateInteractionResponse::Message(
                 CreateInteractionResponseMessage::new()
                     .content("You must be in the bot's voice channel to control playback.")
                     .ephemeral(true),
             )).await;
+            return;
+        }
+
+        // /clear asks before it acts: the prompt is ephemeral, so only the
+        // person who raised it can answer, and the buttons carry the action.
+        if cmd.data.name == "clear" {
+            let queued = self.player.query().await.queue_len;
+            let response = if queued == 0 {
+                CreateInteractionResponse::Message(
+                    CreateInteractionResponseMessage::new()
+                        .content("The queue is already empty.")
+                        .ephemeral(true),
+                )
+            } else {
+                CreateInteractionResponse::Message(
+                    CreateInteractionResponseMessage::new()
+                        .content(format!(
+                            "Clear **{queued}** queued track(s)? What's playing now keeps playing."
+                        ))
+                        .components(vec![clear_confirm_buttons()])
+                        .ephemeral(true),
+                )
+            };
+            if let Err(e) = cmd.create_response(&ctx, response).await {
+                tracing::warn!(error = ?e, "failed to send the clear confirmation");
+            }
             return;
         }
 
