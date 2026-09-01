@@ -87,9 +87,15 @@ pub enum Ack {
 }
 
 /// Telemetry mirror of the Spotify device — an input, never the intent.
-/// `Idle` is reachable only from `Stopped` while `device_active`; a takeover
-/// emits `SessionDisconnected` then `Stopped`, which lands in `Inactive` and
-/// must never be read as "safe to `load()` over".
+///
+/// `Idle` means "ours, and holding no context", which is the one state
+/// `load()` may overwrite. Two things reach it: an explicit human claim on
+/// a session that never loaded anything (`ActivateDevice`, ⏯'s takeover,
+/// `claim_device`), and a `Stopped` **while `device_active`**. That guard on
+/// `Stopped` is the load-safety invariant: a takeover by another device
+/// emits `SessionDisconnected` then `Stopped`, and without it that pair
+/// would land in `Idle` and invite a `load()` over the DJ's context on a
+/// device we no longer own.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SpDevice {
     Inactive,
@@ -100,9 +106,12 @@ pub enum SpDevice {
     Paused(SpotifyUri),
 }
 
-/// Mirror of the Discord voice connection. Media starts while not `Ready`
-/// emit `JoinVoice` alongside `StartMedia`; the runner blocks on the voice
-/// handle, so the core needs no deferred-start bookkeeping.
+/// Mirror of the Discord voice connection. Anything that makes the bot
+/// audible while this is not `Ready` emits `JoinVoice` first (see
+/// `ensure_voice`). The core needs no deferred-start bookkeeping to go with
+/// it: a media runner does not wait for the join, it feeds `AudioBridge`
+/// straight away, and the bridge simply holds those samples until the
+/// reader attaches at the end of the join. Nothing is lost either way.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VoiceStatus {
     Down,
@@ -884,9 +893,9 @@ pub fn step(state: &mut PlayerState, input: Input, now: Instant) -> Vec<Effect> 
             }
             match head_of(&state.queue) {
                 Head::Media => {
-                    // Old table: "play_button_drains_a_media_head" — the
-                    // head airs; a pre-existing pause keeps its owner, so a
-                    // phone pause still blocks the auto-resume afterwards.
+                    // The head airs; a pre-existing pause keeps its owner,
+                    // so a phone pause still blocks the auto-resume
+                    // afterwards.
                     let advancing = matches!(state.sp, SpDevice::Boundary);
                     if advancing {
                         fx.push(Effect::Spirc(SpircCmd::Pause));
@@ -1431,9 +1440,11 @@ fn handle_transport(state: &mut PlayerState, ev: TransportEvent, now: Instant, f
         }
 
         TransportEvent::Stopped => {
-            // Idle is reachable only from Stopped while `device_active`; a
-            // takeover emits SessionDisconnected then Stopped, which must
-            // not read as "safe to load() over".
+            // The `device_active` guard is load safety: a takeover by
+            // another device emits SessionDisconnected (which clears the
+            // flag) and then Stopped, and reading that pair as Idle would
+            // invite a load() over the DJ's context on a device we no
+            // longer own. See `SpDevice`.
             state.sp = if state.device_active { SpDevice::Idle } else { SpDevice::Inactive };
             state.pause_owner = None;
             if matches!(state.active, Active::Spotify { .. } | Active::SpotifyPending { .. }) {
@@ -2171,8 +2182,7 @@ mod tests {
 
     #[test]
     fn enqueue_arms_first_spotify_anywhere_while_playing() {
-        // Old: enqueue_arms_while_spotify_is_playing_regardless_of_head —
-        // arming looks past the media head for the first Spotify item.
+        // Arming looks past the media head for the first Spotify item.
         let mut sim = Sim::baseline_playing();
         sim.s.queue.push(media_item("m1"));
         let fx = sim.enqueue(spotify_item(1, "s1"));
@@ -2183,8 +2193,8 @@ mod tests {
 
     #[test]
     fn enqueue_never_double_arms() {
-        // Old: the armed-head rows of enqueue_arms_* — one armed track at a
-        // time; a second enqueue changes nothing device-side.
+        // One armed track at a time: a second enqueue changes nothing
+        // device-side.
         let mut sim = Sim::baseline_playing();
         let id = sim.push_spotify(1, "s1");
         sim.arm(1, id, Ack::Confirmed);
@@ -2194,12 +2204,10 @@ mod tests {
 
     #[test]
     fn enqueue_during_media_arms_but_never_disturbs_the_media() {
-        // Deliberate change from the old table's
-        // enqueue_never_arms_while_media_is_active: arming while the
-        // baseline sits bot-paused under a media item is what sets up the
-        // paused-at-0:00 handoff (and the frozen-skip fix). The invariant
-        // that survives is the second half: an enqueue during media never
-        // starts or silences anything.
+        // Arming while the baseline sits bot-paused under a media item is
+        // deliberate: it sets up the paused-at-0:00 handoff, and it is the
+        // frozen-skip fix. Arming is not disturbing — an enqueue during
+        // media still never starts or silences anything.
         let mut sim = Sim::media_over_paused_baseline();
         let fx = sim.enqueue(spotify_item(1, "s1"));
         assert_eq!(spircs(&fx), vec![SpircCmd::AddToQueue(uri(1))]);
@@ -2209,8 +2217,8 @@ mod tests {
 
     #[test]
     fn enqueue_does_not_arm_while_spotify_is_idle() {
-        // Old: enqueue_does_nothing_unless_spotify_is_playing (idle half) —
-        // there is no context to queue behind.
+        // An idle device holds no context, so there is nothing to queue
+        // behind — compare the paused case below, which does arm.
         let mut sim = Sim::idle_device();
         let fx = sim.enqueue(spotify_item(1, "s1"));
         assert!(spircs(&fx).is_empty());
@@ -2223,10 +2231,9 @@ mod tests {
 
     #[test]
     fn enqueue_arms_while_the_baseline_is_paused() {
-        // Deliberate change from the old table's paused half of
-        // enqueue_does_nothing_unless_spotify_is_playing: a paused context
-        // is still a context, and arming into it is what makes a later
-        // skip/resume air the request (frozen-skip setup).
+        // A paused context is still a context. Arming into it is
+        // deliberate: it is what makes a later skip or resume air the
+        // request rather than freeze on it.
         let mut sim = Sim::baseline_paused(Some(PauseOwner::Human));
         let fx = sim.enqueue(spotify_item(1, "s1"));
         assert_eq!(spircs(&fx), vec![SpircCmd::AddToQueue(uri(1))]);
@@ -2265,8 +2272,7 @@ mod tests {
 
     #[test]
     fn end_of_track_with_armed_head_is_hands_off() {
-        // Old: track_end_leaves_an_armed_spotify_head_alone — auto-advance
-        // lands on the armed track by itself.
+        // Auto-advance lands on the armed track by itself.
         let mut sim = Sim::baseline_playing();
         let id = sim.push_spotify(1, "s1");
         sim.arm(1, id, Ack::Confirmed);
@@ -2277,7 +2283,6 @@ mod tests {
 
     #[test]
     fn end_of_track_arms_an_unarmed_spotify_head() {
-        // Old: track_end_queues_behind_current_for_an_unarmed_spotify_head.
         let mut sim = Sim::baseline_playing();
         sim.push_spotify(1, "s1");
         let fx = sim.transport(TransportEvent::EndOfTrack);
@@ -2286,7 +2291,7 @@ mod tests {
 
     #[test]
     fn end_of_track_with_media_head_starts_it_behind_the_pause_ack() {
-        // Old: track_end_drains_a_media_head. No Pause at the boundary —
+        // No Pause at the boundary —
         // librespot ignores one in its EndOfTrack state; the advancing
         // next track is caught by the Playing-under-Media arm, and the
         // media item starts behind that pause's ack.
@@ -2376,7 +2381,6 @@ mod tests {
 
     #[test]
     fn end_of_track_during_media_changes_nothing() {
-        // Old: track_end_does_nothing_while_media_is_active_racing_a_drain.
         let mut sim = Sim::media_over_paused_baseline();
         let fx = sim.transport(TransportEvent::EndOfTrack);
         assert!(fx.is_empty());
@@ -2385,7 +2389,6 @@ mod tests {
 
     #[test]
     fn end_of_track_with_empty_queue_lets_the_baseline_roll() {
-        // Old: track_end_does_nothing_on_an_empty_queue.
         let mut sim = Sim::baseline_playing();
         let fx = sim.transport(TransportEvent::EndOfTrack);
         assert!(fx.is_empty());
@@ -2395,7 +2398,7 @@ mod tests {
 
     #[test]
     fn media_end_resumes_an_armed_spotify_head() {
-        // Old: media_end_resumes_an_armed_spotify_head. The cued track
+        // The cued track
         // (9) isn't the confirmed head (1): advance onto the head, then
         // play — the request beats the context track the skip cued.
         let mut sim = Sim::media_over_paused_baseline();
@@ -2409,8 +2412,7 @@ mod tests {
 
     #[test]
     fn media_end_arms_and_resumes_an_unarmed_spotify_head() {
-        // Old: media_end_queues_behind_current_for_an_unarmed_spotify_head
-        // (QueueThenResume): queue it behind the context, then resume.
+        // Queue it behind the context, then resume.
         let mut sim = Sim::media_over_paused_baseline();
         sim.push_spotify(1, "s1");
         let fx = sim.media_ended(MediaOutcome::Finished);
@@ -2419,8 +2421,7 @@ mod tests {
 
     #[test]
     fn media_end_loads_a_spotify_head_while_idle() {
-        // Old: media_end_loads_an_unarmed_spotify_head_while_idle — no
-        // context to lose, so load() is allowed.
+        // No context to lose, so load() is allowed.
         let mut sim = Sim::media_over_paused_baseline();
         sim.s.sp = SpDevice::Idle;
         sim.s.pause_owner = None;
@@ -2433,9 +2434,8 @@ mod tests {
 
     #[test]
     fn media_end_with_empty_queue_resumes_the_bot_paused_baseline() {
-        // Old: media_end_does_nothing_on_an_empty_queue — the resume lived
-        // in the drain loop's `resume_spotify_after_drain` bool then; the
-        // pause owner carries that decision now.
+        // Nothing queued, so the boundary is quiet: whether the baseline
+        // comes back is the pause owner's decision, not the boundary's.
         let mut sim = Sim::media_over_paused_baseline();
         let fx = sim.media_ended(MediaOutcome::Finished);
         assert_eq!(spircs(&fx), vec![SpircCmd::Play]);
@@ -2457,7 +2457,6 @@ mod tests {
 
     #[test]
     fn skip_with_armed_head_sends_next() {
-        // Old: skip_jumps_to_an_armed_spotify_head.
         let mut sim = Sim::baseline_playing();
         let id = sim.push_spotify(1, "s1");
         sim.arm(1, id, Ack::Confirmed);
@@ -2471,7 +2470,6 @@ mod tests {
 
     #[test]
     fn skip_with_unarmed_spotify_head_arms_then_nexts() {
-        // Old: skip_queues_behind_current_then_skips_an_unarmed_spotify_head.
         let mut sim = Sim::baseline_playing();
         sim.push_spotify(1, "s1");
         let fx = sim.skip();
@@ -2482,8 +2480,8 @@ mod tests {
 
     #[test]
     fn skip_onto_a_media_head_pauses_advances_and_starts_it() {
-        // Old: skip_sends_next_then_drains_a_media_head, upgraded to F4's
-        // pause(); next(): the silent advance loads the skipped track
+        // pause() then next() is librespot's silent advance: it loads the
+        // skipped track
         // paused at 0:00 — no blip, exactly one track consumed.
         let mut sim = Sim::baseline_playing();
         sim.s.queue.push(media_item("m"));
@@ -2496,7 +2494,6 @@ mod tests {
 
     #[test]
     fn skip_with_empty_queue_nexts_the_baseline() {
-        // Old: skip_on_an_empty_queue_skips_the_spotify_baseline.
         let mut sim = Sim::baseline_playing();
         let fx = sim.skip();
         assert_eq!(spircs(&fx), vec![SpircCmd::Next]);
@@ -2506,7 +2503,6 @@ mod tests {
 
     #[test]
     fn play_when_paused_with_armed_head_resumes() {
-        // Old: play_button_resumes_an_armed_spotify_head.
         let mut sim = Sim::baseline_paused(None);
         let id = sim.push_spotify(1, "s1");
         sim.arm(1, id, Ack::Confirmed);
@@ -2517,7 +2513,6 @@ mod tests {
 
     #[test]
     fn play_when_idle_loads_the_spotify_head() {
-        // Old: play_button_loads_an_unarmed_spotify_head_while_idle.
         let mut sim = Sim::idle_device();
         sim.push_spotify(1, "s1");
         let fx = sim.toggle();
@@ -2528,8 +2523,8 @@ mod tests {
 
     #[test]
     fn play_with_a_paused_baseline_arms_and_resumes_never_loads() {
-        // Old: play_button_never_hijacks_a_paused_baseline — a paused
-        // context is the DJ's; queue behind it and resume, never Load.
+        // A paused context is still the DJ's: queue behind it and resume,
+        // never Load.
         let mut sim = Sim::baseline_paused(Some(PauseOwner::Human));
         sim.push_spotify(1, "s1");
         let fx = sim.toggle();
@@ -2538,8 +2533,8 @@ mod tests {
 
     #[test]
     fn play_with_a_media_head_starts_it_and_leaves_the_baseline_alone() {
-        // Old: play_button_drains_a_media_head — the baseline stays paused
-        // and keeps its owner.
+        // The baseline stays paused and keeps its owner, so a human pause
+        // still blocks the auto-resume once the media item ends.
         let mut sim = Sim::baseline_paused(Some(PauseOwner::Human));
         sim.s.queue.push(media_item("m"));
         let fx = sim.toggle();
@@ -2550,8 +2545,7 @@ mod tests {
 
     #[test]
     fn play_with_empty_queue_resumes_the_baseline() {
-        // Old: play_button_on_an_empty_queue_resumes_the_baseline. An
-        // explicit Discord command overrides even a human phone pause.
+        // An explicit Discord command overrides even a human phone pause.
         let mut sim = Sim::baseline_paused(Some(PauseOwner::Human));
         let fx = sim.toggle();
         assert_eq!(spircs(&fx), vec![SpircCmd::Play]);

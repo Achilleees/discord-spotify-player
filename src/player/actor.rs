@@ -238,8 +238,6 @@ fn empty_snapshot() -> PlayerSnapshot {
     }
 }
 
-/// Spawn the player actor and return its handle. Called once, when the bot
-/// is built; the actor lives for the process (lifecycle A).
 /// One durable write. Both variants go through a single writer so their
 /// order is the order the actor decided them in.
 enum StoreWrite {
@@ -294,6 +292,8 @@ fn spawn_store_writer(
     tx
 }
 
+/// Spawn the player actor and return its handle. Called once, when the bot
+/// is built; the actor lives for the process (lifecycle A).
 pub fn spawn(deps: PlayerDeps) -> PlayerHandle {
     let (tx, rx) = mpsc::unbounded_channel();
     let handle = PlayerHandle { tx: tx.clone(), spirc: deps.spirc_cmd_tx.clone() };

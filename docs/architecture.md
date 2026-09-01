@@ -266,6 +266,34 @@ arrival is checked (`awaiting_jump`): librespot silently starts a context
 at track 1 when it cannot find the track requested, so a mismatch is
 surfaced instead of quietly restarting the playlist.
 
+## librespot facts the design rests on
+
+Comments through `src/` cite these by number. All four are verified against
+the pinned revision (`1599145`) — re-verify before bumping it, since each
+one is load-bearing and a silent change upstream would not fail a test here.
+
+**F2 — a command to a device that isn't active is dropped, not queued.**
+`spirc.rs:727` matches `_ if !self.connect_state.is_active()` and only
+warns ("will be ignored while Not Active"). So an unacked `add_to_queue` is
+*void*, and every audibility command has to be gated on `device_active`.
+
+**F4 — `pause()` then `next()` is a silent advance.** `handle_next` opens
+with `let continue_playing = self.connect_state.is_playing()`
+(`spirc.rs:1717`), so from a paused state the next track loads paused at
+0:00. That is how a human skip onto a media item consumes exactly one
+Spotify track without a blip of it becoming audible.
+
+**F12 — a transfer restores the queue along with everything else.** The
+transfer payload carries `queue.tracks` and `is_playing_queue`
+(`state/transfer.rs`), which is why reconnect prefers `Transfer(None)` over
+re-activating: it brings the armed track back rather than starting clean.
+
+**F15 — activation must be explicit.** Both `Transfer` and `Activate` are
+ignored when the device is already active (`spirc.rs:711-725`), and an
+unconditional `activate()` on connect would claim the device away from the
+DJ's phone on every session start. This crate therefore never activates on
+connect; only `/login`, ▶, or a queued Spotify item reaching its turn does.
+
 ## See also
 
 `CODEMAP.md` (repo root) for a file-by-file map of `src/`.

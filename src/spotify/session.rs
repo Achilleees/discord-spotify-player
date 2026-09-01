@@ -177,10 +177,11 @@ impl SessionSupervisor {
 
     /// (Re)point the live Spotify session at `discord_user_id`: aborts the
     /// previous session and its refresher, bumps the generation, and spawns
-    /// the new librespot task and its proactive token refresher. Every other
-    /// side effect `spawn_session` used to bundle in here — voice, the DB's
-    /// active flag, the UI card — is the caller's job now (see
-    /// `discord::bot`'s callers); this function touches none of them.
+    /// the new librespot task and its proactive token refresher. That is the
+    /// whole of it — voice, the DB's active flag and the UI card belong to
+    /// the caller (`discord::account`), and this function touches none of
+    /// them. Keeping it that narrow is what lets an account switch happen
+    /// without disturbing playback.
     pub async fn switch(
         &self,
         discord_user_id: u64,

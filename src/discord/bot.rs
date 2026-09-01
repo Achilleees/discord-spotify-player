@@ -70,8 +70,12 @@ pub(super) struct Handler {
     pub(super) leaving_voice: Arc<AtomicBool>,
     /// Owns the Spotify session lifecycle (librespot task, refresher, token
     /// state, generation) independently of playback — see
-    /// `spotify::session`. `switch_active_session`/`auto_start_stored_session`/
-    /// `handle_logout`/`teardown_playback_session` are its only callers.
+    /// `spotify::session`. Reached from the account operations
+    /// (`switch_active_session`, `auto_start_stored_session`,
+    /// `handle_logout`, `teardown_playback_session`) and, for `ensure_session`
+    /// only, straight from `/play` and `/queue`'s Spotify-link branches in
+    /// `commands.rs` — that on-demand bring-up runs in the interaction
+    /// handler's own task, never behind an account operation.
     pub(super) supervisor: SessionSupervisor,
     pub(super) ctx: Arc<Mutex<Option<Context>>>,
     /// The UI task's mailbox. `None` until `ready()`'s first pass spawns

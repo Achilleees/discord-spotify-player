@@ -118,17 +118,17 @@ impl Handler {
     /// exact same path /login uses. Skips when no user is marked active or the
     /// stored record is unusable (unparseable id, failed refresh).
     ///
-    /// A thin wrapper over `SessionSupervisor::ensure_session` (the same
-    /// on-demand bring-up `/play`/`/queue` use, C7): the refresh-and-switch
-    /// work that used to live inline here is single-sourced there now. What
-    /// stays here is boot-specific: the pre-attempt log line (kept ahead of
-    /// the call so it still reads as "attempting", not "succeeded"), and the
-    /// two outcomes `ensure_session` deliberately doesn't decide for its
-    /// other callers — deactivate-and-warn on a dead refresh token, and the
-    /// account-switch bookkeeping (voice, UI, DB exclusivity, the `/who`
-    /// cache) on success, via `finish_account_switch` rather than
-    /// `switch_active_session` so `ensure_session`'s own `supervisor.switch`
-    /// isn't immediately followed by a second one.
+    /// A thin wrapper over `SessionSupervisor::ensure_session`, the same
+    /// on-demand bring-up `/play` and `/queue` use, so the refresh-and-switch
+    /// work is single-sourced. What is boot-specific stays here: the
+    /// pre-attempt log line (kept ahead of the call so it reads as
+    /// "attempting", not "succeeded"), and the two outcomes `ensure_session`
+    /// deliberately does not decide for its other callers — deactivate-and-
+    /// warn on a dead refresh token, and the account-switch bookkeeping
+    /// (voice, UI, DB exclusivity, the `/who` cache) on success. That goes
+    /// through `finish_account_switch` rather than `switch_active_session`,
+    /// so `ensure_session`'s own `supervisor.switch` is not immediately
+    /// followed by a second one.
     pub(super) async fn auto_start_stored_session(&self) {
         let Some(user) = self.user_store.list().into_iter().find(|u| u.active) else {
             tracing::info!("auto-start skipped: no stored active user");

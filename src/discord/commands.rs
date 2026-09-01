@@ -117,8 +117,10 @@ fn parse_track_id_from_url(input: &str) -> Option<String> {
     is_valid_track_id(candidate).then(|| candidate.to_string())
 }
 
-/// Spotify track IDs are exactly 22 base62 characters. Rejecting anything
-/// else keeps user input out of the query string of authenticated API calls.
+/// Spotify track IDs are exactly 22 base62 characters. Anything else is
+/// rejected here rather than being handed to `SpotifyUri::from_uri` and on
+/// into librespot's Mercury calls, so a malformed link fails as a clear
+/// "that isn't a Spotify track" instead of as a metadata lookup error.
 fn is_valid_track_id(id: &str) -> bool {
     id.len() == 22 && id.bytes().all(|b| b.is_ascii_alphanumeric())
 }
