@@ -856,6 +856,12 @@ pub fn step(state: &mut PlayerState, input: Input, now: Instant) -> Vec<Effect> 
                     // it's an idle device — loadable.
                     state.sp = SpDevice::Idle;
                 }
+                // Claiming the device is a claim on the bot: whatever the DJ
+                // starts next, from Discord or from their phone, is meant to
+                // come out here. Joining now (rather than when the first
+                // track lands) also makes the takeover visible in the
+                // channel, the way `/login` is.
+                ensure_voice(state, &mut fx);
                 match head_of(&state.queue) {
                     Head::Media => {
                         let item = state.queue.pop().expect("head checked as media");
@@ -904,6 +910,7 @@ pub fn step(state: &mut PlayerState, input: Input, now: Instant) -> Vec<Effect> 
                         // Never Load over a paused baseline — arm the head
                         // and resume; auto-advance airs it at the boundary.
                         maybe_arm(state, now, &mut fx);
+                        ensure_voice(state, &mut fx);
                         fx.push(Effect::Spirc(SpircCmd::Play));
                         state.pause_owner = None;
                         state.active = Active::Spotify { track: None };
@@ -912,6 +919,7 @@ pub fn step(state: &mut PlayerState, input: Input, now: Instant) -> Vec<Effect> 
                 }
                 Head::Empty => {
                     if matches!(state.sp, SpDevice::Paused(_) | SpDevice::Boundary) {
+                        ensure_voice(state, &mut fx);
                         fx.push(Effect::Spirc(SpircCmd::Play));
                         state.pause_owner = None;
                         state.active = Active::Spotify { track: None };
@@ -1358,6 +1366,12 @@ fn handle_transport(state: &mut PlayerState, ev: TransportEvent, now: Instant, f
             // plain baseline advance all land here).
             state.active = Active::Spotify { track: meta.clone() };
             state.pause_owner = None;
+            // Our own librespot is decoding, so there is audio in the bridge
+            // and it needs a call to drain into. Only reachable with voice
+            // down after a `/stop` that left the channel while the session
+            // stayed up — every involuntary voice loss tears the session
+            // down, so no phone-side playback can pull the bot in here.
+            ensure_voice(state, fx);
             if !same_track {
                 match &meta {
                     Some(m) => {
@@ -1760,14 +1774,34 @@ fn maybe_arm(state: &mut PlayerState, now: Instant, fx: &mut Vec<Effect>) {
 /// device_active` (a load destroys the DJ's context otherwise). Sets up the
 /// pending state and its escape-hatch timer.
 fn begin_load(state: &mut PlayerState, uri: SpotifyUri, now: Instant, fx: &mut Vec<Effect>) {
+    ensure_voice(state, fx);
     state.pause_owner = None;
     state.active = Active::SpotifyPending { uri: uri.clone(), sent: now, retried: false };
     fx.push(Effect::Spirc(SpircCmd::Load(uri)));
     fx.push(Effect::SetTimer(TimerKind::SpotifyPending, PENDING_TIMEOUT));
 }
 
-/// Hand the turn to a media item: bump the epoch, make sure voice is coming
-/// up, and emit the gated start plus its card.
+/// Bring the voice connection up for audio that is about to exist. Idempotent
+/// and safe to call on a path that turns out to make no sound — a join into a
+/// call the bot is already in is a no-op in the shell.
+///
+/// Spotify audio needs this exactly as much as a media item does: it reaches
+/// Discord through the same bridge, and the bridge is only drained by a live
+/// call. Live 2026-09-01: after a `/stop` (which now leaves the channel), a
+/// bare `/play` re-claimed the Connect device and the DJ's phone started a
+/// track, so librespot decoded into a bridge nothing was reading — the card
+/// said "playing", the channel was silent, and only `/login` brought the bot
+/// back.
+fn ensure_voice(state: &mut PlayerState, fx: &mut Vec<Effect>) {
+    if matches!(state.voice, VoiceStatus::Ready) {
+        return;
+    }
+    if matches!(state.voice, VoiceStatus::Down) {
+        fx.push(Effect::JoinVoice);
+    }
+    state.voice = VoiceStatus::Joining;
+}
+
 /// A history row for a Spotify track that just became audible. `popped` is
 /// the queue item this airing consumed, when there was one — its presence is
 /// what makes this a request rather than the DJ's own context reaching a
@@ -1792,17 +1826,14 @@ fn aired_spotify(
     }
 }
 
+/// Hand the turn to a media item: bump the epoch, make sure voice is coming
+/// up, and emit the gated start plus its card.
 fn start_media(state: &mut PlayerState, item: QueueItem, gate: StartGate, fx: &mut Vec<Effect>) {
     state.media_epoch += 1;
     // The media card replaces whatever was up: the next Spotify `Playing`
     // is new to the card even if it's the same track as before.
     state.last_heard_track = None;
-    if !matches!(state.voice, VoiceStatus::Ready) {
-        if matches!(state.voice, VoiceStatus::Down) {
-            fx.push(Effect::JoinVoice);
-        }
-        state.voice = VoiceStatus::Joining;
-    }
+    ensure_voice(state, fx);
     fx.push(Effect::StartMedia { item: item.clone(), epoch: state.media_epoch, gate });
     fx.push(Effect::Ui(UiMsg::NowPlayingMedia { item: item.clone() }));
     fx.push(Effect::RecordAired(AiredTrack {
@@ -2082,6 +2113,10 @@ mod tests {
 
     fn has_leave(fx: &[Effect]) -> bool {
         fx.iter().any(|e| matches!(e, Effect::LeaveVoice))
+    }
+
+    fn has_join(fx: &[Effect]) -> bool {
+        fx.iter().any(|e| matches!(e, Effect::JoinVoice))
     }
 
     fn has_clear(fx: &[Effect]) -> bool {
@@ -2729,6 +2764,61 @@ mod tests {
         assert!(!sim.s.device_active, "the Connect device is released");
         assert!(matches!(sim.s.voice, VoiceStatus::Down));
         assert!(reply_text(&fx).contains("kept"), "got: {}", reply_text(&fx));
+    }
+
+    #[test]
+    fn a_bare_play_after_a_stop_brings_the_bot_back_into_voice() {
+        // Live 2026-09-01: `/stop` leaves the channel but keeps the session,
+        // so a bare `/play` is how you restart. It re-claimed the Connect
+        // device and replied "▶ Taking over the Spotify device" without
+        // rejoining, so the next track decoded into a bridge no call was
+        // draining — the card said playing, the channel was silent, and
+        // only `/login` brought the bot back.
+        let mut sim = Sim::baseline_playing();
+        sim.stop();
+        sim.transport(TransportEvent::SessionDisconnected);
+        assert!(matches!(sim.s.voice, VoiceStatus::Down));
+        assert!(!sim.s.device_active, "the stop released the device");
+
+        let (tx, _rx) = oneshot::channel();
+        let fx = sim.step(Input::Play { reply: tx });
+        assert!(has_join(&fx), "the takeover rejoins the channel: {fx:?}");
+        assert!(matches!(sim.s.voice, VoiceStatus::Joining));
+        assert!(sim.s.device_active, "and still claims the device");
+    }
+
+    #[test]
+    fn spotify_taking_the_turn_with_voice_down_joins_the_channel() {
+        // The other half of the same hole: the DJ presses play on their
+        // phone after a takeover. Our librespot decodes, so audio exists —
+        // it needs a call to drain into, whoever started it.
+        let mut sim = Sim::idle_device();
+        sim.s.voice = VoiceStatus::Down;
+        let fx = sim.transport(TransportEvent::Playing { uri: uri(9), meta: None });
+        assert!(has_join(&fx), "audio with no call is silence: {fx:?}");
+        assert!(matches!(sim.s.active, Active::Spotify { .. }));
+    }
+
+    #[test]
+    fn resuming_a_paused_baseline_with_an_empty_queue_joins_voice() {
+        // ⏯'s ▶ half with nothing queued: a resume is still audio.
+        let mut sim = Sim::baseline_paused(Some(PauseOwner::Human));
+        sim.s.voice = VoiceStatus::Down;
+        let fx = sim.toggle();
+        assert!(has_join(&fx), "{fx:?}");
+        assert!(spircs(&fx).contains(&SpircCmd::Play));
+    }
+
+    #[test]
+    fn a_refused_play_never_joins_voice() {
+        // The one ▶ outcome that makes no sound must not drag the bot into
+        // a channel: nothing is queued and the device is idle, so there is
+        // nothing to resume.
+        let mut sim = Sim::idle_device();
+        sim.s.voice = VoiceStatus::Down;
+        let fx = sim.toggle();
+        assert!(!has_join(&fx), "nothing to play: no join: {fx:?}");
+        assert!(reply_text(&fx).contains("Nothing is playing"), "{}", reply_text(&fx));
     }
 
     #[test]
