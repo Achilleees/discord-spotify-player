@@ -70,13 +70,71 @@ struct CurrentTrack {
     album_art_url: Option<String>,
 }
 
+/// Resolves one HTML entity body (the text between `&` and `;`) to its
+/// character. Named entities cover what Spotify's catalog actually uses;
+/// numeric ones (`#39`, `#x27`) are handled generically.
+fn entity_char(name: &str) -> Option<char> {
+    match name {
+        "amp" => Some('&'),
+        "lt" => Some('<'),
+        "gt" => Some('>'),
+        "quot" => Some('"'),
+        "apos" => Some('\''),
+        "nbsp" => Some('\u{a0}'),
+        _ => {
+            let digits = name.strip_prefix('#')?;
+            let code = match digits.strip_prefix(['x', 'X']) {
+                Some(hex) => u32::from_str_radix(hex, 16).ok()?,
+                None => digits.parse().ok()?,
+            };
+            char::from_u32(code)
+        }
+    }
+}
+
+/// Decodes the HTML entities Spotify's catalog carries in some titles and
+/// artist names ("Pola &amp; Bryson"). Single pass, so a doubly-escaped
+/// `&amp;lt;` decodes to `&lt;` and stops there; an `&` that starts no
+/// entity is passed through untouched.
+fn decode_entities(s: &str) -> String {
+    if !s.contains('&') {
+        return s.to_owned();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        let tail = &rest[amp + 1..];
+        // Entity bodies are short; a ';' beyond that is ordinary punctuation.
+        let end = tail
+            .char_indices()
+            .take(10)
+            .find(|(_, c)| *c == ';')
+            .map(|(i, _)| i);
+        match end.and_then(|i| entity_char(&tail[..i]).map(|c| (c, i))) {
+            Some((c, i)) => {
+                out.push(c);
+                rest = &tail[i + 1..];
+            }
+            None => {
+                out.push('&');
+                rest = tail;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 fn track_info_from_audio_item(audio_item: &AudioItem) -> CurrentTrack {
     let artist = match &audio_item.unique_fields {
         UniqueFields::Track { artists, .. } => {
-            let names: Vec<_> = artists.iter().map(|a| a.name.clone()).collect();
+            let names: Vec<_> = artists.iter().map(|a| decode_entities(&a.name)).collect();
             names.join(", ")
         }
-        UniqueFields::Local { artists, .. } => artists.clone().unwrap_or_default(),
+        UniqueFields::Local { artists, .. } => {
+            artists.as_deref().map(decode_entities).unwrap_or_default()
+        }
         UniqueFields::Episode { .. } => String::new(),
     };
     let album_art_url = audio_item
@@ -87,7 +145,7 @@ fn track_info_from_audio_item(audio_item: &AudioItem) -> CurrentTrack {
 
     CurrentTrack {
         track_id: audio_item.track_id.clone(),
-        title: audio_item.name.clone(),
+        title: decode_entities(&audio_item.name),
         artist,
         album_art_url,
     }
@@ -173,7 +231,10 @@ impl SpotifyPlayer {
     /// All artists' names, joined the way Spotify itself displays multiple
     /// artists. Used by `lookup_track`.
     fn join_artist_names<'a>(artists: impl IntoIterator<Item = &'a Artist>) -> String {
-        let names: Vec<_> = artists.into_iter().map(|a| a.name.clone()).collect();
+        let names: Vec<_> = artists
+            .into_iter()
+            .map(|a| decode_entities(&a.name))
+            .collect();
         if names.is_empty() {
             "Unknown artist".to_string()
         } else {
@@ -204,7 +265,7 @@ impl SpotifyPlayer {
                 let artist = Self::join_artist_names(track.artists.iter());
                 let album_art_url = Self::largest_cover_url(session, &track.album.covers);
                 Some(TrackLookup {
-                    title: track.name,
+                    title: decode_entities(&track.name),
                     artist,
                     album_art_url,
                 })
@@ -212,7 +273,7 @@ impl SpotifyPlayer {
             SpotifyUri::Episode { .. } => {
                 let episode = Episode::get(session, uri).await.ok()?;
                 Some(TrackLookup {
-                    title: episode.name,
+                    title: decode_entities(&episode.name),
                     artist: "Podcast".to_string(),
                     album_art_url: None,
                 })
@@ -480,5 +541,53 @@ impl SpotifyPlayer {
             let _ = transport_tx.send(TransportEvent::SessionDisconnected);
             return Ok(());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decode_entities;
+
+    #[test]
+    fn decodes_the_entities_spotify_actually_sends() {
+        // Observed live on the now-playing card.
+        assert_eq!(decode_entities("Pola &amp; Bryson"), "Pola & Bryson");
+        assert_eq!(
+            decode_entities("Ed:it, Pola &amp; Bryson"),
+            "Ed:it, Pola & Bryson"
+        );
+    }
+
+    #[test]
+    fn decodes_named_and_numeric_entities() {
+        assert_eq!(decode_entities("&lt;tag&gt;"), "<tag>");
+        assert_eq!(decode_entities("&quot;quoted&quot;"), "\"quoted\"");
+        assert_eq!(decode_entities("it&apos;s"), "it's");
+        assert_eq!(decode_entities("it&#39;s"), "it's");
+        assert_eq!(decode_entities("it&#x27;s"), "it's");
+    }
+
+    #[test]
+    fn leaves_plain_text_and_bare_ampersands_alone() {
+        assert_eq!(decode_entities("Simon & Garfunkel"), "Simon & Garfunkel");
+        assert_eq!(decode_entities("AT&T"), "AT&T");
+        assert_eq!(decode_entities("no entities here"), "no entities here");
+        // A ';' far past the '&' is punctuation, not an entity terminator.
+        assert_eq!(decode_entities("a & b; c"), "a & b; c");
+        // Unknown entity names are left as written.
+        assert_eq!(decode_entities("&bogus;"), "&bogus;");
+    }
+
+    #[test]
+    fn decodes_only_one_pass() {
+        // A doubly-escaped entity resolves one level, never to '<'.
+        assert_eq!(decode_entities("&amp;lt;"), "&lt;");
+    }
+
+    #[test]
+    fn handles_multibyte_text_around_entities() {
+        assert_eq!(decode_entities("Café &amp; Crème"), "Café & Crème");
+        assert_eq!(decode_entities("日本 &amp; 中国"), "日本 & 中国");
+        assert_eq!(decode_entities("🎵&amp;🎶"), "🎵&🎶");
     }
 }
