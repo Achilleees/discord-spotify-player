@@ -232,11 +232,67 @@ fn empty_snapshot() -> PlayerSnapshot {
 
 /// Spawn the player actor and return its handle. Called once, when the bot
 /// is built; the actor lives for the process (lifecycle A).
+/// One durable write. Both variants go through a single writer so their
+/// order is the order the actor decided them in.
+enum StoreWrite {
+    /// The whole queue, latest-wins — an older snapshot committing last
+    /// would leave the table permanently behind memory.
+    Queue(Vec<QueueItem>),
+    /// One aired track. Order matters here too: history row ids are what
+    /// back-navigation walks, so an out-of-order insert misorders the walk.
+    Aired(crate::player::state::AiredTrack),
+}
+
+/// The one thread allowed to write to the stores.
+///
+/// Replaces a `spawn_blocking` per write: the blocking pool gives no
+/// ordering between tasks, and `QueueStore::save` is a whole-table rewrite,
+/// so two saves landing out of order persist the older queue with nothing
+/// to reconcile it. Queue snapshots coalesce — only the newest pending one
+/// is worth writing.
+fn spawn_store_writer(
+    history: Option<Arc<crate::history::HistoryStore>>,
+    queue_store: Option<Arc<crate::queue_store::QueueStore>>,
+) -> mpsc::UnboundedSender<StoreWrite> {
+    let (tx, mut rx) = mpsc::unbounded_channel::<StoreWrite>();
+    tokio::task::spawn_blocking(move || {
+        while let Some(first) = rx.blocking_recv() {
+            // Drain whatever else is already queued so a burst of queue
+            // mutations costs one rewrite rather than one per mutation.
+            let mut batch = vec![first];
+            while let Ok(next) = rx.try_recv() {
+                batch.push(next);
+            }
+            let mut latest_queue = None;
+            for write in batch {
+                match write {
+                    StoreWrite::Queue(items) => latest_queue = Some(items),
+                    StoreWrite::Aired(track) => {
+                        if let Some(h) = &history {
+                            if let Err(e) = h.record(&track) {
+                                tracing::warn!(error = %e, "failed to record play history");
+                            }
+                        }
+                    }
+                }
+            }
+            if let (Some(items), Some(store)) = (latest_queue, &queue_store) {
+                if let Err(e) = store.save(&items) {
+                    tracing::warn!(error = %e, "failed to persist the queue");
+                }
+            }
+        }
+    });
+    tx
+}
+
 pub fn spawn(deps: PlayerDeps) -> PlayerHandle {
     let (tx, rx) = mpsc::unbounded_channel();
     let handle = PlayerHandle { tx: tx.clone(), spirc: deps.spirc_cmd_tx.clone() };
+    let store_tx = spawn_store_writer(deps.history.clone(), deps.queue_store.clone());
     let actor = Actor {
         deps,
+        store_tx,
         tx,
         state: PlayerState::new(),
         pending_gate: None,
@@ -251,6 +307,8 @@ pub fn spawn(deps: PlayerDeps) -> PlayerHandle {
 
 struct Actor {
     deps: PlayerDeps,
+    /// Serialized durable writes; see [`spawn_store_writer`].
+    store_tx: mpsc::UnboundedSender<StoreWrite>,
     /// Own mailbox sender, cloned into runners/timers/join tasks so their
     /// completions come back as inputs.
     tx: mpsc::UnboundedSender<Input>,
@@ -326,14 +384,9 @@ impl Actor {
             // far more transport events than queue mutations, and a write
             // per event would be noise.
             if self.state.queue.revision() != queue_rev {
-                if let Some(store) = self.deps.queue_store.clone() {
-                    let items = self.state.queue.snapshot();
-                    tokio::task::spawn_blocking(move || {
-                        if let Err(e) = store.save(&items) {
-                            tracing::warn!(error = %e, "failed to persist the queue");
-                        }
-                    });
-                }
+                let _ = self
+                    .store_tx
+                    .send(StoreWrite::Queue(self.state.queue.snapshot()));
             }
 
             // A `StartMedia` in this batch: remember whose item it is, so a
@@ -468,16 +521,10 @@ impl Actor {
             Effect::ClearBridge => self.deps.bridge.clear(),
 
             Effect::RecordAired(aired) => {
-                // Spawned, never awaited here: the actor must not block on
-                // the database. A failed write costs a history row, never
-                // playback, so it is logged and dropped.
-                if let Some(history) = self.deps.history.clone() {
-                    tokio::task::spawn_blocking(move || {
-                        if let Err(e) = history.record(&aired) {
-                            tracing::warn!(error = %e, "failed to record play history");
-                        }
-                    });
-                }
+                // Handed to the serialized writer, never written here: the
+                // actor must not block on the database, and row order is the
+                // order back-navigation walks.
+                let _ = self.store_tx.send(StoreWrite::Aired(aired));
             }
 
             Effect::ResolveMeta(uri) => {
@@ -512,21 +559,40 @@ impl Actor {
                 let history = self.deps.history.clone();
                 let tx = self.tx.clone();
                 tokio::task::spawn_blocking(move || {
-                    let track = history
-                        .and_then(|h| match h.aired_before(before) {
-                            Ok(row) => row,
-                            Err(e) => {
-                                tracing::warn!(error = %e, "could not read the play history");
-                                None
+                    // Walk back until a row we can actually jump to, rather
+                    // than stopping at the first one we can't: a YouTube or
+                    // file row has no Spotify uri, and treating it as the end
+                    // would wall off every Spotify track behind it — which on
+                    // a bot built for mixing sources is most of them.
+                    // Bounded so a history made entirely of media items can't
+                    // walk the whole table.
+                    const MAX_STEPS: usize = 50;
+                    let mut track = None;
+                    if let Some(history) = history {
+                        let mut anchor = before;
+                        for _ in 0..MAX_STEPS {
+                            let row = match history.aired_before(anchor) {
+                                Ok(Some(row)) => row,
+                                Ok(None) => break,
+                                Err(e) => {
+                                    tracing::warn!(
+                                        error = %e,
+                                        "could not read the play history"
+                                    );
+                                    break;
+                                }
+                            };
+                            anchor = Some(row.id);
+                            if let Ok(uri) = SpotifyUri::from_uri(&row.track_ref) {
+                                track = Some(PreviousTrack {
+                                    id: row.id,
+                                    uri,
+                                    context_uri: row.context_uri,
+                                });
+                                break;
                             }
-                        })
-                        .and_then(|row| {
-                            // A media item has no Spotify uri to jump to;
-                            // skip past it rather than failing the walk.
-                            SpotifyUri::from_uri(&row.track_ref).ok().map(|uri| {
-                                PreviousTrack { id: row.id, uri, context_uri: row.context_uri }
-                            })
-                        });
+                        }
+                    }
                     let _ = tx.send(Input::PreviousResolved { track });
                 });
             }

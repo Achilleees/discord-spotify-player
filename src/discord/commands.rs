@@ -729,15 +729,29 @@ impl Handler {
         if rows.is_empty() {
             return "Nothing has played yet.".to_string();
         }
+        // Discord rejects a body over 2000 characters outright, and 25 rows
+        // of long titles clears that easily — so stop early and say so, the
+        // way the queue listing already does.
+        const MAX_BODY: usize = 1900;
         let mut out = String::from("🕘 **Recently played**\n");
+        let total = rows.len();
+        let mut shown = 0usize;
         for row in rows {
             let title = row.title.as_deref().unwrap_or("Unknown track");
             let artist = row.artist.as_deref().unwrap_or("Unknown artist");
-            out.push_str(&format!("• **{title}** — {artist}"));
+            let mut line = format!("• **{title}** — {artist}");
             if let Some(who) = row.queued_by.as_deref() {
-                out.push_str(&format!(" (queued by {who})"));
+                line.push_str(&format!(" (queued by {who})"));
             }
-            out.push('\n');
+            line.push('\n');
+            if out.len() + line.len() > MAX_BODY {
+                break;
+            }
+            out.push_str(&line);
+            shown += 1;
+        }
+        if shown < total {
+            out.push_str(&format!("…and {} more.", total - shown));
         }
         out
     }

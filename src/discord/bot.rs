@@ -585,7 +585,17 @@ impl DiscordBot {
                     let Some(ctx) = ({ ctx_store.lock().clone() }) else { return };
                     let Some(manager) = songbird::get(&ctx).await else { return };
                     leaving_voice.store(true, Ordering::SeqCst);
-                    let _ = manager.remove(guild_id).await;
+                    let left = manager.remove(guild_id).await;
+                    if let Err(e) = left {
+                        // Nothing was removed (already out of the channel),
+                        // so Discord sends no voice-state update and nothing
+                        // would ever consume the guard. Left set, it would
+                        // swallow the NEXT genuine force-disconnect and leave
+                        // librespot feeding a dead call.
+                        leaving_voice.store(false, Ordering::SeqCst);
+                        tracing::debug!(error = ?e, "leave was a no-op — not already in voice");
+                        return;
+                    }
                     tracing::info!("bot left voice channel");
                 })
             })
