@@ -1,9 +1,14 @@
 //! What actually aired, in order.
 //!
-//! Append-only: a row is written when a track *becomes audible*, never when
+//! Append-only: a row is written when a track *starts playing*, never when
 //! it is queued. Spotify's own playlist and autoplay tracks are recorded the
 //! same way as requests — the bot drives the account, so this log, not
 //! Spotify's, is the record of what the room heard.
+//!
+//! "Starts playing" is the moment the bot commits to it, which for a queue
+//! item is slightly ahead of the first sample: a track skipped a second in
+//! still leaves a row. That is deliberate — the alternative is recording at
+//! the end, which loses everything skipped and everything still playing.
 //!
 //! Each row carries the `context_uri` it aired from. That is what lets a
 //! later back-jump reopen the playlist positioned at a track

@@ -149,6 +149,39 @@ fn classify_link(input: &str) -> LinkKind {
     }
 }
 
+/// Renders the `/history` listing, newest first. Pure so its branches —
+/// the fallbacks, the requester suffix, and the length budget — can be
+/// pinned by tests; the surrounding command only fetches the rows.
+fn render_history(rows: &[crate::history::HistoryRow]) -> String {
+    if rows.is_empty() {
+        return "Nothing has played yet.".to_string();
+    }
+    // Discord rejects a body over 2000 characters outright, and 25 rows of
+    // long titles clears that easily — so stop early and say so, the way the
+    // queue listing already does.
+    const MAX_BODY: usize = 1900;
+    let mut out = String::from("🕘 **Recently played**\n");
+    let mut shown = 0usize;
+    for row in rows {
+        let title = row.title.as_deref().unwrap_or("Unknown track");
+        let artist = row.artist.as_deref().unwrap_or("Unknown artist");
+        let mut line = format!("• **{title}** — {artist}");
+        if let Some(who) = row.queued_by.as_deref() {
+            line.push_str(&format!(" (queued by {who})"));
+        }
+        line.push('\n');
+        if out.len() + line.len() > MAX_BODY {
+            break;
+        }
+        out.push_str(&line);
+        shown += 1;
+    }
+    if shown < rows.len() {
+        out.push_str(&format!("…and {} more.", rows.len() - shown));
+    }
+    out
+}
+
 /// Reply to a button press so only the clicker sees it.
 async fn respond_ephemeral(
     ctx: &Context,
@@ -726,34 +759,7 @@ impl Handler {
                 return "⚠️ Couldn't read the play history.".to_string();
             }
         };
-        if rows.is_empty() {
-            return "Nothing has played yet.".to_string();
-        }
-        // Discord rejects a body over 2000 characters outright, and 25 rows
-        // of long titles clears that easily — so stop early and say so, the
-        // way the queue listing already does.
-        const MAX_BODY: usize = 1900;
-        let mut out = String::from("🕘 **Recently played**\n");
-        let total = rows.len();
-        let mut shown = 0usize;
-        for row in rows {
-            let title = row.title.as_deref().unwrap_or("Unknown track");
-            let artist = row.artist.as_deref().unwrap_or("Unknown artist");
-            let mut line = format!("• **{title}** — {artist}");
-            if let Some(who) = row.queued_by.as_deref() {
-                line.push_str(&format!(" (queued by {who})"));
-            }
-            line.push('\n');
-            if out.len() + line.len() > MAX_BODY {
-                break;
-            }
-            out.push_str(&line);
-            shown += 1;
-        }
-        if shown < total {
-            out.push_str(&format!("…and {} more.", total - shown));
-        }
-        out
+        render_history(&rows)
     }
 
     async fn handle_announce(&self) -> String {
@@ -888,11 +894,60 @@ impl Handler {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_valid_track_id, parse_track_id_from_url, render_now_playing, voice_gate, NowPlaying,
+        is_valid_track_id, parse_track_id_from_url, render_history, render_now_playing, voice_gate,
+        NowPlaying,
     };
+    use crate::history::HistoryRow;
+    use crate::player::state::AiredSource;
     use serenity::all::ChannelId;
 
     const ID: &str = "4cOdK2wGLETKBW3PvgPWqT"; // 22 base62 chars
+
+    fn row(title: &str, who: Option<&str>) -> HistoryRow {
+        HistoryRow {
+            id: 1,
+            aired_at: "2026-09-01 12:00:00".into(),
+            source: AiredSource::Baseline,
+            track_ref: "spotify:track:x".into(),
+            context_uri: None,
+            title: Some(title.into()),
+            artist: Some("An Artist".into()),
+            queued_by: who.map(String::from),
+        }
+    }
+
+    #[test]
+    fn history_names_the_requester_only_for_requests() {
+        let out = render_history(&[row("Asked For", Some("Papos")), row("Just Played", None)]);
+        assert!(out.contains("**Asked For** — An Artist (queued by Papos)"), "{out}");
+        assert!(out.contains("**Just Played** — An Artist\n"), "{out}");
+        assert!(!out.contains("Just Played** — An Artist (queued"), "{out}");
+    }
+
+    #[test]
+    fn history_falls_back_when_metadata_is_missing() {
+        let mut r = row("x", None);
+        r.title = None;
+        r.artist = None;
+        let out = render_history(&[r]);
+        assert!(out.contains("**Unknown track** — Unknown artist"), "{out}");
+    }
+
+    #[test]
+    fn an_empty_history_says_so_rather_than_showing_a_heading() {
+        assert_eq!(render_history(&[]), "Nothing has played yet.");
+    }
+
+    #[test]
+    fn a_long_history_stays_inside_discords_message_limit() {
+        // 25 rows of realistic Spotify titles blow past 2000 characters, and
+        // Discord rejects the whole message rather than truncating it.
+        let long = "A Very Long Remastered Track Title (2011 Remaster) - Extended";
+        let rows: Vec<_> = (0..25).map(|_| row(long, Some("SomebodyWithALongName"))).collect();
+        let out = render_history(&rows);
+        assert!(out.len() <= 2000, "would be rejected outright: {} chars", out.len());
+        assert!(out.contains("…and "), "and it says what it left out: {out}");
+    }
 
     // --- voice_gate: the authorization rule behind every playback command ---
 

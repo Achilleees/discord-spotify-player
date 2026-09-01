@@ -3055,6 +3055,58 @@ mod tests {
     }
 
     #[test]
+    fn a_second_back_press_waits_instead_of_stealing_the_first_reply() {
+        // Overwriting `pending_reply` would drop the first caller's channel
+        // (their interaction times out) and walk back twice for one intent.
+        let mut sim = Sim::baseline_playing();
+        let first = sim.previous();
+        assert!(first
+            .iter()
+            .any(|e| matches!(e, Effect::ResolvePrevious { .. })));
+
+        let second = sim.previous();
+        assert!(
+            !second
+                .iter()
+                .any(|e| matches!(e, Effect::ResolvePrevious { .. })),
+            "the second press does not start a second walk"
+        );
+        assert!(reply_text(&second).contains("Already going back"));
+    }
+
+    #[test]
+    fn a_media_item_records_the_reference_its_own_kind_is_played_from() {
+        // The feeder fetches the url; back-navigation parses the ref. A
+        // swapped field here is junk in the history and unplayable later.
+        let mut sim = Sim::new();
+        sim.s.voice = VoiceStatus::Ready;
+
+        let mut fx = Vec::new();
+        start_media(&mut sim.s, media_item("a-track"), StartGate::Immediate, &mut fx);
+        let rows = aired(&fx);
+        // The fixture's url is "u", its title "a-track" and its id "v", so
+        // this distinguishes the url field from every neighbour it could be
+        // confused with.
+        assert_eq!(rows[0].track_ref, "u", "a YouTube item records its url");
+
+        let file = QueueItem::new(
+            MediaSource::File {
+                filename: "clip.mp3".into(),
+                attachment_url: "https://cdn.discord/attachment".into(),
+            },
+            "Papos".into(),
+            1,
+        );
+        let mut fx = Vec::new();
+        start_media(&mut sim.s, file, StartGate::Immediate, &mut fx);
+        let rows = aired(&fx);
+        assert_eq!(
+            rows[0].track_ref, "https://cdn.discord/attachment",
+            "a file item records the url it is fetched from, not its name"
+        );
+    }
+
+    #[test]
     fn resuming_the_jumped_to_track_does_not_throw_the_walk_away() {
         // Librespot re-emits Playing on a resume or seek. Treating that as
         // "the playlist moved on" reset the cursor, bringing back the very
