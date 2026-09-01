@@ -37,7 +37,7 @@ playback."*)
 
 | Button | Gate | What it does |
 |---|---|---|
-| ⏮ (`ctrl_prev`) | voice gate | Same as Spotify's "previous"; unavailable while a queue (media) item holds the turn. |
+| ⏮ (`ctrl_prev`) | voice gate | Steps back through the bot's own play history, not Spotify's. Reopens the playlist the track came from, positioned at it, so the DJ's context survives. Unavailable while a queue (media) item holds the turn. |
 | ⏯ (`ctrl_pause_toggle`) | voice gate | Pauses/resumes the active media item, pauses a playing Spotify baseline, or — if nothing is audible — starts/resumes whatever the queue head or Spotify state implies (see below). If the device isn't active yet, this is also the takeover gesture. |
 | ⏭ (`ctrl_next`) | voice gate | Same as `/skip`. |
 | ➕ Queue (`ctrl_queue_hint`) | none — always available | Ephemeral reply with the queue listing and how to add to it. |
