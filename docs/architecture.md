@@ -93,6 +93,26 @@ an unexplained one as a force-disconnect worth tearing the session down
 for. A `leaving_voice` flag, set immediately before `manager.remove`,
 marks our own departure as deliberate so a stop cannot log the DJ out.
 
+That guard is armed by whoever asks to leave, so only a departure that
+Discord will actually echo may arm it. `Input::Stop` carries a
+`leave_voice` flag for exactly this: `true` for a human `/stop`, where the
+voice gate guarantees the bot is in the channel and the echo always comes,
+and `false` from the teardown paths, which run *because* voice is already
+gone. A teardown that armed the guard would leave it latched — Discord
+sends no echo for a state that did not change — and the next genuine force
+disconnect would read as deliberate, leaving librespot feeding a dead call.
+
+The mirror rule governs joining. Audio reaches Discord only through the
+bridge, and the bridge is drained only by a live call, so every path that
+makes the bot audible has to arrange one. `ensure_voice` is that single
+point: `start_media` calls it, `begin_load` calls it, both ⏯ resume arms
+and the takeover call it, and so does a turn-approved `Playing` — our own
+librespot decoding is proof audio exists, whoever started it. The one ▶
+outcome that makes no sound, "Nothing is playing right now", deliberately
+does not. Joining is idempotent (the shell short-circuits when already in
+a call, answering `VoiceReady` at once), which is also what lets the core's
+`voice` field heal itself when the shell joined without telling it.
+
 Keeping these separate means a session dying (a dead refresh token, a
 takeover, a forced disconnect) can never leave the queue or the turn in an
 inconsistent state — the player only ever finds out via ordinary `Input`s
