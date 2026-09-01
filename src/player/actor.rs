@@ -671,8 +671,14 @@ impl Actor {
             SpircCmd::ActivateDevice => SpircCommand::ActivateDevice,
             SpircCmd::Transfer => SpircCommand::Transfer,
             SpircCmd::Disconnect => SpircCommand::Disconnect,
-            SpircCmd::LoadContext { context_uri, track_uri } => {
-                SpircCommand::LoadContext { context_uri, track_uri }
+            SpircCmd::LoadContext { context_uri, track_uri, options } => {
+                SpircCommand::LoadContext {
+                    context_uri,
+                    track_uri,
+                    shuffle: options.shuffle,
+                    repeat_context: options.repeat_context,
+                    repeat_track: options.repeat_track,
+                }
             }
         };
         let _ = tx.send(command);

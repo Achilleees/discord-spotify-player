@@ -187,6 +187,9 @@ pub struct PlayerState {
     /// accepted for; suppresses duplicate cards when librespot re-emits
     /// `Playing` for the same track (seek, resume).
     pub last_heard_track: Option<String>,
+    /// The DJ's shuffle/repeat settings, mirrored from Spotify so a context
+    /// jump can put them back.
+    pub play_options: PlayOptions,
     /// Where back-navigation has walked to in the play history. `None` means
     /// "live": the next ⏮ starts from whatever is playing. Any forward move
     /// (a skip, a play, a queued item starting) puts us back live.
@@ -213,6 +216,7 @@ impl PlayerState {
             sp: SpDevice::Inactive,
             link_up: false,
             context_uri: None,
+            play_options: PlayOptions::default(),
             history_cursor: None,
             awaiting_jump: None,
             pending_reply: None,
@@ -281,6 +285,15 @@ impl AiredSource {
     }
 }
 
+/// Shuffle/repeat, as Spotify reports them and as a context load must
+/// restore them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PlayOptions {
+    pub shuffle: bool,
+    pub repeat_context: bool,
+    pub repeat_track: bool,
+}
+
 /// A track found in the play history by a ⏮, handed back to the core.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PreviousTrack {
@@ -326,6 +339,10 @@ pub enum TransportEvent {
         /// only on a context load or queue mutation — never per advance.
         context_uri: Option<String>,
     },
+    /// Shuffle/repeat as Spotify reports them. Tracked so a context jump
+    /// can restore them: loading a context resets these on librespot's side,
+    /// which would silently turn the DJ's shuffle off.
+    OptionsChanged { shuffle: bool, repeat_context: bool, repeat_track: bool },
     SessionConnected,
     SessionDisconnected,
 }
@@ -452,7 +469,7 @@ pub enum SpircCmd {
     /// which replaces the context with a single track, this restores the
     /// playlist and starts inside it — the only non-destructive way to play
     /// a specific track the DJ already heard.
-    LoadContext { context_uri: String, track_uri: SpotifyUri },
+    LoadContext { context_uri: String, track_uri: SpotifyUri, options: PlayOptions },
     /// Give up the active-device slot. Always paired with a pause: the
     /// non-pausing form leaves librespot decoding into a bridge nobody
     /// drains, and its next `Playing` would re-take the turn from outside
@@ -923,6 +940,7 @@ pub fn step(state: &mut PlayerState, input: Input, now: Instant) -> Vec<Effect> 
                     fx.push(Effect::Spirc(SpircCmd::LoadContext {
                         context_uri,
                         track_uri: uri,
+                        options: state.play_options,
                     }));
                     reply(&mut fx, tx, "⏮ Previous track.");
                 }
@@ -1510,6 +1528,12 @@ fn handle_transport(state: &mut PlayerState, ev: TransportEvent, now: Instant, f
                     maybe_arm(state, now, fx);
                 }
             }
+        }
+
+        TransportEvent::OptionsChanged { shuffle, repeat_context, repeat_track } => {
+            // Mirror only — the DJ owns these. Kept so a context jump can
+            // hand them back rather than silently resetting them.
+            state.play_options = PlayOptions { shuffle, repeat_context, repeat_track };
         }
 
         TransportEvent::SessionConnected => {
@@ -2865,10 +2889,61 @@ mod tests {
             vec![SpircCmd::LoadContext {
                 context_uri: "spotify:playlist:abc".to_string(),
                 track_uri: uri(3),
+                options: PlayOptions::default(),
             }],
             "reopens the context instead of replacing it with one track"
         );
         assert_eq!(sim.s.history_cursor, Some(7), "the cursor advances back");
+    }
+
+    #[test]
+    fn a_back_jump_hands_the_djs_shuffle_and_repeat_back() {
+        // Loading a context resets these on librespot's side, so the jump
+        // has to restore them or it silently turns the DJ's shuffle off.
+        let mut sim = Sim::baseline_playing();
+        sim.transport(TransportEvent::OptionsChanged {
+            shuffle: true,
+            repeat_context: true,
+            repeat_track: false,
+        });
+        sim.previous();
+        let fx = sim.step(Input::PreviousResolved {
+            track: Some(prev_track(7, 3, Some("spotify:playlist:abc"))),
+        });
+
+        assert_eq!(
+            spircs(&fx),
+            vec![SpircCmd::LoadContext {
+                context_uri: "spotify:playlist:abc".to_string(),
+                track_uri: uri(3),
+                options: PlayOptions {
+                    shuffle: true,
+                    repeat_context: true,
+                    repeat_track: false,
+                },
+            }]
+        );
+    }
+
+    #[test]
+    fn shuffle_and_repeat_arrive_separately_but_are_tracked_together() {
+        // Spotify sends each half in its own event; neither may clobber the
+        // other's value.
+        let mut sim = Sim::baseline_playing();
+        sim.transport(TransportEvent::OptionsChanged {
+            shuffle: true,
+            repeat_context: false,
+            repeat_track: false,
+        });
+        sim.transport(TransportEvent::OptionsChanged {
+            shuffle: true,
+            repeat_context: false,
+            repeat_track: true,
+        });
+        assert_eq!(
+            sim.s.play_options,
+            PlayOptions { shuffle: true, repeat_context: false, repeat_track: true }
+        );
     }
 
     #[test]

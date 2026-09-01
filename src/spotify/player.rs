@@ -2,7 +2,10 @@ use crate::audio_bridge::AudioBridge;
 use crate::config::Config;
 use crate::player::state::{TrackMeta, TransportEvent};
 use crate::spotify::sink::{DiscordSink, DspConfig};
-use librespot_connect::{ConnectConfig, LoadRequest, LoadRequestOptions, PlayingTrack, Spirc};
+use librespot_connect::{
+    ConnectConfig, LoadContextOptions, LoadRequest, LoadRequestOptions, Options, PlayingTrack,
+    Spirc,
+};
 use librespot_core::authentication::Credentials;
 use librespot_core::config::{DeviceType, SessionConfig};
 use librespot_core::session::Session;
@@ -53,7 +56,13 @@ pub enum SpircCommand {
     Disconnect,
     /// Reopen a context at one of its tracks, restoring the playlist rather
     /// than replacing it the way `Load` does.
-    LoadContext { context_uri: String, track_uri: SpotifyUri },
+    LoadContext {
+        context_uri: String,
+        track_uri: SpotifyUri,
+        shuffle: bool,
+        repeat_context: bool,
+        repeat_track: bool,
+    },
 }
 
 /// Track metadata resolved through the live librespot session, for
@@ -237,6 +246,12 @@ impl SpotifyPlayer {
             // same track_id. Nothing here ever calls api.spotify.com.
             let mut current: Option<CurrentTrack> = None;
             let mut last_sent_track: Option<SpotifyUri> = None;
+            // Spotify reports shuffle and repeat in separate events, each
+            // carrying only its own half; the other half is remembered here
+            // so the core always receives a complete picture.
+            let mut last_shuffle = false;
+            let mut last_repeat_context = false;
+            let mut last_repeat_track = false;
 
             while let Some(event) = rx.recv().await {
                 match event {
@@ -319,6 +334,23 @@ impl SpotifyPlayer {
                             queued,
                             context_uri,
                         });
+                    }
+                    PlayerEvent::ShuffleChanged { shuffle } => {
+                        let _ = transport_tx.send(TransportEvent::OptionsChanged {
+                            shuffle,
+                            repeat_context: last_repeat_context,
+                            repeat_track: last_repeat_track,
+                        });
+                        last_shuffle = shuffle;
+                    }
+                    PlayerEvent::RepeatChanged { context, track } => {
+                        let _ = transport_tx.send(TransportEvent::OptionsChanged {
+                            shuffle: last_shuffle,
+                            repeat_context: context,
+                            repeat_track: track,
+                        });
+                        last_repeat_context = context;
+                        last_repeat_track = track;
                     }
                     PlayerEvent::SessionConnected { .. } => {
                         let _ = transport_tx.send(TransportEvent::SessionConnected);
@@ -469,7 +501,13 @@ impl SpotifyPlayer {
                                     tracing::warn!(error = ?e, "spirc transfer failed");
                                 }
                             }
-                            Some(SpircCommand::LoadContext { context_uri, track_uri }) => {
+                            Some(SpircCommand::LoadContext {
+                                context_uri,
+                                track_uri,
+                                shuffle,
+                                repeat_context,
+                                repeat_track,
+                            }) => {
                                 // Same active-device requirement as Load.
                                 if let Err(e) = spirc.activate() {
                                     tracing::warn!(error = ?e, "spirc activate failed");
@@ -480,6 +518,13 @@ impl SpotifyPlayer {
                                         start_playing: true,
                                         playing_track: Some(PlayingTrack::Uri(
                                             track_uri.to_uri(),
+                                        )),
+                                        // Without these librespot resets
+                                        // shuffle/repeat on every load, which
+                                        // would quietly turn the DJ's shuffle
+                                        // off on a back-jump.
+                                        context_options: Some(LoadContextOptions::Options(
+                                            Options { shuffle, repeat: repeat_context, repeat_track },
                                         )),
                                         ..Default::default()
                                     },
