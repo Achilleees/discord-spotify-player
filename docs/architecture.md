@@ -84,6 +84,15 @@ tap from silently stealing playback state out from under the queue.
    drops the replaced session's armed track itself once the new session's
    `LinkUp` arrives.
 
+The separation cuts the other way too: `/stop` belongs entirely to (1). It
+pauses, releases the Connect device, leaves the voice channel and keeps
+the queue — and never reaches the session supervisor or the account. That
+needs one guard, because leaving voice is not a purely local act: Discord
+echoes the departure back as a voice-state update, and the handler treats
+an unexplained one as a force-disconnect worth tearing the session down
+for. A `leaving_voice` flag, set immediately before `manager.remove`,
+marks our own departure as deliberate so a stop cannot log the DJ out.
+
 Keeping these separate means a session dying (a dead refresh token, a
 takeover, a forced disconnect) can never leave the queue or the turn in an
 inconsistent state — the player only ever finds out via ordinary `Input`s
@@ -158,6 +167,61 @@ the request to hear it here. It never happens on a bare reconnect, on boot
 auto-start, or on an on-demand session brought up to resolve a link: a
 background session must not steal the "currently playing" slot away from a
 DJ who's actively using their phone when nothing has been asked of the bot.
+
+## What aired, and what is still queued
+
+Two tables in the same SQLite file as the credential store, with one job
+each.
+
+**`play_history`** is append-only and written when a track *becomes
+audible* — never when it is queued. Spotify's own playlist and autoplay
+tracks are recorded exactly like requests, because the bot drives the
+account: this log, not Spotify's, is the record of what the room heard.
+Every row keeps the `context_uri` it aired from, which is what makes a
+back-jump possible. The core emits `Effect::RecordAired` alongside the
+card that announces the track, so a track paused straight back down under
+a media item — one that never actually played — writes nothing.
+
+**`queue_items`** holds the pending queue and is rewritten whole inside one
+transaction whenever `PriorityQueue::revision()` changes. The actor
+compares that counter across each `step`, so the write happens on real
+queue mutations rather than on every transport event. There is no expiry:
+nothing is audible without a voice channel and people in it, so presence
+already gates a stale queue, and the VPS redeploys on every push to `main`
+— restarts are routine, not exceptional. `Input::RestoreQueue` refills the
+queue at boot, stamps fresh item ids, starts nothing, and refuses to
+displace a queue someone is already using.
+
+## Going back
+
+⏮ walks the bot's own history rather than asking Spotify, because the two
+diverge the moment anyone touches a phone. The core stays pure: it emits
+`Effect::ResolvePrevious { before }`, the actor does the blocking read on
+a worker thread, and the answer returns through the mailbox as
+`Input::PreviousResolved`.
+
+Playing the result uses `SpircCmd::LoadContext`, which becomes
+`LoadRequest::from_context_uri(..., playing_track: Uri(target))` — it
+*reopens* the playlist positioned at the track. That is a different
+operation from `SpircCmd::Load`, which builds a one-track context and so
+replaces the DJ's playlist; `Load` stays restricted to `sp == Idle` for
+exactly that reason. Two properties of librespot shape the rest:
+
+- A context load does **not** discard Spotify's queue
+  (`clear_next_tracks` is queue-preserving), so an armed request survives
+  a back-jump — it simply plays after the track jumped to.
+- A context load **does** reset shuffle and repeat, so the jump carries
+  the DJ's options back with it (`PlayOptions`, mirrored from Spotify's
+  `ShuffleChanged`/`RepeatChanged` events).
+
+Two guards fall out of that. The walk carries a cursor (`history_cursor`)
+rather than re-reading "the second-newest row", because replaying a track
+appends a row of its own and the naive query would bounce between two
+tracks forever; the cursor clears itself as soon as something other than
+the jump target plays, which is what "we're live again" means. And the
+arrival is checked (`awaiting_jump`): librespot silently starts a context
+at track 1 when it cannot find the track requested, so a mismatch is
+surfaced instead of quietly restarting the playlist.
 
 ## See also
 

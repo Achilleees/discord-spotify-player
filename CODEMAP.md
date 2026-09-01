@@ -27,7 +27,10 @@ src/
 │   └── mod.rs             HistoryStore: append-only log of what aired,
 │                          written when a track becomes audible (never when
 │                          it is queued); keeps the context uri each track
-│                          played from
+│                          played from, and walks backwards by row id for ⏮
+├── queue_store.rs          QueueStore: the pending queue on disk, rewritten
+│                          whole on every change; its own wire format, so
+│                          queue.rs stays free of serde
 │
 ├── player/
 │   ├── mod.rs             module doc: how state.rs and actor.rs divide work
