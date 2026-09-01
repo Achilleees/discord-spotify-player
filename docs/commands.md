@@ -30,6 +30,7 @@ playback."*)
 | `/skip` | Voice gate | Skips the current track (media item or Spotify track) — see "How playback is ordered" below. |
 | `/stop` | Voice gate | Stops playback, releases the Spotify device and leaves the voice channel. The queue is kept. |
 | `/clear` | Voice gate | Empties the queue after a confirmation prompt. Whatever is playing keeps playing. |
+| `/history [count]` | Anyone | Lists what has actually aired, newest first (1–25, default 10). Requests name whoever asked for them; the DJ's own playlist tracks don't. |
 | `/np` | Anyone | Shows what's currently playing. |
 | `/announce` | Anyone, ungated | Toggles DJ track announcements on/off; the setting persists across restarts. |
 

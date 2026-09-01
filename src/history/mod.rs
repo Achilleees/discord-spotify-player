@@ -123,7 +123,6 @@ impl HistoryStore {
     }
 
     /// The most recently aired tracks, newest first.
-    #[cfg(test)]
     pub fn recent(&self, limit: usize) -> rusqlite::Result<Vec<HistoryRow>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(

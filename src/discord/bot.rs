@@ -54,6 +54,9 @@ pub(super) struct Handler {
     ready_tx: mpsc::Sender<ReadySignal>,
     presence_rx: Mutex<Option<mpsc::UnboundedReceiver<PresenceUpdate>>>,
     pub(super) user_store: Arc<UserStore>,
+    /// The play history, for the `/history` listing. `None` when the table
+    /// could not be opened — the listing then says so instead of failing.
+    pub(super) history: Option<Arc<crate::history::HistoryStore>>,
     pub(super) oauth: Arc<SpotifyOAuth>,
     /// Pending device-code pairings keyed by Discord user; notifying cancels
     /// that user's poll. In-memory only: a restart drops pending pairings and
@@ -601,7 +604,7 @@ impl DiscordBot {
             track_handle,
             dj,
             announce_enabled: announce_enabled.clone(),
-            history,
+            history: history.clone(),
             queue_store: queue_store.clone(),
         });
 
@@ -649,6 +652,7 @@ impl DiscordBot {
             pending_auth: Arc::new(Mutex::new(HashMap::new())),
             active_session,
             leaving_voice,
+            history: history.clone(),
             supervisor,
             ctx: ctx_store,
             ui_tx: ui_tx_store,

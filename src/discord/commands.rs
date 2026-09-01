@@ -59,6 +59,18 @@ pub(super) fn register_commands(ytdlp_available: bool) -> Vec<CreateCommand> {
             .description("Clear the queue (asks to confirm); what's playing keeps playing"),
         CreateCommand::new("np")
             .description("Show what's currently playing"),
+        CreateCommand::new("history")
+            .description("Show what has played recently")
+            .add_option(
+                CreateCommandOption::new(
+                    CommandOptionType::Integer,
+                    "count",
+                    "How many tracks to show (1-25, default 10)",
+                )
+                .min_int_value(1)
+                .max_int_value(25)
+                .required(false),
+            ),
         CreateCommand::new("announce")
             .description("Toggle DJ track announcements on/off"),
     ];
@@ -395,6 +407,17 @@ impl Handler {
             "skip" => self.player.skip().await,
             "stop" => self.player.stop().await,
             "np" => render_now_playing(&self.player.query().await.now),
+            "history" => {
+                let count = cmd
+                    .data
+                    .options
+                    .iter()
+                    .find(|o| o.name == "count")
+                    .and_then(|o| o.value.as_i64())
+                    .unwrap_or(10)
+                    .clamp(1, 25) as usize;
+                self.handle_history(count).await
+            }
             "announce" => self.handle_announce().await,
             _ => return,
         };
@@ -680,6 +703,43 @@ impl Handler {
         let _ = cmd.edit_response(ctx, EditInteractionResponse::new()
             .content(reply)
         ).await;
+    }
+
+    /// The last `count` tracks that actually aired, newest first. Requests
+    /// name whoever asked for them; the DJ's own playlist tracks don't, so
+    /// the two are told apart at a glance.
+    async fn handle_history(&self, count: usize) -> String {
+        let Some(store) = self.history.clone() else {
+            return "⚠️ No play history is being kept — the database couldn't be opened."
+                .to_string();
+        };
+        // SQLite is blocking; keep it off the interaction task's thread.
+        let rows = tokio::task::spawn_blocking(move || store.recent(count)).await;
+        let rows = match rows {
+            Ok(Ok(rows)) => rows,
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "failed to read the play history");
+                return "⚠️ Couldn't read the play history.".to_string();
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "play history read panicked");
+                return "⚠️ Couldn't read the play history.".to_string();
+            }
+        };
+        if rows.is_empty() {
+            return "Nothing has played yet.".to_string();
+        }
+        let mut out = String::from("🕘 **Recently played**\n");
+        for row in rows {
+            let title = row.title.as_deref().unwrap_or("Unknown track");
+            let artist = row.artist.as_deref().unwrap_or("Unknown artist");
+            out.push_str(&format!("• **{title}** — {artist}"));
+            if let Some(who) = row.queued_by.as_deref() {
+                out.push_str(&format!(" (queued by {who})"));
+            }
+            out.push('\n');
+        }
+        out
     }
 
     async fn handle_announce(&self) -> String {
