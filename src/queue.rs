@@ -102,17 +102,30 @@ pub struct PriorityQueue {
     /// Monotonic `item_id` source; the last stamped id (0 = none yet).
     /// Never reused, so ids stay unique across pops and reorders.
     next_item_id: u64,
+    /// Bumped by every mutation. Lets a caller persist the queue only when
+    /// it actually changed, instead of after every input the actor sees.
+    revision: u64,
 }
 
 impl PriorityQueue {
     pub fn new() -> Self {
-        Self { items: VecDeque::new(), next_item_id: 0 }
+        Self { items: VecDeque::new(), next_item_id: 0, revision: 0 }
     }
 
     /// Stamp the next monotonic id onto an item about to be inserted.
     fn stamp(&mut self, item: &mut QueueItem) {
         self.next_item_id += 1;
         item.item_id = self.next_item_id;
+    }
+
+    /// Counter that changes whenever the contents change. Compare it across
+    /// a mutation to decide whether the queue is worth writing out.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    fn touch(&mut self) {
+        self.revision += 1;
     }
 
     /// Enqueue an item. Returns `false` (rejecting it) when the queue is full,
@@ -123,6 +136,7 @@ impl PriorityQueue {
         }
         self.stamp(&mut item);
         self.items.push_back(item);
+        self.touch();
         true
     }
 
@@ -135,6 +149,7 @@ impl PriorityQueue {
         }
         self.stamp(&mut item);
         self.items.push_front(item);
+        self.touch();
         true
     }
 
@@ -149,11 +164,16 @@ impl PriorityQueue {
         self.stamp(&mut item);
         let idx = idx.min(self.items.len());
         self.items.insert(idx, item);
+        self.touch();
         true
     }
 
     pub fn pop(&mut self) -> Option<QueueItem> {
-        self.items.pop_front()
+        let popped = self.items.pop_front();
+        if popped.is_some() {
+            self.touch();
+        }
+        popped
     }
 
     /// Look at the head of the queue without removing it.
@@ -166,6 +186,7 @@ impl PriorityQueue {
     #[cfg(test)]
     pub fn pop_if(&mut self, pred: impl Fn(&QueueItem) -> bool) -> Option<QueueItem> {
         if self.items.front().is_some_and(&pred) {
+            self.touch();
             self.items.pop_front()
         } else {
             None
@@ -181,6 +202,7 @@ impl PriorityQueue {
     /// satisfies `pred`.
     pub fn remove_first(&mut self, pred: impl Fn(&QueueItem) -> bool) -> Option<QueueItem> {
         let idx = self.items.iter().position(pred)?;
+        self.touch();
         self.items.remove(idx)
     }
 
@@ -188,13 +210,15 @@ impl PriorityQueue {
         self.items.len()
     }
 
-    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.items.is_empty()
     }
 
 
     pub fn clear(&mut self) {
+        if !self.items.is_empty() {
+            self.touch();
+        }
         self.items.clear();
     }
 

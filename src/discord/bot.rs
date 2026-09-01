@@ -420,6 +420,7 @@ impl DiscordBot {
         presence_tx: mpsc::UnboundedSender<PresenceUpdate>,
         user_store: Arc<UserStore>,
         history: Option<Arc<crate::history::HistoryStore>>,
+        queue_store: Option<Arc<crate::queue_store::QueueStore>>,
         oauth: Arc<SpotifyOAuth>,
         ytdlp_available: bool,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
@@ -568,7 +569,21 @@ impl DiscordBot {
             dj,
             announce_enabled: announce_enabled.clone(),
             history,
+            queue_store: queue_store.clone(),
         });
+
+        // Replay the queue the last process was holding. Restoring never
+        // starts playback — the core treats it as bookkeeping only.
+        if let Some(store) = &queue_store {
+            match store.load() {
+                Ok(items) if !items.is_empty() => {
+                    tracing::info!(count = items.len(), "restoring the queue from the last run");
+                    player.restore_queue(items);
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!(error = %e, "could not restore the queue"),
+            }
+        }
 
         // One long-lived transport-event stream, shared by every generation
         // of Spotify session (unlike the old per-login channel) — the

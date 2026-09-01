@@ -7,6 +7,7 @@ mod oauth;
 mod player;
 mod presence;
 mod queue;
+mod queue_store;
 mod setup;
 mod spotify;
 mod users;
@@ -104,6 +105,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     };
 
+    // Same story as history: a queue that can't be persisted is a lost
+    // convenience, not a reason to refuse to play.
+    let queue_store = match queue_store::QueueStore::open(&db_path) {
+        Ok(q) => Some(Arc::new(q)),
+        Err(e) => {
+            tracing::warn!(error = %e, "queue persistence disabled — could not open the table");
+            None
+        }
+    };
+
     let bridge = AudioBridge::new(config.audio_buffer_seconds);
     tracing::debug!("audio bridge initialized");
 
@@ -138,6 +149,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         presence_tx.clone(),
         user_store.clone(),
         history.clone(),
+        queue_store.clone(),
         oauth.clone(),
         ytdlp_available,
     )

@@ -394,6 +394,10 @@ pub enum Input {
     /// path besides ▶ that may activate. Auto-start and on-demand sessions
     /// never send it (F15).
     ActivateDevice,
+    /// The queue as it was when the process last stopped, replayed at boot.
+    /// Restoring never starts playback on its own — nothing is audible
+    /// without a voice channel and someone in it to hear it.
+    RestoreQueue { items: Vec<QueueItem> },
     Query { reply: oneshot::Sender<PlayerSnapshot> },
     Tick(TimerKind),
 }
@@ -956,6 +960,26 @@ pub fn step(state: &mut PlayerState, input: Input, now: Instant) -> Vec<Effect> 
 
         Input::VoiceReady => {
             state.voice = VoiceStatus::Ready;
+        }
+
+        Input::RestoreQueue { items } => {
+            // Only ever at boot, onto an untouched queue: anything already
+            // queued was added by someone present just now and outranks a
+            // record of what the last process was holding.
+            if !state.queue.is_empty() {
+                return fx;
+            }
+            for item in items {
+                // `push` stamps a fresh item_id — a restored item is a new
+                // residency, not a resurrected one.
+                if !state.queue.push(item) {
+                    break;
+                }
+            }
+            // Deliberately no playback: restoring is not a reason to make
+            // noise. The queue airs when a human acts, or when the head is
+            // reached in the ordinary way.
+            maybe_arm(state, now, &mut fx);
         }
 
         Input::ActivateDevice => {
@@ -2662,6 +2686,44 @@ mod tests {
         let fx = sim.media_ended(MediaOutcome::Finished);
         assert!(spircs(&fx).is_empty(), "the phone's pause is honoured");
         assert_eq!(sim.s.pause_owner, Some(PauseOwner::Human));
+    }
+
+    #[test]
+    fn restoring_refills_the_queue_without_playing_anything() {
+        let mut sim = Sim::new();
+        let fx = sim.step(Input::RestoreQueue {
+            items: vec![media_item("a"), media_item("b")],
+        });
+
+        assert_eq!(sim.s.queue.len(), 2);
+        assert!(matches!(sim.s.active, Active::None), "restoring is silent");
+        assert!(
+            !fx.iter().any(|e| matches!(e, Effect::StartMedia { .. })),
+            "a restored queue must not start itself"
+        );
+    }
+
+    #[test]
+    fn restoring_stamps_fresh_ids_rather_than_reusing_stored_ones() {
+        let mut sim = Sim::new();
+        sim.step(Input::RestoreQueue { items: vec![media_item("a"), media_item("b")] });
+        let ids: Vec<u64> = sim.s.queue.snapshot().iter().map(|i| i.item_id).collect();
+        assert_eq!(ids, vec![1, 2], "an id names a residency, not a track");
+    }
+
+    #[test]
+    fn restoring_never_overwrites_a_queue_someone_is_already_using() {
+        // The restore is asynchronous at boot; anything queued by a person
+        // in the meantime is newer than the record and outranks it.
+        let mut sim = Sim::new();
+        sim.enqueue(media_item("queued-by-a-human"));
+        sim.step(Input::RestoreQueue { items: vec![media_item("from-disk")] });
+
+        assert_eq!(sim.s.queue.len(), 1);
+        assert_eq!(
+            sim.s.queue.peek().unwrap().source.display_title(),
+            "queued-by-a-human"
+        );
     }
 
     fn aired(fx: &[Effect]) -> Vec<&AiredTrack> {

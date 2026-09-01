@@ -114,6 +114,9 @@ pub struct PlayerDeps {
     /// a bot whose database could not be opened) without changing any
     /// playback behaviour.
     pub history: Option<Arc<crate::history::HistoryStore>>,
+    /// Persists the pending queue across restarts. `None` disables it
+    /// without changing playback.
+    pub queue_store: Option<Arc<crate::queue_store::QueueStore>>,
 }
 
 /// The actor's mailbox handle. Cheap to clone; the typed helpers build the
@@ -160,6 +163,12 @@ impl PlayerHandle {
 
     pub async fn toggle_pause(&self) -> String {
         self.request(|reply| Input::TogglePause { reply }).await
+    }
+
+    /// Hand the actor the queue the last process was holding. Fire-and-
+    /// forget: there is no reply to wait for and nothing starts playing.
+    pub fn restore_queue(&self, items: Vec<crate::queue::QueueItem>) {
+        let _ = self.tx.send(Input::RestoreQueue { items });
     }
 
     /// The ▶ half only (bare `/play`): refused while something is audible.
@@ -283,6 +292,7 @@ impl Actor {
             }
 
             tracing::debug!(target: "player", ?input, "input");
+            let queue_rev = self.state.queue.revision();
             let effects = step(&mut self.state, input, Instant::now());
             tracing::debug!(
                 target: "player",
@@ -300,6 +310,20 @@ impl Actor {
             self.deps
                 .bridge
                 .set_spotify_muted(matches!(self.state.active, Active::Media { .. }));
+
+            // Persist only when the queue actually changed — the actor sees
+            // far more transport events than queue mutations, and a write
+            // per event would be noise.
+            if self.state.queue.revision() != queue_rev {
+                if let Some(store) = self.deps.queue_store.clone() {
+                    let items = self.state.queue.snapshot();
+                    tokio::task::spawn_blocking(move || {
+                        if let Err(e) = store.save(&items) {
+                            tracing::warn!(error = %e, "failed to persist the queue");
+                        }
+                    });
+                }
+            }
 
             // A `StartMedia` in this batch: remember whose item it is, so a
             // cold-start voice join follows the requester.
