@@ -288,7 +288,12 @@ impl SpotifyPlayer {
                         let _ = transport_tx.send(TransportEvent::Unavailable { uri: track_id });
                         println!("Track unavailable");
                     }
-                    PlayerEvent::SetQueue { current_track, next_tracks, .. } => {
+                    PlayerEvent::SetQueue {
+                        current_track,
+                        next_tracks,
+                        context_uri,
+                        ..
+                    } => {
                         let current: Option<SpotifyUri> =
                             current_track.and_then(|t| SpotifyUri::from_uri(&t.uri).ok());
                         // Only "queue"-provider entries are ours (the ones
@@ -299,7 +304,15 @@ impl SpotifyPlayer {
                             .filter(|t| t.provider == "queue")
                             .filter_map(|t| SpotifyUri::from_uri(&t.uri).ok())
                             .collect();
-                        let _ = transport_tx.send(TransportEvent::SetQueue { current, queued });
+                        // Spotify sends an empty string when the playback
+                        // has no named context (a bare track, autoplay
+                        // before it resolves); that is absence, not a name.
+                        let context_uri = Some(context_uri).filter(|c| !c.is_empty());
+                        let _ = transport_tx.send(TransportEvent::SetQueue {
+                            current,
+                            queued,
+                            context_uri,
+                        });
                     }
                     PlayerEvent::SessionConnected { .. } => {
                         let _ = transport_tx.send(TransportEvent::SessionConnected);

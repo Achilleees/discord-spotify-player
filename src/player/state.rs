@@ -188,6 +188,11 @@ pub struct PlayerState {
     /// accepted for; suppresses duplicate cards when librespot re-emits
     /// `Playing` for the same track (seek, resume).
     pub last_heard_track: Option<String>,
+    /// The context the Spotify baseline is playing from, as last reported
+    /// by `SetQueue`. Stamped onto history rows so a later back-jump can
+    /// reopen the playlist at a track instead of replacing it with a
+    /// one-track context.
+    pub context_uri: Option<String>,
     armed_snapshot: Option<ArmSnapshot>,
 }
 
@@ -198,6 +203,7 @@ impl PlayerState {
             active: Active::None,
             sp: SpDevice::Inactive,
             link_up: false,
+            context_uri: None,
             armed: None,
             pause_owner: None,
             inflight: InflightRing::default(),
@@ -247,7 +253,14 @@ pub enum TransportEvent {
     EndOfTrack,
     Unavailable { uri: SpotifyUri },
     TrackChanged { uri: SpotifyUri, meta: TrackMeta },
-    SetQueue { current: Option<SpotifyUri>, queued: Vec<SpotifyUri> },
+    SetQueue {
+        current: Option<SpotifyUri>,
+        queued: Vec<SpotifyUri>,
+        /// The context (playlist/album/station) the baseline is playing
+        /// from, when Spotify names one. Only `SetQueue` carries it, and
+        /// only on a context load or queue mutation — never per advance.
+        context_uri: Option<String>,
+    },
     SessionConnected,
     SessionDisconnected,
 }
@@ -1246,7 +1259,12 @@ fn handle_transport(state: &mut PlayerState, ev: TransportEvent, now: Instant, f
             }
         }
 
-        TransportEvent::SetQueue { current, queued } => {
+        TransportEvent::SetQueue { current, queued, context_uri } => {
+            // Spotify only names the context on a load or a queue mutation,
+            // so hold the last one seen rather than expecting it per track.
+            if context_uri.is_some() {
+                state.context_uri = context_uri;
+            }
             if let Some(a) = &state.armed {
                 let item_id = a.item_id;
                 let ack = a.ack;
@@ -2229,6 +2247,7 @@ mod tests {
         let fx = sim.transport(TransportEvent::SetQueue {
             current: Some(uri(9)),
             queued: vec![uri(1)],
+            context_uri: None,
         });
         assert_eq!(add_to_queue_count(&fx), 0);
         assert!(matches!(sim.s.armed, Some(Armed { ack: Ack::Confirmed, .. })));
@@ -2543,6 +2562,36 @@ mod tests {
         assert_eq!(sim.s.pause_owner, Some(PauseOwner::Human));
     }
 
+    #[test]
+    fn set_queue_remembers_the_context_and_keeps_it_across_silent_ones() {
+        let mut sim = Sim::baseline_playing();
+        assert_eq!(sim.s.context_uri, None);
+
+        sim.transport(TransportEvent::SetQueue {
+            current: Some(uri(9)),
+            queued: vec![],
+            context_uri: Some("spotify:playlist:abc".into()),
+        });
+        assert_eq!(sim.s.context_uri.as_deref(), Some("spotify:playlist:abc"));
+
+        // Spotify names the context only on a load or queue mutation, so a
+        // later event without one must not erase what we know.
+        sim.transport(TransportEvent::SetQueue {
+            current: Some(uri(9)),
+            queued: vec![],
+            context_uri: None,
+        });
+        assert_eq!(sim.s.context_uri.as_deref(), Some("spotify:playlist:abc"));
+
+        // A genuine context change replaces it.
+        sim.transport(TransportEvent::SetQueue {
+            current: Some(uri(9)),
+            queued: vec![],
+            context_uri: Some("spotify:album:xyz".into()),
+        });
+        assert_eq!(sim.s.context_uri.as_deref(), Some("spotify:album:xyz"));
+    }
+
     // --- SetQueue ack machine ---------------------------------------------
 
     #[test]
@@ -2552,6 +2601,7 @@ mod tests {
         let fx = sim.transport(TransportEvent::SetQueue {
             current: Some(uri(9)),
             queued: vec![uri(1)],
+            context_uri: None,
         });
         assert!(fx.is_empty());
         assert!(matches!(sim.s.armed, Some(Armed { ack: Ack::Confirmed, .. })));
@@ -2564,7 +2614,7 @@ mod tests {
         let id = sim.push_spotify(1, "s1");
         sim.arm(1, id, Ack::Confirmed);
         sim.push_spotify(2, "s2");
-        let fx = sim.transport(TransportEvent::SetQueue { current: Some(uri(9)), queued: vec![] });
+        let fx = sim.transport(TransportEvent::SetQueue { current: Some(uri(9)), queued: vec![], context_uri: None });
         assert_eq!(sim.s.queue.len(), 1, "the cancelled request is dropped");
         assert!(matches!(&sim.s.armed, Some(Armed { uri: u, .. }) if *u == uri(2)));
         assert_eq!(add_to_queue_count(&fx), 1, "the next item arms in its place");
@@ -2579,7 +2629,7 @@ mod tests {
         let mut sim = Sim::baseline_playing();
         let id = sim.push_spotify(1, "s1");
         sim.arm(1, id, Ack::Confirmed);
-        let fx = sim.transport(TransportEvent::SetQueue { current: Some(uri(1)), queued: vec![] });
+        let fx = sim.transport(TransportEvent::SetQueue { current: Some(uri(1)), queued: vec![], context_uri: None });
         assert!(fx.is_empty());
         assert!(sim.s.armed.is_some());
         assert_eq!(sim.s.queue.len(), 1);
