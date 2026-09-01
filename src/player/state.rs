@@ -64,7 +64,6 @@ pub enum Active {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PauseOwner {
     BotForMedia,
-    BotForStop,
     Human,
 }
 
@@ -424,6 +423,11 @@ pub enum SpircCmd {
     /// `Spirc::transfer(None)`: restore context, position, pause state and
     /// the queue after a reconnect.
     Transfer,
+    /// Give up the active-device slot. Always paired with a pause: the
+    /// non-pausing form leaves librespot decoding into a bridge nobody
+    /// drains, and its next `Playing` would re-take the turn from outside
+    /// the voice channel.
+    Disconnect,
 }
 
 /// Commands for the live songbird track handle of the active media item.
@@ -481,6 +485,9 @@ pub enum Effect {
     /// A track just became audible: append it to the play history. Emitted
     /// once per airing, alongside the card that announces it.
     RecordAired(AiredTrack),
+    /// Leave the voice channel. Only `/stop` asks for this — an empty
+    /// channel is torn down by the Discord layer instead.
+    LeaveVoice,
     /// Spotify reported a track playing without metadata: resolve it
     /// through the live session and feed the answer back as
     /// `TransportEvent::TrackChanged` (which posts the card).
@@ -685,40 +692,42 @@ pub fn step(state: &mut PlayerState, input: Input, now: Instant) -> Vec<Effect> 
         }
 
         Input::Stop { reply: tx } => {
-            // Stop on a radio means dead air: clear the queue, silence
-            // everything, and let ⏯ be the thing that resumes.
-            let orphaned = state.armed.take().is_some();
-            state.armed_snapshot = None;
-            state.queue.clear();
-            let mut paused_now = false;
+            // Stop is stop: the bot goes quiet and leaves the channel. It
+            // keeps the queue (`/clear` is what empties it) and never
+            // touches the Spotify session or the account — only this
+            // lifecycle. The arm is left alone: `SessionDisconnected` voids
+            // an unacked one and keeps a confirmed one, which is already the
+            // right rule for "handed to Spotify, can't be withdrawn".
             if matches!(state.active, Active::Media { .. }) {
                 fx.push(Effect::CancelMedia);
-                fx.push(Effect::ClearBridge);
-                // `active` stays Media until the runner reports
-                // `MediaEnded{Cancelled}`; the emptied queue plus
-                // `BotForStop` below make that boundary land on dead air.
-            } else if matches!(state.active, Active::Spotify { .. } | Active::SpotifyPending { .. })
-            {
-                if state.device_active && matches!(state.sp, SpDevice::Playing(_)) {
-                    fx.push(Effect::Spirc(SpircCmd::Pause));
+            }
+            // Audibility, not the turn: Spotify reaches the bridge whenever
+            // no media item holds it, `Active::None` included.
+            if state.device_active {
+                if matches!(state.sp, SpDevice::Playing(_)) {
                     state.inflight.record_pause(now);
-                    paused_now = true;
                 }
-                fx.push(Effect::ClearBridge);
-                state.active = Active::None;
-                fx.push(Effect::Presence(PresenceState::Idle));
+                fx.push(Effect::Spirc(SpircCmd::Disconnect));
+                state.device_active = false;
             }
-            if paused_now || matches!(state.pause_owner, Some(PauseOwner::BotForMedia)) {
-                state.pause_owner = Some(PauseOwner::BotForStop);
-            }
-            let text = if orphaned {
-                // Librespot has no dequeue, so an armed track can't be
-                // un-armed — it may still air once when the baseline plays.
-                "⏹ Stopped. Queue cleared. (a track already handed to Spotify will still play once)"
-            } else {
-                "⏹ Stopped. Queue cleared."
+            fx.push(Effect::ClearBridge);
+            fx.push(Effect::LeaveVoice);
+            // The runner's `MediaEnded{Cancelled}` still lands after this;
+            // `Active::None` plus a `Down` voice makes that boundary quiet,
+            // and lets the next queued item ask for a fresh join.
+            state.active = Active::None;
+            state.voice = VoiceStatus::Down;
+            state.pause_owner = None;
+            fx.push(Effect::Presence(PresenceState::Idle));
+
+            let queued = state.queue.len();
+            let text = match queued {
+                0 => "⏹ Stopped and left the channel.".to_string(),
+                n => format!(
+                    "⏹ Stopped and left the channel. {n} queued track(s) kept — use `/clear` to drop them."
+                ),
             };
-            reply(&mut fx, tx, text);
+            reply(&mut fx, tx, &text);
         }
 
         Input::Play { reply: tx } => {
@@ -1478,7 +1487,7 @@ fn after_media_boundary(state: &mut PlayerState, now: Instant, fx: &mut Vec<Effe
                         state.active = Active::Spotify { track: None };
                     }
                 }
-                Some(PauseOwner::Human) | Some(PauseOwner::BotForStop) => {
+                Some(PauseOwner::Human) => {
                     // Honoured: the baseline stays paused; the armed head
                     // airs whenever a human resumes.
                     state.active = Active::None;
@@ -1871,6 +1880,10 @@ mod tests {
 
     fn has_cancel(fx: &[Effect]) -> bool {
         fx.iter().any(|e| matches!(e, Effect::CancelMedia))
+    }
+
+    fn has_leave(fx: &[Effect]) -> bool {
+        fx.iter().any(|e| matches!(e, Effect::LeaveVoice))
     }
 
     fn has_clear(fx: &[Effect]) -> bool {
@@ -2417,10 +2430,10 @@ mod tests {
 
     #[test]
     fn skipping_a_media_item_after_a_stop_resumes_the_spotify_head() {
-        // Live E': /stop paused the baseline (BotForStop); a later ⏭ on
-        // the media item honoured that pause and nothing played. A human
-        // skip is an advance.
-        let mut sim = Sim::baseline_paused(Some(PauseOwner::BotForStop));
+        // Live E': a pause the bot did not own for the media item once
+        // froze the next skip — the media item's ⏭ honoured it and nothing
+        // played. A human skip is an advance regardless of who paused.
+        let mut sim = Sim::baseline_paused(Some(PauseOwner::Human));
         sim.s.queue.push(media_item("m"));
         let item = sim.s.queue.pop().unwrap();
         sim.s.media_epoch = 1;
@@ -2505,20 +2518,31 @@ mod tests {
     }
 
     #[test]
-    fn stop_orphans_armed_track() {
-        // Librespot has no dequeue: stop clears our side and says so.
+    fn stop_keeps_the_queue_and_leaves_the_channel() {
+        // Stop is stop, not clear: /clear is the only thing that empties.
         let mut sim = Sim::baseline_playing();
         let id = sim.push_spotify(1, "s1");
         sim.arm(1, id, Ack::Confirmed);
         let fx = sim.stop();
-        assert!(sim.s.queue.is_empty());
-        assert!(sim.s.armed.is_none());
-        assert_eq!(
-            reply_text(&fx),
-            "⏹ Stopped. Queue cleared. (a track already handed to Spotify will still play once)"
-        );
-        assert_eq!(spircs(&fx), vec![SpircCmd::Pause]);
-        assert_eq!(sim.s.pause_owner, Some(PauseOwner::BotForStop));
+
+        assert_eq!(sim.s.queue.len(), 1, "the request survives a stop");
+        assert!(has_leave(&fx), "the bot leaves the channel");
+        assert_eq!(spircs(&fx), vec![SpircCmd::Disconnect]);
+        assert!(!sim.s.device_active, "the Connect device is released");
+        assert!(matches!(sim.s.voice, VoiceStatus::Down));
+        assert!(reply_text(&fx).contains("kept"), "got: {}", reply_text(&fx));
+    }
+
+    #[test]
+    fn stop_leaves_a_confirmed_arm_for_the_disconnect_to_judge() {
+        // An armed track is already in Spotify's queue and cannot be
+        // withdrawn; SessionDisconnected keeps a confirmed arm and voids an
+        // unacked one, which is exactly the right rule here.
+        let mut sim = Sim::baseline_playing();
+        let id = sim.push_spotify(1, "s1");
+        sim.arm(1, id, Ack::Confirmed);
+        sim.stop();
+        assert!(sim.s.armed.is_some(), "stop does not un-arm by itself");
     }
 
     #[test]
@@ -2982,18 +3006,18 @@ mod tests {
     // --- stop -------------------------------------------------------------
 
     #[test]
-    fn stop_during_media_goes_to_dead_air() {
+    fn stop_during_media_cancels_it_and_still_keeps_the_queue() {
         let mut sim = Sim::media_over_paused_baseline();
         sim.s.queue.push(media_item("m2"));
         sim.push_spotify(1, "s1");
         let fx = sim.stop();
         assert!(has_cancel(&fx));
-        assert!(sim.s.queue.is_empty());
-        assert_eq!(sim.s.pause_owner, Some(PauseOwner::BotForStop));
-        // The runner's cancel report lands on an empty queue and a stop-
-        // owned pause: dead air, no resume, no next item.
+        assert!(has_leave(&fx));
+        assert_eq!(sim.s.queue.len(), 2, "queued items outlive the stop");
+        // The runner's cancel report lands after the bot has already left:
+        // nothing starts, because the turn and the voice call are both gone.
         let fx = sim.media_ended(MediaOutcome::Cancelled);
-        assert!(spircs(&fx).is_empty() && !has_start_media(&fx), "stop means dead air");
+        assert!(!has_start_media(&fx), "a stopped bot does not start the next item");
         assert!(matches!(sim.s.active, Active::None));
     }
 

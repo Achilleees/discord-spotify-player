@@ -55,10 +55,13 @@ impl Handler {
     pub(super) async fn teardown_playback_session(&self, ctx: &Context, leave_voice: bool) {
         // VoiceLost first (mailbox order beats the runner's own cancel
         // report): the actor drops any active media turn and stale-ifies
-        // the runner's coming `MediaEnded`. The awaited Stop then clears
-        // the queue before the supervisor's `LinkDown` lands, so nothing
+        // the runner's coming `MediaEnded`. The awaited Stop then releases
+        // the turn before the supervisor's `LinkDown` lands, so nothing
         // gets promoted into the emptying call, and the actor's own
-        // presence/status transitions cover the Idle update.
+        // presence/status transitions cover the Idle update. The queue is
+        // deliberately left alone: it survives an empty channel the same way
+        // it survives a restart, and `/clear` is the only thing that empties
+        // it.
         self.player.send(PlayerInput::VoiceLost);
         let _ = self.player.stop().await;
 

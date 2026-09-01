@@ -60,6 +60,11 @@ pub(super) struct Handler {
     /// the user re-runs `/login`.
     pub(super) pending_auth: Arc<Mutex<HashMap<u64, Arc<tokio::sync::Notify>>>>,
     pub(super) active_session: Arc<Mutex<Option<ActiveSession>>>,
+    /// Set just before the bot removes itself from voice on purpose.
+    /// Discord echoes that removal back as a voice-state update, and the
+    /// own-disconnect branch below would otherwise read it as a force
+    /// disconnect and tear down the Spotify session and the account.
+    pub(super) leaving_voice: Arc<AtomicBool>,
     /// Owns the Spotify session lifecycle (librespot task, refresher, token
     /// state, generation) independently of playback — see
     /// `spotify::session`. `switch_active_session`/`auto_start_stored_session`/
@@ -349,6 +354,12 @@ impl EventHandler for Handler {
         // librespot and the feeder pushing into a dead call forever.
         if new.user_id == ctx.cache.current_user().id {
             if new.channel_id.is_none() {
+                // Our own `/stop` leave: expected, and it must not touch the
+                // session or the account.
+                if self.leaving_voice.swap(false, Ordering::SeqCst) {
+                    tracing::debug!("bot left voice deliberately — no teardown");
+                    return;
+                }
                 let anything_active = {
                     let session = {
                         let lock = self.active_session.lock();
@@ -556,6 +567,27 @@ impl DiscordBot {
             )
         };
 
+        // Deliberate departure (`/stop`). Sets the guard first so the
+        // gateway echo of our own removal isn't read as a force disconnect.
+        // `remove`, not `leave`: leave keeps the Call registered and every
+        // later presence check would read it as "still in a call".
+        let leaving_voice = Arc::new(AtomicBool::new(false));
+        let leave_voice: player_actor::LeaveVoiceFn = {
+            let ctx_store = ctx_store.clone();
+            let leaving_voice = leaving_voice.clone();
+            Arc::new(move || -> Pin<Box<dyn Future<Output = ()> + Send>> {
+                let ctx_store = ctx_store.clone();
+                let leaving_voice = leaving_voice.clone();
+                Box::pin(async move {
+                    let Some(ctx) = ({ ctx_store.lock().clone() }) else { return };
+                    let Some(manager) = songbird::get(&ctx).await else { return };
+                    leaving_voice.store(true, Ordering::SeqCst);
+                    let _ = manager.remove(guild_id).await;
+                    tracing::info!("bot left voice channel");
+                })
+            })
+        };
+
         let notice_tx = spawn_notice_task(ctx_store.clone(), text_channel_id);
 
         let player = player_actor::spawn(PlayerDeps {
@@ -564,6 +596,7 @@ impl DiscordBot {
             notice_tx,
             presence_tx,
             join_voice: join_voice.clone(),
+            leave_voice,
             spirc_cmd_tx: spirc_cmd_tx.clone(),
             track_handle,
             dj,
@@ -615,6 +648,7 @@ impl DiscordBot {
             oauth,
             pending_auth: Arc::new(Mutex::new(HashMap::new())),
             active_session,
+            leaving_voice,
             supervisor,
             ctx: ctx_store,
             ui_tx: ui_tx_store,

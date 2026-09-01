@@ -48,6 +48,9 @@ pub enum SpircCommand {
     /// the queue after a reconnect, claiming the active-device slot in the
     /// same call instead of a bare activate.
     Transfer,
+    /// Release the active-device slot, pausing as it goes. The device stays
+    /// in the Connect list; librespot ignores this while already inactive.
+    Disconnect,
 }
 
 /// Track metadata resolved through the live librespot session, for
@@ -461,6 +464,15 @@ impl SpotifyPlayer {
                             Some(SpircCommand::Transfer) => {
                                 if let Err(e) = spirc.transfer(None) {
                                     tracing::warn!(error = ?e, "spirc transfer failed");
+                                }
+                            }
+                            Some(SpircCommand::Disconnect) => {
+                                // Always with the pause: the non-pausing form
+                                // leaves the player decoding after the bot
+                                // has gone, and its next event would re-take
+                                // the device.
+                                if let Err(e) = spirc.disconnect(true) {
+                                    tracing::warn!(error = ?e, "spirc disconnect failed");
                                 }
                             }
                             Some(SpircCommand::Lookup(uri, reply)) => {

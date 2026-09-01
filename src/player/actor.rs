@@ -89,6 +89,10 @@ pub type UiSendFn = Arc<dyn Fn(UiEvent) + Send + Sync>;
 pub type JoinVoiceFn =
     Arc<dyn Fn(Option<u64>) -> Pin<Box<dyn Future<Output = bool> + Send>> + Send + Sync>;
 
+/// Leaves the voice call. Deliberate departures only (`/stop`) — an empty
+/// channel is torn down by the Discord layer. Run inside a spawned task.
+pub type LeaveVoiceFn = Arc<dyn Fn() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+
 /// Everything the actor owns or drives. The shared `Arc`s are the process's
 /// cross-task seams: the spirc cell is written by the session supervisor,
 /// the track handle by the voice-join machinery, and `announce_enabled` by
@@ -102,6 +106,7 @@ pub struct PlayerDeps {
     /// Feeds the Discord status task (`run_presence_loop`).
     pub presence_tx: mpsc::UnboundedSender<PresenceUpdate>,
     pub join_voice: JoinVoiceFn,
+    pub leave_voice: LeaveVoiceFn,
     /// The live session's command channel; `None` between sessions. The
     /// session supervisor (re)publishes the sender on switch/stop.
     pub spirc_cmd_tx: Arc<Mutex<Option<mpsc::UnboundedSender<SpircCommand>>>>,
@@ -500,6 +505,12 @@ impl Actor {
                 });
             }
 
+            Effect::LeaveVoice => {
+                // Spawned, never awaited: leaving talks to Discord.
+                let leave = (self.deps.leave_voice)();
+                tokio::spawn(leave);
+            }
+
             Effect::JoinVoice => {
                 let join = (self.deps.join_voice)(join_hint);
                 let tx = self.tx.clone();
@@ -633,6 +644,7 @@ impl Actor {
             SpircCmd::Load(uri) => SpircCommand::Load(uri),
             SpircCmd::ActivateDevice => SpircCommand::ActivateDevice,
             SpircCmd::Transfer => SpircCommand::Transfer,
+            SpircCmd::Disconnect => SpircCommand::Disconnect,
         };
         let _ = tx.send(command);
     }

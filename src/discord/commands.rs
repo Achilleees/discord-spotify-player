@@ -54,7 +54,7 @@ pub(super) fn register_commands(ytdlp_available: bool) -> Vec<CreateCommand> {
         CreateCommand::new("skip")
             .description("Skip the current track"),
         CreateCommand::new("stop")
-            .description("Stop playback and clear the priority queue"),
+            .description("Stop playback and leave the channel; the queue is kept"),
         CreateCommand::new("clear")
             .description("Clear the queue (asks to confirm); what's playing keeps playing"),
         CreateCommand::new("np")
