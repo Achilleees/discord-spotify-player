@@ -752,10 +752,12 @@ pub fn step(state: &mut PlayerState, input: Input, now: Instant) -> Vec<Effect> 
             if matches!(state.active, Active::Media { .. }) {
                 fx.push(Effect::CancelMedia);
             }
-            // `Disconnect` resets librespot's device state, queue included,
-            // so a surviving arm is a ghost: `maybe_arm` would refuse to
-            // re-arm behind it, and the next `SetQueue` would read its
-            // absence as "deleted on the phone" and drop the request.
+            // `Disconnect` resets librespot's device state, queue included
+            // (`became_inactive` -> `reset`, which replaces `next_tracks`
+            // with an empty vec and zeroes `queue_count`; connect/src/state.rs
+            // @1599145), so a surviving arm is a ghost: `maybe_arm` would
+            // refuse to re-arm behind it, and the next `SetQueue` would read
+            // its absence as "deleted on the phone" and drop the request.
             state.armed = None;
             state.armed_snapshot = None;
             // A jump still resolving is abandoned along with everything else.
@@ -1519,9 +1521,11 @@ fn handle_transport(state: &mut PlayerState, ev: TransportEvent, now: Instant, f
                 // only ever recorded once per airing.
                 //
                 // `TrackChanged` arrives BEFORE the `Playing` that pops the
-                // request, so the queue still holds it: look it up rather
-                // than assuming this is the baseline, or every request would
-                // be logged as one and lose whoever asked for it.
+                // request — both are sent from librespot's `start_playback`,
+                // in that order (playback/src/player.rs @1599145) — so the
+                // queue still holds it: look it up rather than assuming this
+                // is the baseline, or every request would be logged as one
+                // and lose whoever asked for it.
                 let queued = state
                     .queue
                     .find_first(
