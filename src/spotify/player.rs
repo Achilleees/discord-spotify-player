@@ -85,11 +85,25 @@ struct CurrentTrack {
     album_art_url: Option<String>,
 }
 
+/// Joins artist names in Spotify's own display order, dropping repeats.
+/// Spotify's catalogue lists an artist twice on some tracks (a remixer
+/// credited as both artist and remixer), which rendered as "Oliver Tree,
+/// Georgie Riot, Georgie Riot" on the card while the enqueue-time lookup
+/// showed it once.
+fn join_unique(names: impl IntoIterator<Item = String>) -> String {
+    let mut seen: Vec<String> = Vec::new();
+    for name in names {
+        if !seen.contains(&name) {
+            seen.push(name);
+        }
+    }
+    seen.join(", ")
+}
+
 fn track_info_from_audio_item(audio_item: &AudioItem) -> CurrentTrack {
     let artist = match &audio_item.unique_fields {
         UniqueFields::Track { artists, .. } => {
-            let names: Vec<_> = artists.iter().map(|a| a.name.clone()).collect();
-            names.join(", ")
+            join_unique(artists.iter().map(|a| a.name.clone()))
         }
         UniqueFields::Local { artists, .. } => artists.clone().unwrap_or_default(),
         UniqueFields::Episode { .. } => String::new(),
@@ -188,11 +202,11 @@ impl SpotifyPlayer {
     /// All artists' names, joined the way Spotify itself displays multiple
     /// artists. Used by `lookup_track`.
     fn join_artist_names<'a>(artists: impl IntoIterator<Item = &'a Artist>) -> String {
-        let names: Vec<_> = artists.into_iter().map(|a| a.name.clone()).collect();
-        if names.is_empty() {
+        let joined = join_unique(artists.into_iter().map(|a| a.name.clone()));
+        if joined.is_empty() {
             "Unknown artist".to_string()
         } else {
-            names.join(", ")
+            joined
         }
     }
 
@@ -572,5 +586,31 @@ impl SpotifyPlayer {
             let _ = transport_tx.send(TransportEvent::SessionDisconnected);
             return Ok(());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::join_unique;
+
+    #[test]
+    fn repeated_artists_are_listed_once() {
+        assert_eq!(
+            join_unique(["Oliver Tree", "Georgie Riot", "Georgie Riot"].map(String::from)),
+            "Oliver Tree, Georgie Riot"
+        );
+    }
+
+    #[test]
+    fn distinct_artists_keep_spotifys_order() {
+        assert_eq!(
+            join_unique(["Ed:it", "Pola & Bryson"].map(String::from)),
+            "Ed:it, Pola & Bryson"
+        );
+    }
+
+    #[test]
+    fn no_artists_joins_to_nothing() {
+        assert_eq!(join_unique(Vec::<String>::new()), "");
     }
 }
