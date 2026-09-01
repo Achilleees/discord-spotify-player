@@ -3087,6 +3087,62 @@ mod tests {
     }
 
     #[test]
+    fn a_back_jump_leaves_an_armed_request_armed() {
+        // The whole promise of going back is that it costs you nothing:
+        // whoever queued a track still hears it after the detour. Librespot
+        // keeps its queue across a context load (`clear_next_tracks` is
+        // queue-preserving), so the arm is still live on Spotify's side —
+        // dropping or re-issuing it here would either lose the request or
+        // queue it twice, and librespot has no dequeue to undo that with.
+        let mut sim = Sim::baseline_playing();
+        let id = sim.push_spotify(1, "s1");
+        sim.arm(1, id, Ack::Confirmed);
+
+        sim.previous();
+        let fx = sim.step(Input::PreviousResolved {
+            track: Some(prev_track(7, 3, Some("spotify:playlist:abc"))),
+        });
+
+        assert_eq!(
+            spircs(&fx),
+            vec![SpircCmd::LoadContext {
+                context_uri: "spotify:playlist:abc".to_string(),
+                track_uri: uri(3),
+                options: PlayOptions::default(),
+            }],
+            "the jump alone — no re-arm, and nothing that would double-queue"
+        );
+        let armed = sim.s.armed.as_ref().expect("the request stays armed");
+        assert_eq!(armed.item_id, id);
+        assert_eq!(armed.uri, uri(1));
+        assert!(matches!(armed.ack, Ack::Confirmed), "and stays acked");
+        assert_eq!(sim.s.queue.len(), 1, "and stays in the queue");
+    }
+
+    #[test]
+    fn the_armed_request_still_airs_after_the_jumped_to_track() {
+        // The other half: the detour ends and the request is next, exactly
+        // as it would have been without it.
+        let mut sim = Sim::baseline_playing();
+        let id = sim.push_spotify(1, "s1");
+        sim.arm(1, id, Ack::Confirmed);
+        sim.previous();
+        sim.step(Input::PreviousResolved {
+            track: Some(prev_track(7, 3, Some("spotify:playlist:abc"))),
+        });
+        // The jump lands.
+        sim.transport(TransportEvent::Playing { uri: uri(3), meta: None });
+        assert!(sim.s.armed.is_some(), "landing on the jump is not the request");
+        assert_eq!(sim.s.queue.len(), 1);
+
+        // Spotify's own advance reaches the armed track.
+        sim.transport(TransportEvent::EndOfTrack);
+        sim.transport(TransportEvent::Playing { uri: uri(1), meta: None });
+        assert!(sim.s.armed.is_none(), "the arm is consumed by its own track");
+        assert_eq!(sim.s.queue.len(), 0, "and the request leaves the queue");
+    }
+
+    #[test]
     fn a_back_jump_hands_the_djs_shuffle_and_repeat_back() {
         // Loading a context resets these on librespot's side, so the jump
         // has to restore them or it silently turns the DJ's shuffle off.
