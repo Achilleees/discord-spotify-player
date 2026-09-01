@@ -893,8 +893,15 @@ pub fn step(state: &mut PlayerState, input: Input, now: Instant) -> Vec<Effect> 
                 // Spotify's: the bot drives the account, so what the room
                 // heard is the authoritative record. The answer comes back
                 // as `PreviousResolved`.
-                fx.push(Effect::ResolvePrevious { before: state.history_cursor });
-                state.pending_reply = Some(tx);
+                if state.pending_reply.is_some() {
+                    // A ⏮ is already being resolved; answering this one
+                    // separately would either drop the first caller's reply
+                    // channel or walk back twice for one intent.
+                    reply(&mut fx, tx, "⏮ Already going back — one moment.");
+                } else {
+                    fx.push(Effect::ResolvePrevious { before: state.history_cursor });
+                    state.pending_reply = Some(tx);
+                }
             } else {
                 reply(&mut fx, tx, "Nothing is playing right now.");
             }
