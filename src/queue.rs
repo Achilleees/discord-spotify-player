@@ -231,6 +231,48 @@ impl PriorityQueue {
 mod tests {
     use super::*;
 
+    /// The revision counter is the sole trigger for queue persistence: the
+    /// actor compares it across each step and writes the queue out when it
+    /// moves. A mutation that forgets to bump it doesn't fail anything
+    /// visibly — it just stops being saved, and the next restart restores a
+    /// queue that is quietly wrong.
+    #[test]
+    fn every_mutation_bumps_the_revision() {
+        let mut q = PriorityQueue::new();
+        let mut seen = q.revision();
+        let mut moved = |q: &PriorityQueue, what: &str| {
+            assert_ne!(q.revision(), seen, "{what} did not bump the revision");
+            seen = q.revision();
+        };
+
+        q.push(item("a"));
+        moved(&q, "push");
+        q.push_front(item("b"));
+        moved(&q, "push_front");
+        q.insert(1, item("c"));
+        moved(&q, "insert");
+        q.pop();
+        moved(&q, "pop");
+        q.remove_first(|i| i.source.display_title() == "a");
+        moved(&q, "remove_first");
+        q.clear();
+        moved(&q, "clear");
+    }
+
+    #[test]
+    fn a_no_op_does_not_bump_the_revision() {
+        // A spurious bump costs a pointless whole-table rewrite on every
+        // input that touches an empty queue.
+        let mut q = PriorityQueue::new();
+        let start = q.revision();
+        q.clear();
+        assert_eq!(q.revision(), start, "clearing an empty queue changed nothing");
+        q.pop();
+        assert_eq!(q.revision(), start, "popping an empty queue changed nothing");
+        q.remove_first(|_| true);
+        assert_eq!(q.revision(), start, "removing nothing changed nothing");
+    }
+
     fn item(title: &str) -> QueueItem {
         QueueItem::new(
             MediaSource::YouTube {

@@ -49,8 +49,10 @@ impl HistoryStore {
                  queued_by    TEXT,
                  queued_by_id TEXT
              );
-             CREATE INDEX IF NOT EXISTS idx_play_history_aired_at
-                 ON play_history (aired_at);",
+             -- Both reads order and filter by id, not aired_at, so an
+             -- aired_at index would be write amplification on the hot
+             -- insert path and nothing else. id is already the primary key.
+             ",
         )?;
         Ok(Self { conn: Mutex::new(conn) })
     }
@@ -152,24 +154,23 @@ impl HistoryStore {
 mod tests {
     use super::*;
 
+    /// Built through `open` itself, against a real (temporary) file, so the
+    /// schema under test is the one that ships. A hand-copied `CREATE TABLE`
+    /// here would let a renamed column pass every test and fail on the live
+    /// database.
+    static NEXT_DB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
     fn store() -> HistoryStore {
-        // Each test gets its own in-memory database.
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE play_history (
-                 id           INTEGER PRIMARY KEY AUTOINCREMENT,
-                 aired_at     TEXT NOT NULL DEFAULT (datetime('now')),
-                 source       TEXT NOT NULL,
-                 track_ref    TEXT NOT NULL,
-                 context_uri  TEXT,
-                 title        TEXT,
-                 artist       TEXT,
-                 queued_by    TEXT,
-                 queued_by_id TEXT
-             );",
-        )
-        .unwrap();
-        HistoryStore { conn: Mutex::new(conn) }
+        let path = std::env::temp_dir().join(format!(
+            "spotibot-history-test-{}-{}.db",
+            std::process::id(),
+            // A counter, not a thread id: ids get reused, and on Windows
+            // removing a file another test still holds open fails silently
+            // — which would leak one test's rows into the next.
+            NEXT_DB.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&path);
+        HistoryStore::open(path.to_str().unwrap()).unwrap()
     }
 
     fn baseline(track: &str) -> AiredTrack {

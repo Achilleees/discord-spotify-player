@@ -203,19 +203,22 @@ impl QueueStore {
 mod tests {
     use super::*;
 
+    /// Built through `open` itself, against a real (temporary) file: a
+    /// hand-copied schema here would let a renamed column pass every test
+    /// and fail against the live database.
+    static NEXT_DB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
     fn store() -> QueueStore {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE queue_items (
-                 position     INTEGER PRIMARY KEY,
-                 source_json  TEXT NOT NULL,
-                 queued_by    TEXT NOT NULL,
-                 queued_by_id TEXT NOT NULL,
-                 added_at     TEXT NOT NULL DEFAULT (datetime('now'))
-             );",
-        )
-        .unwrap();
-        QueueStore { conn: Mutex::new(conn) }
+        let path = std::env::temp_dir().join(format!(
+            "spotibot-queue-test-{}-{}.db",
+            std::process::id(),
+            // A counter, not a thread id: ids get reused, and on Windows
+            // removing a file another test still holds open fails silently
+            // — which would leak one test's rows into the next.
+            NEXT_DB.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&path);
+        QueueStore::open(path.to_str().unwrap()).unwrap()
     }
 
     fn yt(title: &str) -> QueueItem {
@@ -307,6 +310,78 @@ mod tests {
         let loaded = s.load().unwrap();
         assert_eq!(loaded.len(), 1, "the readable row still restores");
         assert_eq!(loaded[0].source.display_title(), "good-two");
+    }
+
+    #[test]
+    fn a_track_that_no_longer_resolves_is_skipped_not_fatal() {
+        // `load` runs inside the bot's startup path, so one bad row must not
+        // be able to stop the process from booting.
+        let s = store();
+        s.save(&[yt("keeper")]).unwrap();
+        {
+            let conn = s.lock();
+            conn.execute(
+                "INSERT INTO queue_items (position, source_json, queued_by, queued_by_id)
+                 VALUES (1, ?1, 'Papos', '1')",
+                [r#"{"kind":"spotify","uri":"not-a-spotify-uri","title":"t","artist":"a","album_art_url":null}"#],
+            )
+            .unwrap();
+        }
+        let loaded = s.load().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].source.display_title(), "keeper");
+    }
+
+    #[test]
+    fn an_unreadable_requester_id_is_skipped_not_fatal() {
+        let s = store();
+        s.save(&[yt("keeper")]).unwrap();
+        {
+            let conn = s.lock();
+            conn.execute(
+                "UPDATE queue_items SET queued_by_id = 'not-a-number' WHERE position = 0",
+                [],
+            )
+            .unwrap();
+        }
+        assert!(s.load().unwrap().is_empty(), "skipped rather than panicking");
+    }
+
+    #[test]
+    fn every_field_survives_the_round_trip() {
+        // display_title() alone would let a swapped field (url for video_id,
+        // attachment_url for filename) pass — and those are exactly what the
+        // feeder fetches and the player plays.
+        let s = store();
+        s.save(&[spotify("3iJDVtjZGLkWQOG53XdTvF"), yt("a-title")]).unwrap();
+        let loaded = s.load().unwrap();
+
+        match &loaded[0].source {
+            MediaSource::Spotify { uri, title, artist, album_art_url } => {
+                assert_eq!(uri.to_string(), "spotify:track:3iJDVtjZGLkWQOG53XdTvF");
+                assert_eq!(title, "A Track");
+                assert_eq!(artist, "An Artist");
+                assert_eq!(album_art_url, &None);
+            }
+            other => panic!("expected a Spotify item, got {other:?}"),
+        }
+        match &loaded[1].source {
+            MediaSource::YouTube {
+                url,
+                video_id,
+                title,
+                channel,
+                duration_secs,
+                ..
+            } => {
+                assert_eq!(url, "https://soundcloud.com/x/a-title");
+                assert_eq!(video_id, "1");
+                assert_eq!(title, "a-title");
+                assert_eq!(channel, "A Channel");
+                assert_eq!(*duration_secs, 271);
+            }
+            other => panic!("expected a YouTube item, got {other:?}"),
+        }
     }
 
     #[test]

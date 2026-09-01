@@ -1001,6 +1001,13 @@ pub fn step(state: &mut PlayerState, input: Input, now: Instant) -> Vec<Effect> 
             state.device_active = false;
             state.sp = SpDevice::Inactive;
             state.inflight.clear();
+            // The context and the shuffle/repeat flags describe ONE account's
+            // listening. A new session may be a different DJ, and carrying
+            // them over would stamp the previous DJ's playlist onto the new
+            // one's history rows — and open that playlist on their account
+            // the first time anyone pressed ⏮.
+            state.context_uri = None;
+            state.play_options = PlayOptions::default();
             let snapshot_ok = state.armed_snapshot.as_ref().is_some_and(|s| {
                 now.saturating_duration_since(s.at) < SNAPSHOT_TTL
                     && state.queue.find_first(|i| i.item_id == s.armed.item_id).is_some()
