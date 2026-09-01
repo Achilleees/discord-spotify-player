@@ -407,7 +407,14 @@ pub enum Input {
         reply: oneshot::Sender<String>,
     },
     Skip { reply: oneshot::Sender<String> },
-    Stop { reply: oneshot::Sender<String> },
+    Stop {
+        reply: oneshot::Sender<String>,
+        /// `true` for a human `/stop`: the bot is in the channel and must
+        /// leave it. `false` from the teardown paths, which own the voice
+        /// connection's fate themselves — it is already gone (force
+        /// disconnect) or removed by the caller (empty channel).
+        leave_voice: bool,
+    },
     TogglePause { reply: oneshot::Sender<String> },
     Previous { reply: oneshot::Sender<String> },
     /// A media runner's terminal report, epoch-tagged against stale runners.
@@ -742,7 +749,7 @@ pub fn step(state: &mut PlayerState, input: Input, now: Instant) -> Vec<Effect> 
             }
         }
 
-        Input::Stop { reply: tx } => {
+        Input::Stop { reply: tx, leave_voice } => {
             // Stop is stop: the bot goes quiet and leaves the channel. It
             // keeps the queue (`/clear` is what empties it) and never
             // touches the Spotify session or the account — only this
@@ -773,7 +780,15 @@ pub fn step(state: &mut PlayerState, input: Input, now: Instant) -> Vec<Effect> 
                 state.device_active = false;
             }
             fx.push(Effect::ClearBridge);
-            fx.push(Effect::LeaveVoice);
+            // `LeaveVoice` arms the shell's deliberate-leave guard, which is
+            // consumed by Discord's echo of the removal. A teardown reacting
+            // to a force disconnect has no echo coming (the bot's voice
+            // state is already "no channel"), so emitting it there would
+            // latch the guard and make the NEXT force disconnect read as
+            // deliberate — no teardown, librespot feeding a dead call.
+            if leave_voice {
+                fx.push(Effect::LeaveVoice);
+            }
             // The runner's `MediaEnded{Cancelled}` still lands after this;
             // `Active::None` plus a `Down` voice makes that boundary quiet,
             // and lets the next queued item ask for a fresh join.
@@ -1998,7 +2013,15 @@ mod tests {
 
         fn stop(&mut self) -> Vec<Effect> {
             let (tx, _rx) = oneshot::channel();
-            self.step(Input::Stop { reply: tx })
+            self.step(Input::Stop { reply: tx, leave_voice: true })
+        }
+
+        /// The teardown shape: `VoiceLost` then a stop that owns no leave.
+        fn teardown(&mut self) -> Vec<Effect> {
+            let mut fx = self.step(Input::VoiceLost);
+            let (tx, _rx) = oneshot::channel();
+            fx.extend(self.step(Input::Stop { reply: tx, leave_voice: false }));
+            fx
         }
 
         fn toggle(&mut self) -> Vec<Effect> {
@@ -2706,6 +2729,27 @@ mod tests {
         assert!(!sim.s.device_active, "the Connect device is released");
         assert!(matches!(sim.s.voice, VoiceStatus::Down));
         assert!(reply_text(&fx).contains("kept"), "got: {}", reply_text(&fx));
+    }
+
+    #[test]
+    fn teardown_stop_never_asks_to_leave_voice() {
+        // Live 2026-09-01: a force disconnect ran the teardown, whose Stop
+        // emitted LeaveVoice; the shell armed its deliberate-leave guard and
+        // removed a call Discord had already dropped, so no echo ever
+        // consumed the guard and the next force disconnect would have been
+        // read as deliberate. Teardown owns voice itself — the core must not.
+        let mut sim = Sim::baseline_playing();
+        let id = sim.push_spotify(1, "s1");
+        sim.arm(1, id, Ack::Confirmed);
+        let fx = sim.teardown();
+
+        assert!(!has_leave(&fx), "voice is already gone: nothing to leave");
+        assert!(has_clear(&fx), "the bridge is still silenced");
+        assert_eq!(spircs(&fx), vec![SpircCmd::Disconnect], "the device is still released");
+        assert!(!sim.s.device_active);
+        assert!(matches!(sim.s.active, Active::None));
+        assert!(matches!(sim.s.voice, VoiceStatus::Down));
+        assert_eq!(sim.s.queue.len(), 1, "the queue survives a teardown too");
     }
 
     #[test]

@@ -61,9 +61,11 @@ impl Handler {
         // presence/status transitions cover the Idle update. The queue is
         // deliberately left alone: it survives an empty channel the same way
         // it survives a restart, and `/clear` is the only thing that empties
-        // it.
+        // it. Voice is handled below, never by the actor: its `LeaveVoice`
+        // would arm the deliberate-leave guard, and after a force disconnect
+        // no gateway echo ever comes to consume it.
         self.player.send(PlayerInput::VoiceLost);
-        let _ = self.player.stop().await;
+        let _ = self.player.stop_without_leaving().await;
 
         let owner = {
             let mut lock = self.active_session.lock();

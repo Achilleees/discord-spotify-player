@@ -163,8 +163,16 @@ impl PlayerHandle {
         self.request(|reply| Input::Skip { reply }).await
     }
 
+    /// A human `/stop`: silence everything and leave the voice channel.
     pub async fn stop(&self) -> String {
-        self.request(|reply| Input::Stop { reply }).await
+        self.request(|reply| Input::Stop { reply, leave_voice: true }).await
+    }
+
+    /// The teardown paths' stop: the same silence, but the caller owns the
+    /// voice connection (already dropped by Discord, or removed by the
+    /// caller itself), so no `LeaveVoice` — see `Input::Stop`.
+    pub async fn stop_without_leaving(&self) -> String {
+        self.request(|reply| Input::Stop { reply, leave_voice: false }).await
     }
 
     pub async fn toggle_pause(&self) -> String {
