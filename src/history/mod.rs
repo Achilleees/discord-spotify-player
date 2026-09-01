@@ -10,15 +10,11 @@
 //! (`LoadRequest::from_context_uri`) rather than replacing it with a
 //! one-track context.
 
-#[cfg(test)]
-use crate::player::state::AiredSource;
-use crate::player::state::AiredTrack;
-use rusqlite::Connection;
+use crate::player::state::{AiredSource, AiredTrack};
+use rusqlite::{Connection, OptionalExtension};
 use std::sync::Mutex;
 
-/// One aired row, as read back out. Test-only until something reads the
-/// history back (the `/history` listing and back-navigation both will).
-#[cfg(test)]
+/// One aired row, as read back out.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HistoryRow {
     pub id: i64,
@@ -82,6 +78,48 @@ impl HistoryStore {
             ],
         )?;
         Ok(())
+    }
+
+    /// The row aired immediately before `before`, or the one before the
+    /// newest row when `before` is `None` (i.e. "the track before whatever
+    /// is playing"). `None` means there is nothing further back.
+    ///
+    /// Back-navigation walks by row id rather than re-reading "the
+    /// second-newest row" each time: replaying a track appends a row of its
+    /// own, so the naive query would bounce between two tracks forever.
+    pub fn aired_before(&self, before: Option<i64>) -> rusqlite::Result<Option<HistoryRow>> {
+        let conn = self.lock();
+        let anchor: i64 = match before {
+            Some(id) => id,
+            None => {
+                match conn
+                    .query_row("SELECT MAX(id) FROM play_history", [], |r| {
+                        r.get::<_, Option<i64>>(0)
+                    })? {
+                    Some(newest) => newest,
+                    None => return Ok(None),
+                }
+            }
+        };
+        conn.query_row(
+            "SELECT id, aired_at, source, track_ref, context_uri, title, artist, queued_by
+             FROM play_history WHERE id < ?1 ORDER BY id DESC LIMIT 1",
+            [anchor],
+            |row| {
+                let source: String = row.get(2)?;
+                Ok(HistoryRow {
+                    id: row.get(0)?,
+                    aired_at: row.get(1)?,
+                    source: AiredSource::from_str(&source),
+                    track_ref: row.get(3)?,
+                    context_uri: row.get(4)?,
+                    title: row.get(5)?,
+                    artist: row.get(6)?,
+                    queued_by: row.get(7)?,
+                })
+            },
+        )
+        .optional()
     }
 
     /// The most recently aired tracks, newest first.
@@ -196,6 +234,42 @@ mod tests {
         s.record(&baseline("spotify:track:one")).unwrap();
         s.record(&baseline("spotify:track:one")).unwrap();
         assert_eq!(s.recent(10).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn walking_back_by_id_does_not_bounce_between_two_tracks() {
+        // The whole reason back-navigation carries a cursor: replaying a
+        // track appends a row, so "the second-newest row" would alternate
+        // between the last two tracks forever.
+        let s = store();
+        for t in ["one", "two", "three"] {
+            s.record(&baseline(t)).unwrap();
+        }
+
+        // From live: the track before whatever is playing ("three").
+        let first_back = s.aired_before(None).unwrap().unwrap();
+        assert_eq!(first_back.track_ref, "two");
+
+        // Replaying it appends a row — and the next step back must still go
+        // to "one", not back to "two".
+        s.record(&baseline("two")).unwrap();
+        let second_back = s.aired_before(Some(first_back.id)).unwrap().unwrap();
+        assert_eq!(second_back.track_ref, "one");
+    }
+
+    #[test]
+    fn walking_past_the_start_reports_nothing_rather_than_wrapping() {
+        let s = store();
+        s.record(&baseline("only")).unwrap();
+        // Nothing aired before the single row.
+        let oldest = s.recent(1).unwrap()[0].id;
+        assert_eq!(s.aired_before(Some(oldest)).unwrap(), None);
+    }
+
+    #[test]
+    fn walking_back_on_an_empty_history_is_not_an_error() {
+        let s = store();
+        assert_eq!(s.aired_before(None).unwrap(), None);
     }
 
     #[test]

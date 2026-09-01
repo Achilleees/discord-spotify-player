@@ -187,6 +187,16 @@ pub struct PlayerState {
     /// accepted for; suppresses duplicate cards when librespot re-emits
     /// `Playing` for the same track (seek, resume).
     pub last_heard_track: Option<String>,
+    /// Where back-navigation has walked to in the play history. `None` means
+    /// "live": the next ⏮ starts from whatever is playing. Any forward move
+    /// (a skip, a play, a queued item starting) puts us back live.
+    pub history_cursor: Option<i64>,
+    /// The track a context jump asked for, until a transport event confirms
+    /// it. Librespot silently starts a context at track 1 when the requested
+    /// track is not in it, so the request has to be checked, not assumed.
+    awaiting_jump: Option<SpotifyUri>,
+    /// The ⏮ reply, held while the shell reads the history.
+    pending_reply: Option<oneshot::Sender<String>>,
     /// The context the Spotify baseline is playing from, as last reported
     /// by `SetQueue`. Stamped onto history rows so a later back-jump can
     /// reopen the playlist at a track instead of replacing it with a
@@ -203,6 +213,9 @@ impl PlayerState {
             sp: SpDevice::Inactive,
             link_up: false,
             context_uri: None,
+            history_cursor: None,
+            awaiting_jump: None,
+            pending_reply: None,
             armed: None,
             pause_owner: None,
             inflight: InflightRing::default(),
@@ -260,13 +273,22 @@ impl AiredSource {
 
     /// Unknown strings read as `Baseline`: a row written by a newer version
     /// should degrade to "something played", never panic a listing.
-    #[cfg(test)]
     pub fn from_str(s: &str) -> Self {
         match s {
             "request" => AiredSource::Request,
             _ => AiredSource::Baseline,
         }
     }
+}
+
+/// A track found in the play history by a ⏮, handed back to the core.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreviousTrack {
+    /// History row id — the cursor the next ⏮ walks back from.
+    pub id: i64,
+    pub uri: SpotifyUri,
+    /// The context it aired from, when one was recorded.
+    pub context_uri: Option<String>,
 }
 
 /// One track becoming audible, handed to the history store by the actor.
@@ -393,6 +415,9 @@ pub enum Input {
     /// path besides ▶ that may activate. Auto-start and on-demand sessions
     /// never send it (F15).
     ActivateDevice,
+    /// The history row the shell found for a ⏮, or `None` when there is
+    /// nothing further back.
+    PreviousResolved { track: Option<PreviousTrack> },
     /// Empty the queue without touching what is currently audible — the
     /// half of `/stop` that isn't "go to dead air".
     ClearQueue { reply: oneshot::Sender<String> },
@@ -423,6 +448,11 @@ pub enum SpircCmd {
     /// `Spirc::transfer(None)`: restore context, position, pause state and
     /// the queue after a reconnect.
     Transfer,
+    /// Reopen a context positioned at one of its tracks. Unlike `Load`,
+    /// which replaces the context with a single track, this restores the
+    /// playlist and starts inside it — the only non-destructive way to play
+    /// a specific track the DJ already heard.
+    LoadContext { context_uri: String, track_uri: SpotifyUri },
     /// Give up the active-device slot. Always paired with a pause: the
     /// non-pausing form leaves librespot decoding into a bridge nobody
     /// drains, and its next `Playing` would re-take the turn from outside
@@ -488,6 +518,10 @@ pub enum Effect {
     /// Leave the voice channel. Only `/stop` asks for this — an empty
     /// channel is torn down by the Discord layer instead.
     LeaveVoice,
+    /// Read the play history for the track aired before `before` (or before
+    /// whatever is playing, when `None`) and feed it back as
+    /// `Input::PreviousResolved`. The core never touches the database.
+    ResolvePrevious { before: Option<i64> },
     /// Spotify reported a track playing without metadata: resolve it
     /// through the live session and feed the answer back as
     /// `TransportEvent::TrackChanged` (which posts the card).
@@ -855,10 +889,48 @@ pub fn step(state: &mut PlayerState, input: Input, now: Instant) -> Vec<Effect> 
                     SpDevice::Playing(_) | SpDevice::Paused(_) | SpDevice::Boundary
                 )
             {
-                fx.push(Effect::Spirc(SpircCmd::Previous));
-                reply(&mut fx, tx, "⏮ Previous track.");
+                // Our own history decides what "previous" means, not
+                // Spotify's: the bot drives the account, so what the room
+                // heard is the authoritative record. The answer comes back
+                // as `PreviousResolved`.
+                fx.push(Effect::ResolvePrevious { before: state.history_cursor });
+                state.pending_reply = Some(tx);
             } else {
                 reply(&mut fx, tx, "Nothing is playing right now.");
+            }
+        }
+
+        Input::PreviousResolved { track } => {
+            let Some(tx) = state.pending_reply.take() else {
+                // The reply channel is gone (a second ⏮ raced this one);
+                // resolving twice is harmless, answering twice is not.
+                return fx;
+            };
+            match track {
+                // A track we heard, and we know the context it came from:
+                // reopen the playlist positioned there, which leaves the
+                // DJ's environment intact.
+                Some(PreviousTrack { id, uri, context_uri: Some(context_uri) }) => {
+                    state.history_cursor = Some(id);
+                    state.awaiting_jump = Some(uri.clone());
+                    fx.push(Effect::Spirc(SpircCmd::LoadContext {
+                        context_uri,
+                        track_uri: uri,
+                    }));
+                    reply(&mut fx, tx, "⏮ Previous track.");
+                }
+                // Heard, but with no context to reopen (a one-off link, or a
+                // row written before contexts were recorded). Spotify's own
+                // history is the only honest fallback.
+                Some(_) => {
+                    fx.push(Effect::Spirc(SpircCmd::Previous));
+                    reply(&mut fx, tx, "⏮ Previous track.");
+                }
+                None => reply(
+                    &mut fx,
+                    tx,
+                    "❌ Nothing further back — this is the earliest track I have a record of.",
+                ),
             }
         }
 
@@ -1156,6 +1228,24 @@ fn handle_transport(state: &mut PlayerState, ev: TransportEvent, now: Instant, f
             // this is also how a post-`Transfer` reconnect re-marks it.
             state.device_active = true;
             let uri_str = uri.to_string();
+            // A context jump asked for a specific track. Librespot starts a
+            // context at track 1 when it cannot find the one requested, and
+            // says so only in its own log — so the arrival has to be checked
+            // rather than assumed, or a bad jump silently replays a playlist
+            // from the top.
+            if let Some(wanted) = state.awaiting_jump.take() {
+                if wanted != uri {
+                    fx.push(Effect::Ui(UiMsg::Notice(
+                        "⚠️ Spotify couldn't find that track in the playlist and started from                          the beginning instead."
+                            .to_string(),
+                    )));
+                    state.history_cursor = None;
+                }
+            } else {
+                // Anything else playing means the playlist has moved on past
+                // wherever ⏮ walked to: we are live again.
+                state.history_cursor = None;
+            }
             // Bookkeeping first: a matching request is consumed wherever it
             // sits (a track the DJ's playlist reaches isn't also aired
             // later), and the armed marker clears only for the armed uri.
@@ -2733,6 +2823,111 @@ mod tests {
         let fx = sim.media_ended(MediaOutcome::Finished);
         assert!(spircs(&fx).is_empty(), "the phone's pause is honoured");
         assert_eq!(sim.s.pause_owner, Some(PauseOwner::Human));
+    }
+
+    fn prev_track(id: i64, n: u64, context: Option<&str>) -> PreviousTrack {
+        PreviousTrack {
+            id,
+            uri: uri(n),
+            context_uri: context.map(|c| c.to_string()),
+        }
+    }
+
+    #[test]
+    fn previous_asks_the_history_rather_than_spotify() {
+        let mut sim = Sim::baseline_playing();
+        let fx = sim.previous();
+        assert!(
+            fx.iter()
+                .any(|e| matches!(e, Effect::ResolvePrevious { before: None })),
+            "walks from live the first time"
+        );
+        assert!(spircs(&fx).is_empty(), "nothing is sent until it resolves");
+    }
+
+    #[test]
+    fn a_resolved_previous_reopens_the_playlist_at_that_track() {
+        let mut sim = Sim::baseline_playing();
+        sim.previous();
+        let fx = sim.step(Input::PreviousResolved {
+            track: Some(prev_track(7, 3, Some("spotify:playlist:abc"))),
+        });
+
+        assert_eq!(
+            spircs(&fx),
+            vec![SpircCmd::LoadContext {
+                context_uri: "spotify:playlist:abc".to_string(),
+                track_uri: uri(3),
+            }],
+            "reopens the context instead of replacing it with one track"
+        );
+        assert_eq!(sim.s.history_cursor, Some(7), "the cursor advances back");
+    }
+
+    #[test]
+    fn a_track_with_no_recorded_context_falls_back_to_spotifys_own_previous() {
+        let mut sim = Sim::baseline_playing();
+        sim.previous();
+        let fx = sim.step(Input::PreviousResolved {
+            track: Some(prev_track(7, 3, None)),
+        });
+        assert_eq!(spircs(&fx), vec![SpircCmd::Previous]);
+    }
+
+    #[test]
+    fn reaching_the_start_of_the_history_says_so() {
+        let mut sim = Sim::baseline_playing();
+        sim.previous();
+        let fx = sim.step(Input::PreviousResolved { track: None });
+        assert!(spircs(&fx).is_empty());
+        assert!(reply_text(&fx).contains("Nothing further back"));
+    }
+
+    #[test]
+    fn a_jump_that_lands_on_the_wrong_track_is_reported_not_swallowed() {
+        // Librespot starts a context at track 1 when the requested track
+        // isn't in it, and only logs about it — so we check the arrival.
+        let mut sim = Sim::baseline_playing();
+        sim.previous();
+        sim.step(Input::PreviousResolved {
+            track: Some(prev_track(7, 3, Some("spotify:playlist:abc"))),
+        });
+
+        let fx = sim.transport(TransportEvent::Playing {
+            uri: uri(99),
+            meta: Some(meta("Not What Was Asked For")),
+        });
+        assert!(
+            fx.iter().any(|e| matches!(e, Effect::Ui(UiMsg::Notice(_)))),
+            "the mismatch surfaces"
+        );
+        assert_eq!(sim.s.history_cursor, None, "and the walk is abandoned");
+    }
+
+    #[test]
+    fn the_playlist_moving_on_puts_us_back_live() {
+        let mut sim = Sim::baseline_playing();
+        sim.previous();
+        sim.step(Input::PreviousResolved {
+            track: Some(prev_track(7, 3, Some("spotify:playlist:abc"))),
+        });
+        // The jump lands.
+        sim.transport(TransportEvent::Playing { uri: uri(3), meta: Some(meta("jumped-to")) });
+        assert_eq!(sim.s.history_cursor, Some(7), "still positioned there");
+
+        // The context then advances on its own: no longer browsing history.
+        sim.transport(TransportEvent::Playing { uri: uri(4), meta: Some(meta("next")) });
+        assert_eq!(sim.s.history_cursor, None);
+    }
+
+    #[test]
+    fn previous_still_refuses_during_a_queue_item() {
+        let mut sim = Sim::media_over_paused_baseline();
+        let fx = sim.previous();
+        assert!(!fx
+            .iter()
+            .any(|e| matches!(e, Effect::ResolvePrevious { .. })));
+        assert!(reply_text(&fx).contains("isn't available"));
     }
 
     #[test]

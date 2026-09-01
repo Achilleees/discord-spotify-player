@@ -2,7 +2,7 @@ use crate::audio_bridge::AudioBridge;
 use crate::config::Config;
 use crate::player::state::{TrackMeta, TransportEvent};
 use crate::spotify::sink::{DiscordSink, DspConfig};
-use librespot_connect::{ConnectConfig, LoadRequest, LoadRequestOptions, Spirc};
+use librespot_connect::{ConnectConfig, LoadRequest, LoadRequestOptions, PlayingTrack, Spirc};
 use librespot_core::authentication::Credentials;
 use librespot_core::config::{DeviceType, SessionConfig};
 use librespot_core::session::Session;
@@ -51,6 +51,9 @@ pub enum SpircCommand {
     /// Release the active-device slot, pausing as it goes. The device stays
     /// in the Connect list; librespot ignores this while already inactive.
     Disconnect,
+    /// Reopen a context at one of its tracks, restoring the playlist rather
+    /// than replacing it the way `Load` does.
+    LoadContext { context_uri: String, track_uri: SpotifyUri },
 }
 
 /// Track metadata resolved through the live librespot session, for
@@ -464,6 +467,25 @@ impl SpotifyPlayer {
                             Some(SpircCommand::Transfer) => {
                                 if let Err(e) = spirc.transfer(None) {
                                     tracing::warn!(error = ?e, "spirc transfer failed");
+                                }
+                            }
+                            Some(SpircCommand::LoadContext { context_uri, track_uri }) => {
+                                // Same active-device requirement as Load.
+                                if let Err(e) = spirc.activate() {
+                                    tracing::warn!(error = ?e, "spirc activate failed");
+                                }
+                                let req = LoadRequest::from_context_uri(
+                                    context_uri,
+                                    LoadRequestOptions {
+                                        start_playing: true,
+                                        playing_track: Some(PlayingTrack::Uri(
+                                            track_uri.to_uri(),
+                                        )),
+                                        ..Default::default()
+                                    },
+                                );
+                                if let Err(e) = spirc.load(req) {
+                                    tracing::warn!(error = ?e, "spirc context load failed");
                                 }
                             }
                             Some(SpircCommand::Disconnect) => {

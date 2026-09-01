@@ -44,7 +44,8 @@ use crate::audio::dj::DJAnnouncer;
 use crate::audio_bridge::AudioBridge;
 use crate::player::state::{
     step, Active, AnnounceKind, Effect, EnqueuePos, Input, MediaOutcome, NowPlaying,
-    PlayerSnapshot, PlayerState, PresenceState, SpDevice, SpircCmd, StartGate, TrackHandleCmd,
+    PlayerSnapshot, PlayerState, PresenceState, PreviousTrack, SpDevice, SpircCmd, StartGate,
+    TrackHandleCmd,
     TrackMeta, TransportEvent, UiMsg as CoreUiMsg,
 };
 use crate::presence::PresenceUpdate;
@@ -505,6 +506,31 @@ impl Actor {
                 });
             }
 
+            Effect::ResolvePrevious { before } => {
+                // Blocking read, off the actor thread; the answer returns
+                // through the mailbox like every other asynchronous result.
+                let history = self.deps.history.clone();
+                let tx = self.tx.clone();
+                tokio::task::spawn_blocking(move || {
+                    let track = history
+                        .and_then(|h| match h.aired_before(before) {
+                            Ok(row) => row,
+                            Err(e) => {
+                                tracing::warn!(error = %e, "could not read the play history");
+                                None
+                            }
+                        })
+                        .and_then(|row| {
+                            // A media item has no Spotify uri to jump to;
+                            // skip past it rather than failing the walk.
+                            SpotifyUri::from_uri(&row.track_ref).ok().map(|uri| {
+                                PreviousTrack { id: row.id, uri, context_uri: row.context_uri }
+                            })
+                        });
+                    let _ = tx.send(Input::PreviousResolved { track });
+                });
+            }
+
             Effect::LeaveVoice => {
                 // Spawned, never awaited: leaving talks to Discord.
                 let leave = (self.deps.leave_voice)();
@@ -645,6 +671,9 @@ impl Actor {
             SpircCmd::ActivateDevice => SpircCommand::ActivateDevice,
             SpircCmd::Transfer => SpircCommand::Transfer,
             SpircCmd::Disconnect => SpircCommand::Disconnect,
+            SpircCmd::LoadContext { context_uri, track_uri } => {
+                SpircCommand::LoadContext { context_uri, track_uri }
+            }
         };
         let _ = tx.send(command);
     }
