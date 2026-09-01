@@ -28,7 +28,8 @@ playback."*)
 | `/play [url] [file] [next]` | Voice gate (follow mode when the bot isn't in voice yet) | Starts playback if nothing is playing, otherwise enqueues. `next:true` jumps the queue (or lands right behind an already-armed head, since an armed Spotify track can't be un-queued). Accepts a Spotify/YouTube/SoundCloud URL or a file attachment, never both. Disabled at registration if yt-dlp/ffmpeg aren't available (Spotify links still work). |
 | `/queue [url] [file]` | Voice gate | Always enqueues, never starts playback. With no argument, shows the current queue listing instead. |
 | `/skip` | Voice gate | Skips the current track (media item or Spotify track) — see "How playback is ordered" below. |
-| `/stop` | Voice gate | Stops playback and clears the queue. |
+| `/stop` | Voice gate | Stops playback, releases the Spotify device and leaves the voice channel. The queue is kept. |
+| `/clear` | Voice gate | Empties the queue after a confirmation prompt. Whatever is playing keeps playing. |
 | `/np` | Anyone | Shows what's currently playing. |
 | `/announce` | Anyone, ungated | Toggles DJ track announcements on/off; the setting persists across restarts. |
 
@@ -40,6 +41,8 @@ playback."*)
 | ⏯ (`ctrl_pause_toggle`) | voice gate | Pauses/resumes the active media item, pauses a playing Spotify baseline, or — if nothing is audible — starts/resumes whatever the queue head or Spotify state implies (see below). If the device isn't active yet, this is also the takeover gesture. |
 | ⏭ (`ctrl_next`) | voice gate | Same as `/skip`. |
 | ➕ Queue (`ctrl_queue_hint`) | none — always available | Ephemeral reply with the queue listing and how to add to it. |
+| Clear the queue (`ctrl_queue_clear_confirm`) | voice gate | Confirms `/clear`. Gated on its own, because you can leave the channel between raising the prompt and answering it. |
+| Cancel (`ctrl_queue_clear_cancel`) | none | Dismisses the `/clear` prompt without touching the queue. |
 
 Button replies are ephemeral (only the clicker sees them), so they never
 spam the channel.
@@ -64,7 +67,7 @@ paused on the armed track until it's their turn. The armed marker in
 `/queue`'s listing (⏭ next on Spotify) shows this.
 
 **DJ pauses/plays from their phone mid-queue.** The player tracks who
-caused a pause (bot-for-media, bot-for-stop, or human) so it knows whether
+caused a pause (bot-for-media, or human) so it knows whether
 to auto-resume later. A human pause on the Spotify side is honored and
 never silently overridden, but it also never blocks an explicit Discord
 command (⏯, `/skip`, `/stop`) from taking over. If the DJ skips ahead from
@@ -72,13 +75,19 @@ their own phone, the player detects the matching `Playing` event and
 reconciles the armed track instead of getting confused about what's
 airing.
 
-**`/stop` semantics.** Clears the queue and silences whatever's audible: a
-playing media item is cancelled, or a playing Spotify baseline is paused.
-One caveat — Spotify has no way to un-queue a track once it's been armed
-(`AddToQueue`), so if a track was already handed to Spotify at the moment
-you stop, it may still play once when Spotify's own auto-advance reaches
-it. The reply says so explicitly: *"⏹ Stopped. Queue cleared. (a track
-already handed to Spotify will still play once)"*.
+**`/stop` semantics.** Stop is stop, not pause: a playing media item is
+cancelled, the Spotify device is paused and released, and the bot leaves
+the voice channel. It stays inside the player's own lifecycle — the
+Spotify session and the account are untouched, so a stop never logs
+anyone out.
+
+The queue survives. `/clear` is the only thing that empties it, and it
+asks first: an ephemeral prompt with Confirm/Cancel, whose buttons are
+removed once answered so it cannot be answered twice. One caveat applies
+to both — Spotify has no way to un-queue a track once it has been armed
+(`AddToQueue`), so a track already handed over may still play once when
+Spotify's own auto-advance reaches it. `/clear` says so explicitly when
+that is the case.
 
 **`/play` vs `/queue`.** `/play` starts playback immediately if nothing is
 playing; otherwise it behaves like `/queue` (optionally jumping the line
