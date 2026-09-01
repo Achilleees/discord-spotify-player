@@ -1193,7 +1193,19 @@ fn handle_transport(state: &mut PlayerState, ev: TransportEvent, now: Instant, f
         }
 
         TransportEvent::Unavailable { uri } => {
-            if matches!(state.active, Active::Spotify { .. } | Active::SpotifyPending { .. }) {
+            // Only the track we believe is audible left stale audio in the
+            // bridge. Librespot also reports this for a track it was
+            // preloading, which hasn't been heard at all — clearing on one
+            // of those cuts the buffer out from under the track still
+            // playing (a ~10s gap, since the bridge refills to capacity).
+            let was_audible = match (&state.active, &state.sp) {
+                (Active::SpotifyPending { uri: pending, .. }, _) => pending == &uri,
+                (Active::Spotify { .. }, SpDevice::Playing(cur) | SpDevice::Paused(cur)) => {
+                    cur == &uri
+                }
+                _ => false,
+            };
+            if was_audible {
                 fx.push(Effect::ClearBridge);
             }
             if state.armed.as_ref().is_some_and(|a| a.uri == uri) {
@@ -2433,6 +2445,20 @@ mod tests {
         let mut sim = Sim::baseline_playing();
         let fx = sim.transport(TransportEvent::Unavailable { uri: uri(9) });
         assert!(has_clear(&fx));
+    }
+
+    #[test]
+    fn unavailable_for_a_preloaded_track_leaves_the_playing_one_alone() {
+        // Seen live: librespot failed the key fetch for the track it was
+        // preloading and reported it unavailable while a different track
+        // played on. Clearing there cut the playing track's buffer.
+        let mut sim = Sim::baseline_playing();
+        let fx = sim.transport(TransportEvent::Unavailable { uri: uri(7) });
+        assert!(!has_clear(&fx));
+        // Still surfaced to the channel — it just doesn't touch the audio.
+        assert!(fx
+            .iter()
+            .any(|e| matches!(e, Effect::Ui(UiMsg::Notice(_)))));
     }
 
     #[test]
