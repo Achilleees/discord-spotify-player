@@ -23,6 +23,12 @@ src/
 ├── queue.rs                MediaSource (Spotify/YouTube/File) + QueueItem +
 │                         PriorityQueue: the one ordered queue across sources
 │
+├── history/
+│   └── mod.rs             HistoryStore: append-only log of what aired,
+│                          written when a track becomes audible (never when
+│                          it is queued); keeps the context uri each track
+│                          played from
+│
 ├── player/
 │   ├── mod.rs             module doc: how state.rs and actor.rs divide work
 │   ├── state.rs            pure decision core: PlayerState, Active (the
