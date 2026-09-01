@@ -410,12 +410,16 @@ pub struct DiscordBot {
 }
 
 impl DiscordBot {
+    // Wiring, not logic: each argument is a distinct process-lifetime
+    // dependency built in main, so grouping them would only rename them.
+    #[allow(clippy::too_many_arguments)]
     pub async fn new(
         config: Arc<Config>,
         bridge: Arc<AudioBridge>,
         presence_rx: mpsc::UnboundedReceiver<PresenceUpdate>,
         presence_tx: mpsc::UnboundedSender<PresenceUpdate>,
         user_store: Arc<UserStore>,
+        history: Option<Arc<crate::history::HistoryStore>>,
         oauth: Arc<SpotifyOAuth>,
         ytdlp_available: bool,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
@@ -563,6 +567,7 @@ impl DiscordBot {
             track_handle,
             dj,
             announce_enabled: announce_enabled.clone(),
+            history,
         });
 
         // One long-lived transport-event stream, shared by every generation

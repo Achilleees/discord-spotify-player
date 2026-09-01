@@ -2,6 +2,7 @@ mod audio;
 mod audio_bridge;
 mod config;
 mod discord;
+mod history;
 mod oauth;
 mod player;
 mod presence;
@@ -93,6 +94,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .map_err(|e| io::Error::other(format!("failed to open credential store: {e}")))?,
     );
 
+    // History is a nice-to-have: if the table can't be opened the bot still
+    // plays, it just stops keeping a record.
+    let history = match history::HistoryStore::open(&db_path) {
+        Ok(h) => Some(Arc::new(h)),
+        Err(e) => {
+            tracing::warn!(error = %e, "play history disabled — could not open the table");
+            None
+        }
+    };
+
     let bridge = AudioBridge::new(config.audio_buffer_seconds);
     tracing::debug!("audio bridge initialized");
 
@@ -126,6 +137,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         presence_rx,
         presence_tx.clone(),
         user_store.clone(),
+        history.clone(),
         oauth.clone(),
         ytdlp_available,
     )

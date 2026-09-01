@@ -110,6 +110,10 @@ pub struct PlayerDeps {
     pub track_handle: Arc<Mutex<Option<TrackHandle>>>,
     pub dj: Arc<DJAnnouncer>,
     pub announce_enabled: Arc<AtomicBool>,
+    /// Append-only log of what aired. `None` disables recording (tests, and
+    /// a bot whose database could not be opened) without changing any
+    /// playback behaviour.
+    pub history: Option<Arc<crate::history::HistoryStore>>,
 }
 
 /// The actor's mailbox handle. Cheap to clone; the typed helpers build the
@@ -427,6 +431,19 @@ impl Actor {
             }
 
             Effect::ClearBridge => self.deps.bridge.clear(),
+
+            Effect::RecordAired(aired) => {
+                // Spawned, never awaited here: the actor must not block on
+                // the database. A failed write costs a history row, never
+                // playback, so it is logged and dropped.
+                if let Some(history) = self.deps.history.clone() {
+                    tokio::task::spawn_blocking(move || {
+                        if let Err(e) = history.record(&aired) {
+                            tracing::warn!(error = %e, "failed to record play history");
+                        }
+                    });
+                }
+            }
 
             Effect::ResolveMeta(uri) => {
                 // Awaited in a spawned task, never here; the answer comes

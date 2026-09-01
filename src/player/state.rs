@@ -242,6 +242,50 @@ pub enum TimerKind {
     SnapshotExpiry,
 }
 
+/// Where an aired track came from. Not who queued it — a request aired
+/// because someone asked for it here; a baseline track aired because the
+/// DJ's own Spotify context reached it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AiredSource {
+    Request,
+    Baseline,
+}
+
+impl AiredSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AiredSource::Request => "request",
+            AiredSource::Baseline => "baseline",
+        }
+    }
+
+    /// Unknown strings read as `Baseline`: a row written by a newer version
+    /// should degrade to "something played", never panic a listing.
+    #[cfg(test)]
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "request" => AiredSource::Request,
+            _ => AiredSource::Baseline,
+        }
+    }
+}
+
+/// One track becoming audible, handed to the history store by the actor.
+/// Plain strings only: the core names what aired, the store decides how to
+/// keep it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AiredTrack {
+    pub source: AiredSource,
+    /// A Spotify uri, or the URL/filename for a media item.
+    pub track_ref: String,
+    /// The Spotify context it aired from, when there was one.
+    pub context_uri: Option<String>,
+    pub title: Option<String>,
+    pub artist: Option<String>,
+    pub queued_by: Option<String>,
+    pub queued_by_id: Option<String>,
+}
+
 /// Gen-tagged Spotify telemetry, translated from librespot player events by
 /// the session layer. `SetQueue.queued` carries only `provider == "queue"`
 /// entries (the ones `AddToQueue` creates); `current` is unfiltered.
@@ -427,6 +471,9 @@ pub enum Effect {
     CancelMedia,
     ClearBridge,
     JoinVoice,
+    /// A track just became audible: append it to the play history. Emitted
+    /// once per airing, alongside the card that announces it.
+    RecordAired(AiredTrack),
     /// Spotify reported a track playing without metadata: resolve it
     /// through the live session and feed the answer back as
     /// `TransportEvent::TrackChanged` (which posts the card).
@@ -1099,6 +1146,12 @@ fn handle_transport(state: &mut PlayerState, ev: TransportEvent, now: Instant, f
                             uri: uri.clone(),
                             meta: meta.clone(),
                         }));
+                        fx.push(Effect::RecordAired(aired_spotify(
+                            state,
+                            &uri_str,
+                            Some(m),
+                            popped.as_ref(),
+                        )));
                         fx.push(Effect::Announce(AnnounceKind::Track {
                             title: m.title.clone(),
                             artist: m.artist.clone(),
@@ -1254,7 +1307,17 @@ fn handle_transport(state: &mut PlayerState, ev: TransportEvent, now: Instant, f
             if state.last_heard_track.as_deref() != Some(uri_str.as_str())
                 && matches!(state.active, Active::Spotify { .. } | Active::SpotifyPending { .. })
             {
-                fx.push(Effect::Ui(UiMsg::NowPlayingSpotify { uri, meta: Some(meta) }));
+                fx.push(Effect::Ui(UiMsg::NowPlayingSpotify {
+                    uri,
+                    meta: Some(meta.clone()),
+                }));
+                // The resolved-metadata path reaches the card here rather
+                // than through `Playing`, so history is written here too —
+                // both sites are gated on `last_heard_track`, so a track is
+                // only ever recorded once per airing.
+                fx.push(Effect::RecordAired(aired_spotify(
+                    state, &uri_str, Some(&meta), None,
+                )));
                 state.last_heard_track = Some(uri_str);
             }
         }
@@ -1459,6 +1522,30 @@ fn begin_load(state: &mut PlayerState, uri: SpotifyUri, now: Instant, fx: &mut V
 
 /// Hand the turn to a media item: bump the epoch, make sure voice is coming
 /// up, and emit the gated start plus its card.
+/// A history row for a Spotify track that just became audible. `popped` is
+/// the queue item this airing consumed, when there was one — its presence is
+/// what makes this a request rather than the DJ's own context reaching a
+/// track, and it carries who asked for it.
+fn aired_spotify(
+    state: &PlayerState,
+    uri_str: &str,
+    meta: Option<&TrackMeta>,
+    popped: Option<&QueueItem>,
+) -> AiredTrack {
+    AiredTrack {
+        source: match popped {
+            Some(_) => AiredSource::Request,
+            None => AiredSource::Baseline,
+        },
+        track_ref: uri_str.to_string(),
+        context_uri: state.context_uri.clone(),
+        title: meta.map(|m| m.title.clone()),
+        artist: meta.map(|m| m.artist.clone()),
+        queued_by: popped.map(|i| i.queued_by.clone()),
+        queued_by_id: popped.map(|i| i.queued_by_id.to_string()),
+    }
+}
+
 fn start_media(state: &mut PlayerState, item: QueueItem, gate: StartGate, fx: &mut Vec<Effect>) {
     state.media_epoch += 1;
     // The media card replaces whatever was up: the next Spotify `Playing`
@@ -1472,6 +1559,21 @@ fn start_media(state: &mut PlayerState, item: QueueItem, gate: StartGate, fx: &m
     }
     fx.push(Effect::StartMedia { item: item.clone(), epoch: state.media_epoch, gate });
     fx.push(Effect::Ui(UiMsg::NowPlayingMedia { item: item.clone() }));
+    fx.push(Effect::RecordAired(AiredTrack {
+        // Always a request: nothing but a queued item ever starts here.
+        source: AiredSource::Request,
+        track_ref: match &item.source {
+            MediaSource::YouTube { url, .. } => url.clone(),
+            MediaSource::File { attachment_url, .. } => attachment_url.clone(),
+            MediaSource::Spotify { uri, .. } => uri.to_string(),
+        },
+        // A media item has no Spotify context to reopen.
+        context_uri: None,
+        title: Some(item.source.display_title().to_string()),
+        artist: Some(item.source.display_subtitle()),
+        queued_by: Some(item.queued_by.clone()),
+        queued_by_id: Some(item.queued_by_id.to_string()),
+    }));
     state.active = Active::Media { item, paused: false, epoch: state.media_epoch };
 }
 
@@ -2560,6 +2662,96 @@ mod tests {
         let fx = sim.media_ended(MediaOutcome::Finished);
         assert!(spircs(&fx).is_empty(), "the phone's pause is honoured");
         assert_eq!(sim.s.pause_owner, Some(PauseOwner::Human));
+    }
+
+    fn aired(fx: &[Effect]) -> Vec<&AiredTrack> {
+        fx.iter()
+            .filter_map(|e| match e {
+                Effect::RecordAired(a) => Some(a),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_baseline_track_is_recorded_with_the_context_it_aired_from() {
+        let mut sim = Sim::baseline_playing();
+        sim.transport(TransportEvent::SetQueue {
+            current: Some(uri(9)),
+            queued: vec![],
+            context_uri: Some("spotify:playlist:abc".into()),
+        });
+
+        let fx = sim.transport(TransportEvent::Playing {
+            uri: uri(3),
+            meta: Some(meta("Something")),
+        });
+
+        let rows = aired(&fx);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].source, AiredSource::Baseline, "nobody queued it");
+        assert_eq!(rows[0].track_ref, uri(3).to_string());
+        assert_eq!(rows[0].context_uri.as_deref(), Some("spotify:playlist:abc"));
+        assert_eq!(rows[0].queued_by, None);
+    }
+
+    #[test]
+    fn an_aired_request_records_who_asked_for_it() {
+        let mut sim = Sim::baseline_playing();
+        sim.enqueue(spotify_item(1, "s1"));
+
+        let fx = sim.transport(TransportEvent::Playing {
+            uri: uri(1),
+            meta: Some(meta("s1")),
+        });
+
+        let rows = aired(&fx);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].source, AiredSource::Request, "it was queued here");
+        assert!(rows[0].queued_by.is_some());
+    }
+
+    #[test]
+    fn the_same_track_repeating_playing_is_only_recorded_once() {
+        // Librespot re-emits Playing on a seek or a resume; history is a log
+        // of airings, not of transport events.
+        let mut sim = Sim::baseline_playing();
+        let first = sim.transport(TransportEvent::Playing {
+            uri: uri(3),
+            meta: Some(meta("Something")),
+        });
+        assert_eq!(aired(&first).len(), 1);
+
+        let again = sim.transport(TransportEvent::Playing {
+            uri: uri(3),
+            meta: Some(meta("Something")),
+        });
+        assert_eq!(aired(&again).len(), 0, "same track, no second row");
+    }
+
+    #[test]
+    fn a_spotify_play_under_a_media_item_records_nothing() {
+        // It never became audible — the actor pauses it straight back down.
+        let mut sim = Sim::media_over_paused_baseline();
+        let fx = sim.transport(TransportEvent::Playing {
+            uri: uri(3),
+            meta: Some(meta("Something")),
+        });
+        assert!(aired(&fx).is_empty());
+    }
+
+    #[test]
+    fn starting_a_media_item_records_it_as_a_request() {
+        let mut sim = Sim::new();
+        sim.s.voice = VoiceStatus::Ready;
+        let mut fx = Vec::new();
+        start_media(&mut sim.s, media_item("a-track"), StartGate::Immediate, &mut fx);
+
+        let rows = aired(&fx);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].source, AiredSource::Request);
+        assert_eq!(rows[0].context_uri, None, "media has no Spotify context");
+        assert!(rows[0].queued_by.is_some());
     }
 
     #[test]
