@@ -20,6 +20,16 @@ fn max_samples(buffer_seconds: usize) -> usize {
     SAMPLE_RATE * CHANNELS * buffer_seconds
 }
 
+/// How much audio survives an overflow, in seconds. Hitting the cap means
+/// the consumer stalled; for a live stream the samples that just arrived
+/// are the ones worth keeping, so the stale front is dropped down to this
+/// cushion. Sized to sit inside the healthy steady-state fill (~0.3s).
+const OVERFLOW_KEEP_SECONDS: f32 = 0.5;
+
+fn overflow_keep_samples() -> usize {
+    (((SAMPLE_RATE * CHANNELS) as f32 * OVERFLOW_KEEP_SECONDS) as usize) & !1
+}
+
 /// Shared audio buffer between the producers — librespot's sink, the
 /// YouTube/file feeder, and the DJ overlay (a second, mixed-on-top deque) —
 /// and the Discord consumer (SimpleBridgeReader).
@@ -82,35 +92,35 @@ impl AudioBridge {
         }
 
         let mut buffer = self.buffer.lock();
-        let available_space = self.max_samples.saturating_sub(buffer.len());
-        if available_space == 0 {
-            self.stats
-                .total_dropped
-                .fetch_add(samples.len() as u64, std::sync::atomic::Ordering::Relaxed);
-            if count.is_multiple_of(200) {
-                tracing::warn!(
-                    target: "audio_stream",
-                    dropped = samples.len(),
-                    total_dropped = self.stats.total_dropped.load(std::sync::atomic::Ordering::Relaxed),
-                    "bridge full, dropping samples"
-                );
-            }
-            return;
-        }
-        // Keep drops on whole stereo frames (even counts) so the L/R
+        // Keep every drop on whole stereo frames (even counts) so the L/R
         // interleaving in the buffer never shifts by one sample.
-        let to_take = (samples.len().min(available_space)) & !1;
+        let to_take = (samples.len().min(self.max_samples)) & !1;
         if to_take < samples.len() {
+            // One push larger than the entire buffer: the tail cannot fit
+            // however the front is managed.
             self.stats.total_dropped.fetch_add(
                 (samples.len() - to_take) as u64,
                 std::sync::atomic::Ordering::Relaxed,
             );
+        }
+        // Overflow means the consumer stalled. Dropping what just arrived
+        // would leave the buffer pinned at capacity, so playback would run
+        // permanently behind live and never recover; drop the stale front
+        // instead, costing one audible jump and restoring normal latency.
+        let overflow = (buffer.len() + to_take).saturating_sub(self.max_samples);
+        if overflow > 0 {
+            let keep = overflow_keep_samples().min(self.max_samples.saturating_sub(to_take));
+            let discard = buffer.len().saturating_sub(keep) & !1;
+            buffer.drain(..discard);
+            self.stats
+                .total_dropped
+                .fetch_add(discard as u64, std::sync::atomic::Ordering::Relaxed);
             if count.is_multiple_of(200) {
                 tracing::warn!(
                     target: "audio_stream",
-                    dropped = samples.len() - to_take,
+                    dropped = discard,
                     total_dropped = self.stats.total_dropped.load(std::sync::atomic::Ordering::Relaxed),
-                    "bridge nearly full, dropping samples"
+                    "bridge full, dropped the backlog to catch up to live"
                 );
             }
         }
@@ -331,6 +341,39 @@ mod tests {
         b.push_samples(&vec![0.5f32; 100_000]);
         assert_eq!(b.len(), 88_200);
         assert!(b.stats_snapshot().total_dropped >= (100_000 - 88_200));
+    }
+
+    #[test]
+    fn a_stalled_consumer_keeps_the_newest_audio_not_the_oldest() {
+        // Seen live: the buffer filled to its 10s cap and stayed pinned
+        // there, so Discord ran ~10s behind Spotify until the bot was
+        // restarted. Refusing the new audio is what pinned it — the stale
+        // front has to go instead, so playback catches back up to live.
+        let b = AudioBridge::new(1); // cap = 88_200 samples = 1s
+        for i in 0..100u32 {
+            b.push_samples(&vec![i as f32; 2048]); // nothing ever pulls
+        }
+        let mut out = vec![0.0f32; b.len()];
+        let n = b.pull_samples(&mut out);
+        assert!(n > 0);
+        assert_eq!(out[n - 1], 99.0, "the newest audio survives");
+        assert!(out[0] > 0.0, "the oldest audio was discarded, not the newest");
+        assert!(b.stats_snapshot().total_dropped > 0);
+    }
+
+    #[test]
+    fn catching_up_keeps_the_newest_audio_and_stays_frame_aligned() {
+        let b = AudioBridge::new(1);
+        b.push_samples(&vec![0.5f32; 88_200]); // fill to cap with stale audio
+        b.push_samples(&[1.0, 2.0, 3.0, 4.0]); // fresh arrival
+        let mut out = vec![0.0f32; b.len()];
+        let n = b.pull_samples(&mut out);
+        assert!(n.is_multiple_of(2), "drains whole stereo frames");
+        assert_eq!(
+            &out[n - 4..n],
+            &[1.0, 2.0, 3.0, 4.0],
+            "the newest samples survive the catch-up"
+        );
     }
 
     #[test]
