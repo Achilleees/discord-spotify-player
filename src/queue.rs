@@ -85,9 +85,6 @@ pub struct QueueItem {
 impl QueueItem {
     /// Build an item awaiting insertion; the queue stamps `item_id` when the
     /// item is pushed, so constructors never invent ids.
-    // Unused until the C3 call-site migration; bot.rs's struct literals
-    // predate this constructor.
-    #[allow(dead_code)]
     pub fn new(source: MediaSource, queued_by: String, queued_by_id: u64) -> Self {
         Self { source, queued_by, queued_by_id, item_id: 0 }
     }

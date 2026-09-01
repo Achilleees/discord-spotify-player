@@ -165,7 +165,11 @@ fn render_history(rows: &[crate::history::HistoryRow]) -> String {
     for row in rows {
         let title = row.title.as_deref().unwrap_or("Unknown track");
         let artist = row.artist.as_deref().unwrap_or("Unknown artist");
-        let mut line = format!("• **{title}** — {artist}");
+        // `<t:unix:t>` is Discord's own timestamp markup: each reader sees
+        // it in their timezone, which is what makes "what played on Tuesday"
+        // answerable without the bot guessing at anyone's clock.
+        // Not in backticks: Discord only expands the markup as plain text.
+        let mut line = format!("• <t:{}:t> **{title}** — {artist}", row.aired_at_unix);
         if let Some(who) = row.queued_by.as_deref() {
             line.push_str(&format!(" (queued by {who})"));
         }
@@ -906,7 +910,7 @@ mod tests {
     fn row(title: &str, who: Option<&str>) -> HistoryRow {
         HistoryRow {
             id: 1,
-            aired_at: "2026-09-01 12:00:00".into(),
+            aired_at_unix: 1_788_000_000,
             source: AiredSource::Baseline,
             track_ref: "spotify:track:x".into(),
             context_uri: None,
@@ -914,6 +918,15 @@ mod tests {
             artist: Some("An Artist".into()),
             queued_by: who.map(String::from),
         }
+    }
+
+    #[test]
+    fn history_stamps_each_row_with_a_timestamp_discord_will_expand() {
+        // Bare markup, not code-fenced: in backticks Discord shows the raw
+        // "<t:...>" instead of a time, which is the whole point of storing it.
+        let out = render_history(&[row("A Track", None)]);
+        assert!(out.contains("<t:1788000000:t>"), "{out}");
+        assert!(!out.contains("`<t:"), "a fenced timestamp renders literally: {out}");
     }
 
     #[test]

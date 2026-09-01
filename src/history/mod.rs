@@ -23,7 +23,9 @@ use std::sync::Mutex;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HistoryRow {
     pub id: i64,
-    pub aired_at: String,
+    /// Unix seconds, so the listing can hand Discord a timestamp it renders
+    /// in each reader's own timezone. Stored as text; converted on read.
+    pub aired_at_unix: i64,
     pub source: AiredSource,
     pub track_ref: String,
     pub context_uri: Option<String>,
@@ -52,6 +54,11 @@ impl HistoryStore {
                  title        TEXT,
                  artist       TEXT,
                  queued_by    TEXT,
+                 -- Written but never read back: the listing shows a plain
+                 -- name rather than a mention, because a history listing
+                 -- that pings everyone in it is a bad listing. Kept because
+                 -- it is the durable identity behind the name, and it
+                 -- cannot be recovered later if it isn't stored now.
                  queued_by_id TEXT
              );
              -- Both reads order and filter by id, not aired_at, so an
@@ -109,14 +116,15 @@ impl HistoryStore {
             }
         };
         conn.query_row(
-            "SELECT id, aired_at, source, track_ref, context_uri, title, artist, queued_by
+            "SELECT id, CAST(strftime('%s', aired_at) AS INTEGER), source, track_ref,
+                    context_uri, title, artist, queued_by
              FROM play_history WHERE id < ?1 ORDER BY id DESC LIMIT 1",
             [anchor],
             |row| {
                 let source: String = row.get(2)?;
                 Ok(HistoryRow {
                     id: row.get(0)?,
-                    aired_at: row.get(1)?,
+                    aired_at_unix: row.get(1)?,
                     source: AiredSource::from_str(&source),
                     track_ref: row.get(3)?,
                     context_uri: row.get(4)?,
@@ -133,7 +141,8 @@ impl HistoryStore {
     pub fn recent(&self, limit: usize) -> rusqlite::Result<Vec<HistoryRow>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
-            "SELECT id, aired_at, source, track_ref, context_uri, title, artist, queued_by
+            "SELECT id, CAST(strftime('%s', aired_at) AS INTEGER), source, track_ref,
+                    context_uri, title, artist, queued_by
              FROM play_history ORDER BY id DESC LIMIT ?1",
         )?;
         let rows = stmt
@@ -141,7 +150,7 @@ impl HistoryStore {
                 let source: String = row.get(2)?;
                 Ok(HistoryRow {
                     id: row.get(0)?,
-                    aired_at: row.get(1)?,
+                    aired_at_unix: row.get(1)?,
                     source: AiredSource::from_str(&source),
                     track_ref: row.get(3)?,
                     context_uri: row.get(4)?,
