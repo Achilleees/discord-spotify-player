@@ -39,8 +39,9 @@ src/
 │   │                       imports no serenity/songbird/librespot-connect
 │   └── actor.rs             impure shell: one task + mailbox owning
 │                            PlayerState; PlayerHandle is the typed API
-│                            (enqueue/skip/stop/toggle_pause/previous/query/
-│                            lookup_spotify); runs media runners as spawns
+│                            (enqueue/play/skip/stop/stop_without_leaving/
+│                            toggle_pause/previous/clear_queue/restore_queue/
+│                            query/lookup_spotify); runs media runners as spawns
 │
 ├── spotify/
 │   ├── mod.rs              re-exports (SpircCommand, EnsureOutcome, SessionSupervisor)
@@ -150,5 +151,9 @@ carries most of the suite:
   age-limit handling.
 - `src/audio_bridge.rs`, `src/discord/voice.rs` — buffer push/pull framing,
   prebuffer timing.
+- `src/queue_store.rs` — round-trip persistence, replace-not-append, one
+  unreadable row skipped rather than losing the rest.
+- `src/history/mod.rs` — newest-first ordering, context retention, and the
+  id-walk semantics back-navigation depends on.
 - `src/oauth/mod.rs`, `src/discord/presence.rs`, `src/audio/mod.rs`,
   `src/spotify/sink.rs` — smaller focused suites per module.

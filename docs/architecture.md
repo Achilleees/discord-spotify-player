@@ -120,10 +120,17 @@ That guard is armed by whoever asks to leave, so only a departure that
 Discord will actually echo may arm it. `Input::Stop` carries a
 `leave_voice` flag for exactly this: `true` for a human `/stop`, where the
 voice gate guarantees the bot is in the channel and the echo always comes,
-and `false` from the teardown paths, which run *because* voice is already
-gone. A teardown that armed the guard would leave it latched — Discord
-sends no echo for a state that did not change — and the next genuine force
-disconnect would read as deliberate, leaving librespot feeding a dead call.
+and `false` from the teardown paths, which own the voice connection's fate
+themselves — it is already gone on a force disconnect, and the caller removes
+it on an empty channel. Either way no echo is coming. A teardown that armed
+the guard would leave it latched — Discord sends no echo for a state that did
+not change — and the next genuine force disconnect would read as deliberate,
+leaving librespot feeding a dead call.
+
+The guard counts outstanding departures rather than flagging one, so that
+undoing an arming can only ever undo its own. As a shared flag, a second
+`/stop` racing the first one's echo cleared the *first* one's arming, and
+that echo was then read as a force disconnect.
 
 The mirror rule governs joining. Audio reaches Discord only through the
 bridge, and the bridge is drained only by a live call, so every path that
@@ -268,7 +275,7 @@ surfaced instead of quietly restarting the playlist.
 
 ## librespot facts the design rests on
 
-Comments through `src/` cite these by number. All four are verified against
+Comments through `src/` cite these by number. All five are verified against
 the pinned revision (`1599145`) — re-verify before bumping it, since each
 one is load-bearing and a silent change upstream would not fail a test here.
 
@@ -293,6 +300,14 @@ ignored when the device is already active (`spirc.rs:711-725`), and an
 unconditional `activate()` on connect would claim the device away from the
 DJ's phone on every session start. This crate therefore never activates on
 connect; only `/login`, ▶, or a queued Spotify item reaching its turn does.
+
+**F16 — `previous` is not a promise to change track.** `handle_prev`
+branches on position (`spirc.rs:1747-1763`): under 3000 ms it steps to the
+previous track, at or over that it seeks to zero and keeps playing the same
+one. So the context-less back-jump fallback cannot assume it moved — it
+carries the cursor on the jump and commits it only when a *different* track
+arrives, or a press three seconds into a song would advance the walk without
+moving.
 
 ## See also
 

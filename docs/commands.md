@@ -2,18 +2,27 @@
 
 ## Voice-channel gate
 
-Most playback commands require you to share the bot's voice channel:
+Anything that makes the bot audible requires you to share its voice channel:
 
 - If the bot **is** in a channel, you must be in that same channel.
-- If the bot is in **no** channel, `/play` alone will follow you in — you
-  just need to be in some voice channel, and the bot joins it.
-- Buttons on the now-playing card require sharing the bot's channel, except
-  the "➕ Queue" hint button, which is read-only and always available.
-- `/announce` is a guild-level toggle, not playback control, and is ungated
-  so it can be set before the bot has joined voice.
+- If the bot is in **no** channel, `/play` will follow you in — you just need
+  to be in some voice channel, and the bot joins it.
+- Buttons that drive playback (⏮ ⏯ ⏭) require sharing the bot's channel.
 
-Failing the gate gets you: *"You must be in the bot's voice channel to
-control playback."* (or, for `/play`'s fresh-boot path: *"Join a voice
+Actions that only change the queue take a looser gate: you must be in a voice
+channel, but not necessarily the bot's. That covers `/clear` and its confirm
+button, and it exists because `/stop` leaves the channel while keeping the
+queue — under the strict gate, the command `/stop` tells you to use would be
+refused in exactly the state `/stop` creates.
+
+Reads and settings are ungated: `/np`, `/queue` with no argument, `/history`,
+`/who`, the "➕ Queue" hint button, and cancelling the clear prompt.
+`/announce` is a guild-level toggle rather than playback control, so it can be
+set before the bot has joined.
+
+Failing the gate gets you *"You must be in the bot's voice channel to control
+playback."*, or *"You must be in a voice channel to change the queue."* for
+the queue-only actions (or, for `/play`'s fresh-boot path: *"Join a voice
 channel first (or the bot's channel if it's already in one) to queue
 playback."*)
 
@@ -29,7 +38,7 @@ playback."*)
 | `/queue [url] [file]` | Voice gate | Always enqueues, never starts playback. With no argument, shows the current queue listing instead. |
 | `/skip` | Voice gate | Skips the current track (media item or Spotify track) — see "How playback is ordered" below. |
 | `/stop` | Voice gate | Stops playback, releases the Spotify device and leaves the voice channel. The queue is kept. |
-| `/clear` | Voice gate | Empties the queue after a confirmation prompt. Whatever is playing keeps playing. |
+| `/clear` | In any voice channel (the bot's, if it is in one) | Empties the queue after a confirmation prompt. Whatever is playing keeps playing. |
 | `/history [count]` | Anyone | Lists what has actually aired, newest first (1–25, default 10), each stamped with the time it played in your own timezone. Requests name whoever asked for them; the DJ's own playlist tracks don't. |
 | `/np` | Anyone | Shows what's currently playing. |
 | `/announce` | Anyone, ungated | Toggles DJ track announcements on/off; the setting persists across restarts. |
@@ -42,7 +51,7 @@ playback."*)
 | ⏯ (`ctrl_pause_toggle`) | voice gate | Pauses/resumes the active media item, pauses a playing Spotify baseline, or — if nothing is audible — starts/resumes whatever the queue head or Spotify state implies (see below). If the device isn't active yet, this is also the takeover gesture. |
 | ⏭ (`ctrl_next`) | voice gate | Same as `/skip`. |
 | ➕ Queue (`ctrl_queue_hint`) | none — always available | Ephemeral reply with the queue listing and how to add to it. |
-| Clear the queue (`ctrl_queue_clear_confirm`) | voice gate | Confirms `/clear`. Gated on its own, because you can leave the channel between raising the prompt and answering it. |
+| Clear the queue (`ctrl_queue_clear_confirm`) | in any voice channel, like `/clear` | Confirms `/clear`. Gated on its own, because you can leave the channel between raising the prompt and answering it. |
 | Cancel (`ctrl_queue_clear_cancel`) | none | Dismisses the `/clear` prompt without touching the queue. |
 
 Button replies are ephemeral (only the clicker sees them), so they never
@@ -84,11 +93,19 @@ anyone out.
 
 The queue survives. `/clear` is the only thing that empties it, and it
 asks first: an ephemeral prompt with Confirm/Cancel, whose buttons are
-removed once answered so it cannot be answered twice. One caveat applies
-to both — Spotify has no way to un-queue a track once it has been armed
+removed once answered so it cannot be answered twice. One caveat applies to
+`/clear` alone: Spotify has no way to un-queue a track once it has been armed
 (`AddToQueue`), so a track already handed over may still play once when
-Spotify's own auto-advance reaches it. `/clear` says so explicitly when
-that is the case.
+Spotify's own auto-advance reaches it. `/clear` says so explicitly when that
+is the case. `/stop` normally is not affected: releasing the device resets
+Spotify's own queue along with it, so the arm goes too. The exception is a
+`/stop` with the device already released, which sends no release and so
+leaves the armed track exactly where it is.
+
+Because `/stop` leaves the channel, `/clear` deliberately takes a looser
+permission than the playback commands: you need to be in a voice channel, not
+necessarily the bot's. It never makes a sound, and gating it on the bot's
+channel would make it unusable in exactly the state `/stop` creates.
 
 **`/play` vs `/queue`.** `/play` starts playback immediately if nothing is
 playing; otherwise it behaves like `/queue` (optionally jumping the line
