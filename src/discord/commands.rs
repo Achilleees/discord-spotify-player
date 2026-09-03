@@ -245,6 +245,37 @@ fn voice_gate(
     }
 }
 
+/// Commands that make the bot do something audible, and so require sharing
+/// its voice channel. `/announce` is a guild-level toggle rather than
+/// playback control and must be settable before the bot joins; `/np`,
+/// `/queue`, `/history` and `/who` only read.
+fn command_drives_playback(name: &str) -> bool {
+    matches!(name, "skip" | "stop")
+}
+
+/// Commands that change the queue without touching audio. These take the
+/// looser gate — the caller must be in a voice channel, but not necessarily
+/// the bot's, because the bot may be in none.
+///
+/// `/clear` is here rather than above for a reason `/stop` creates: `/stop`
+/// leaves the channel and its reply says the queue survived and to use
+/// `/clear`. Under the strict gate that command is refused in exactly the
+/// state the message describes.
+fn command_mutates_queue(name: &str) -> bool {
+    matches!(name, "clear")
+}
+
+/// The button equivalents of [`command_drives_playback`].
+fn button_drives_playback(custom_id: &str) -> bool {
+    matches!(custom_id, "ctrl_prev" | "ctrl_next" | "ctrl_pause_toggle")
+}
+
+/// The button equivalents of [`command_mutates_queue`]. The queue-hint
+/// button is read-only info and stays open; so does cancelling the prompt.
+fn button_mutates_queue(custom_id: &str) -> bool {
+    matches!(custom_id, "ctrl_queue_clear_confirm")
+}
+
 /// Renders the actor's view of what's audible, for `/np` and the queue
 /// listing's status line. Follows the reply house style documented on
 /// `player::state`'s `reply`: `▶`/`⏸` for the transport state, track and
@@ -270,19 +301,23 @@ impl Handler {
             let custom_id = component.data.custom_id.as_str();
             tracing::debug!(custom_id, "button interaction received");
 
-            // Anything that mutates playback or the queue requires sharing
-            // the bot's voice channel. The queue-hint button is read-only
-            // info, so it stays open. The clear confirmation is gated in its
-            // own right: a user can leave voice between raising the prompt
-            // and pressing the button.
-            let is_control = matches!(
-                custom_id,
-                "ctrl_prev" | "ctrl_next" | "ctrl_pause_toggle" | "ctrl_queue_clear_confirm"
-            );
-            if is_control && !self.user_in_bot_voice_channel(&ctx, component.user.id) {
+            // The clear confirmation is gated in its own right: a user can
+            // leave voice between raising the prompt and pressing the button.
+            let allowed = if button_drives_playback(custom_id) {
+                self.user_in_bot_voice_channel(&ctx, component.user.id)
+            } else if button_mutates_queue(custom_id) {
+                self.user_in_any_voice_channel(&ctx, component.user.id)
+            } else {
+                true
+            };
+            if !allowed {
                 let response = CreateInteractionResponse::Message(
                     CreateInteractionResponseMessage::new()
-                        .content("You must be in the bot's voice channel to control playback.")
+                        .content(if button_drives_playback(custom_id) {
+                            "You must be in the bot's voice channel to control playback."
+                        } else {
+                            "You must be in a voice channel to change the queue."
+                        })
                         .ephemeral(true),
                 );
                 let _ = component.create_response(&ctx, response).await;
@@ -399,14 +434,22 @@ impl Handler {
             return;
         }
 
-        // Commands that drive playback require sharing the bot's voice channel.
-        // /announce is a guild-level toggle, not playback control, and must be
-        // settable before the bot is in voice.
-        let needs_voice = matches!(cmd.data.name.as_str(), "skip" | "stop" | "clear");
-        if needs_voice && !in_voice {
+        let name = cmd.data.name.as_str();
+        let allowed = if command_drives_playback(name) {
+            in_voice
+        } else if command_mutates_queue(name) {
+            self.user_in_any_voice_channel(&ctx, cmd.user.id)
+        } else {
+            true
+        };
+        if !allowed {
             let _ = cmd.create_response(&ctx, CreateInteractionResponse::Message(
                 CreateInteractionResponseMessage::new()
-                    .content("You must be in the bot's voice channel to control playback.")
+                    .content(if command_drives_playback(name) {
+                        "You must be in the bot's voice channel to control playback."
+                    } else {
+                        "You must be in a voice channel to change the queue."
+                    })
                     .ephemeral(true),
             )).await;
             return;
@@ -488,6 +531,14 @@ impl Handler {
     pub(super) fn user_in_bot_voice_channel(&self, ctx: &Context, user_id: UserId) -> bool {
         let (bot_ch, user_ch) = self.voice_channels(ctx, user_id);
         voice_gate(bot_ch, user_ch, false)
+    }
+
+    /// The looser gate: share the bot's channel when it is in one, otherwise
+    /// just be in a voice channel. Used by the queue-only actions, which make
+    /// no sound and must stay reachable after a `/stop` has left the channel.
+    fn user_in_any_voice_channel(&self, ctx: &Context, user_id: UserId) -> bool {
+        let (bot_ch, user_ch) = self.voice_channels(ctx, user_id);
+        voice_gate(bot_ch, user_ch, true)
     }
 
     /// The queue listing shown by the `ctrl_queue_hint` button and by
@@ -900,8 +951,9 @@ impl Handler {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_valid_track_id, parse_track_id_from_url, render_history, render_now_playing, voice_gate,
-        NowPlaying,
+        button_drives_playback, button_mutates_queue, command_drives_playback,
+        command_mutates_queue, is_valid_track_id, parse_track_id_from_url, render_history,
+        render_now_playing, voice_gate, NowPlaying,
     };
     use crate::history::HistoryRow;
     use crate::player::state::AiredSource;
@@ -984,6 +1036,45 @@ mod tests {
         assert!(!voice_gate(None, Some(ChannelId::new(10)), false));
         assert!(voice_gate(None, Some(ChannelId::new(10)), true));
         assert!(!voice_gate(None, None, true), "follow still needs the user in voice");
+    }
+
+    // --- which interactions each gate covers -----------------------------
+
+    #[test]
+    fn only_the_audible_commands_take_the_strict_gate() {
+        assert!(command_drives_playback("skip"));
+        assert!(command_drives_playback("stop"));
+        // Reads and settings stay open, and /play runs its own follow gate
+        // before this point.
+        for open in ["np", "queue", "history", "who", "announce", "login", "play"] {
+            assert!(!command_drives_playback(open), "{open} must not be gated on the bot's channel");
+        }
+    }
+
+    #[test]
+    fn clear_takes_the_looser_gate_because_stop_points_at_it() {
+        // `/stop` leaves the channel and its reply says the queue survived
+        // and to use `/clear`. Under the strict gate that command would be
+        // refused in exactly the state the message describes.
+        assert!(command_mutates_queue("clear"));
+        assert!(!command_drives_playback("clear"), "never both");
+        for other in ["skip", "stop", "np", "queue"] {
+            assert!(!command_mutates_queue(other));
+        }
+    }
+
+    #[test]
+    fn the_buttons_split_the_same_way_as_the_commands() {
+        for playback in ["ctrl_prev", "ctrl_next", "ctrl_pause_toggle"] {
+            assert!(button_drives_playback(playback));
+            assert!(!button_mutates_queue(playback), "never both");
+        }
+        assert!(button_mutates_queue("ctrl_queue_clear_confirm"));
+        assert!(!button_drives_playback("ctrl_queue_clear_confirm"));
+        // Reading the queue and backing out of the prompt are open.
+        for open in ["ctrl_queue_hint", "ctrl_queue_clear_cancel"] {
+            assert!(!button_drives_playback(open) && !button_mutates_queue(open), "{open}");
+        }
     }
 
     // --- render_now_playing: the /np and queue-listing status line ---

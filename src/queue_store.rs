@@ -17,6 +17,12 @@ use librespot_core::SpotifyUri;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
+use std::time::Duration;
+
+/// How long a write waits for another connection's write to finish before
+/// giving up. Three connections share this database file and WAL admits one
+/// writer at a time, so the alternative to waiting is failing instantly.
+const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// On-disk form of one queued item.
 #[derive(Serialize, Deserialize)]
@@ -116,6 +122,12 @@ pub struct QueueStore {
 impl QueueStore {
     pub fn open(db_path: &str) -> rusqlite::Result<Self> {
         let conn = Connection::open(db_path)?;
+        // Three connections now write this file, and WAL allows one writer at
+        // a time. Without a timeout the loser fails instantly rather than
+        // waiting, and a queue save that loses to a history write is only
+        // logged — leaving the stored queue behind memory until the next
+        // mutation happens to come along.
+        conn.busy_timeout(BUSY_TIMEOUT)?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS queue_items (
                  position     INTEGER PRIMARY KEY,

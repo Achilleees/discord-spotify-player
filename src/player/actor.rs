@@ -369,6 +369,16 @@ impl Actor {
             }
 
             tracing::debug!(target: "player", ?input, "input");
+            // Who to follow into voice, when this input turns out to need a
+            // join. Read from the input rather than only from the effects
+            // because a Spotify enqueue produces no `StartMedia` — it reaches
+            // the join through `begin_load` — so hint-from-effects alone sent
+            // a cold `/play <spotify link>` to the configured channel while
+            // the same command with a YouTube link followed the requester.
+            let enqueued_by = match &input {
+                Input::Enqueue { item, .. } => Some(item.queued_by_id),
+                _ => None,
+            };
             let queue_rev = self.state.queue.revision();
             let effects = step(&mut self.state, input, Instant::now());
             tracing::debug!(
@@ -397,9 +407,10 @@ impl Actor {
                     .send(StoreWrite::Queue(self.state.queue.snapshot()));
             }
 
-            // A `StartMedia` in this batch: remember whose item it is, so a
-            // cold-start voice join follows the requester.
-            let mut join_hint = None;
+            // A `StartMedia` in this batch names whose item is airing, which
+            // beats the enqueuer when they differ — the item starting is the
+            // one the bot is joining for.
+            let mut join_hint = enqueued_by;
             for effect in &effects {
                 if let Effect::StartMedia { item, .. } = effect {
                     join_hint = Some(item.queued_by_id);
@@ -749,9 +760,8 @@ impl Actor {
                 SpircCommand::LoadContext {
                     context_uri,
                     track_uri,
-                    shuffle: options.shuffle,
-                    repeat_context: options.repeat_context,
-                    repeat_track: options.repeat_track,
+                    options: options
+                        .map(|o| (o.shuffle, o.repeat_context, o.repeat_track)),
                 }
             }
         };

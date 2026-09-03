@@ -31,7 +31,7 @@ use std::pin::Pin;
 // incantation at every acquisition (audio_bridge already uses it).
 use parking_lot::Mutex;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio::sync::watch;
@@ -67,7 +67,7 @@ pub(super) struct Handler {
     /// Discord echoes that removal back as a voice-state update, and the
     /// own-disconnect branch below would otherwise read it as a force
     /// disconnect and tear down the Spotify session and the account.
-    pub(super) leaving_voice: Arc<AtomicBool>,
+    pub(super) leaving_voice: Arc<AtomicUsize>,
     /// Owns the Spotify session lifecycle (librespot task, refresher, token
     /// state, generation) independently of playback — see
     /// `spotify::session`. Reached from the account operations
@@ -194,6 +194,18 @@ async fn transport_shim(
 /// needs the serenity `Context` and an await, which the actor must never
 /// hold; messages arriving before the gateway is ready are dropped with a
 /// log.
+/// Take one outstanding deliberate departure off the guard, reporting
+/// whether there was one to take. Counting rather than flagging is what keeps
+/// two departures from interfering: each arming is undone or consumed exactly
+/// once, so a second `/stop` racing the first one's gateway echo can no
+/// longer clear the first one's arming and turn that echo into a phantom
+/// force disconnect.
+fn consume_deliberate_leave(guard: &AtomicUsize) -> bool {
+    guard
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+        .is_ok()
+}
+
 fn spawn_notice_task(
     ctx_store: Arc<Mutex<Option<Context>>>,
     text_channel_id: ChannelId,
@@ -363,10 +375,17 @@ impl EventHandler for Handler {
             if new.channel_id.is_none() {
                 // Our own `/stop` leave: expected, and it must not touch the
                 // session or the account.
-                if self.leaving_voice.swap(false, Ordering::SeqCst) {
+                if consume_deliberate_leave(&self.leaving_voice) {
                     tracing::debug!("bot left voice deliberately — no teardown");
                     return;
                 }
+                // Not ours, so the core has to hear about it. The teardown
+                // below sends `VoiceLost` itself, but it only runs when a
+                // session or playback is live — and a bot dragged out after a
+                // YouTube item finished, with nobody logged in, satisfies
+                // neither. The core would go on believing voice was `Ready`,
+                // `ensure_voice` would return early, and the next `/play`
+                // would feed a bridge no call drains.
                 let anything_active = {
                     let session = {
                         let lock = self.active_session.lock();
@@ -379,6 +398,9 @@ impl EventHandler for Handler {
                 if anything_active {
                     tracing::info!("bot disconnected from voice — tearing down playback");
                     self.teardown_playback_session(&ctx, false).await;
+                } else {
+                    tracing::info!("bot disconnected from voice with nothing playing");
+                    self.player.send(PlayerInput::VoiceLost);
                 }
             }
             return;
@@ -578,7 +600,7 @@ impl DiscordBot {
         // gateway echo of our own removal isn't read as a force disconnect.
         // `remove`, not `leave`: leave keeps the Call registered and every
         // later presence check would read it as "still in a call".
-        let leaving_voice = Arc::new(AtomicBool::new(false));
+        let leaving_voice = Arc::new(AtomicUsize::new(0));
         let leave_voice: player_actor::LeaveVoiceFn = {
             let ctx_store = ctx_store.clone();
             let leaving_voice = leaving_voice.clone();
@@ -588,15 +610,22 @@ impl DiscordBot {
                 Box::pin(async move {
                     let Some(ctx) = ({ ctx_store.lock().clone() }) else { return };
                     let Some(manager) = songbird::get(&ctx).await else { return };
-                    leaving_voice.store(true, Ordering::SeqCst);
+                    leaving_voice.fetch_add(1, Ordering::SeqCst);
                     let left = manager.remove(guild_id).await;
                     if let Err(e) = left {
                         // Nothing was removed (already out of the channel),
                         // so Discord sends no voice-state update and nothing
-                        // would ever consume the guard. Left set, it would
-                        // swallow the NEXT genuine force-disconnect and leave
-                        // librespot feeding a dead call.
-                        leaving_voice.store(false, Ordering::SeqCst);
+                        // would ever consume this arming. Left standing, it
+                        // would swallow the NEXT genuine force-disconnect and
+                        // leave librespot feeding a dead call.
+                        //
+                        // It is a count rather than a flag so that undoing
+                        // can only ever undo *this* departure: with a shared
+                        // bool, a second `/stop` racing the first one's echo
+                        // cleared the first one's arming, and that echo then
+                        // read as a force disconnect and tore the session
+                        // down.
+                        consume_deliberate_leave(&leaving_voice);
                         tracing::debug!(error = ?e, "leave was a no-op — not already in voice");
                         return;
                     }

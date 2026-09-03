@@ -18,6 +18,12 @@
 use crate::player::state::{AiredSource, AiredTrack};
 use rusqlite::{Connection, OptionalExtension};
 use std::sync::Mutex;
+use std::time::Duration;
+
+/// How long a write waits for another connection's write to finish before
+/// giving up. Three connections share this database file and WAL admits one
+/// writer at a time, so the alternative to waiting is failing instantly.
+const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// One aired row, as read back out.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,6 +50,10 @@ impl HistoryStore {
     /// connection to the same file is safe under it.
     pub fn open(db_path: &str) -> rusqlite::Result<Self> {
         let conn = Connection::open(db_path)?;
+        // WAL allows one writer at a time across all three connections to
+        // this file; without a timeout the loser fails immediately instead of
+        // waiting its turn.
+        conn.busy_timeout(BUSY_TIMEOUT)?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS play_history (
                  id           INTEGER PRIMARY KEY AUTOINCREMENT,

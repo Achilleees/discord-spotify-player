@@ -214,7 +214,12 @@ pub struct PlayerState {
     pub last_heard_track: Option<String>,
     /// The DJ's shuffle/repeat settings, mirrored from Spotify so a context
     /// jump can put them back.
-    pub play_options: PlayOptions,
+    /// Shuffle/repeat as Spotify has reported them, or `None` while it
+    /// has reported nothing. Librespot only emits these on a *change*, so an
+    /// untouched session never reports at all — and a default stood in for
+    /// the DJ's real settings would be handed back on the first context jump,
+    /// silently turning their shuffle off.
+    pub play_options: Option<PlayOptions>,
     /// Where back-navigation has walked to in the play history. `None` means
     /// "live": the next ⏮ starts from whatever is playing. Any forward move
     /// (a skip, a play, a queued item starting) puts us back live.
@@ -248,7 +253,7 @@ impl PlayerState {
             sp: SpDevice::Inactive,
             link_up: false,
             context_uri: None,
-            play_options: PlayOptions::default(),
+            play_options: None,
             history_cursor: None,
             awaiting_jump: None,
             pending_reply: None,
@@ -509,7 +514,13 @@ pub enum SpircCmd {
     /// which replaces the context with a single track, this restores the
     /// playlist and starts inside it — the only non-destructive way to play
     /// a specific track the DJ already heard.
-    LoadContext { context_uri: String, track_uri: SpotifyUri, options: PlayOptions },
+    LoadContext {
+        context_uri: String,
+        track_uri: SpotifyUri,
+        /// `None` leaves librespot's own shuffle/repeat alone, which is the
+        /// only honest thing to do before Spotify has reported them.
+        options: Option<PlayOptions>,
+    },
     /// Give up the active-device slot. Always paired with a pause: the
     /// non-pausing form leaves librespot decoding into a bridge nobody
     /// drains, and its next `Playing` would re-take the turn from outside
@@ -1085,7 +1096,7 @@ pub fn step(state: &mut PlayerState, input: Input, now: Instant) -> Vec<Effect> 
             // one's history rows — and open that playlist on their account
             // the first time anyone pressed ⏮.
             state.context_uri = None;
-            state.play_options = PlayOptions::default();
+            state.play_options = None;
             // Same reasoning, same account boundary: an account switch comes
             // through as a bare `LinkUp` with no `LinkDown` before it, so
             // anything the previous session left in flight has to be dropped
@@ -1719,7 +1730,7 @@ fn handle_transport(state: &mut PlayerState, ev: TransportEvent, now: Instant, f
         TransportEvent::OptionsChanged { shuffle, repeat_context, repeat_track } => {
             // Mirror only — the DJ owns these. Kept so a context jump can
             // hand them back rather than silently resetting them.
-            state.play_options = PlayOptions { shuffle, repeat_context, repeat_track };
+            state.play_options = Some(PlayOptions { shuffle, repeat_context, repeat_track });
         }
 
         TransportEvent::SessionConnected => {
@@ -3187,9 +3198,9 @@ mod tests {
             vec![SpircCmd::LoadContext {
                 context_uri: "spotify:playlist:abc".to_string(),
                 track_uri: uri(3),
-                options: PlayOptions::default(),
+                options: None,
             }],
-            "reopens the context instead of replacing it with one track"
+            "reopens the context instead of replacing it with one track,              and leaves shuffle/repeat alone because Spotify never reported them"
         );
         assert_eq!(sim.s.history_cursor, Some(7), "the cursor advances back");
     }
@@ -3216,7 +3227,7 @@ mod tests {
             vec![SpircCmd::LoadContext {
                 context_uri: "spotify:playlist:abc".to_string(),
                 track_uri: uri(3),
-                options: PlayOptions::default(),
+                options: None,
             }],
             "the jump alone — no re-arm, and nothing that would double-queue"
         );
@@ -3270,23 +3281,26 @@ mod tests {
             vec![SpircCmd::LoadContext {
                 context_uri: "spotify:playlist:abc".to_string(),
                 track_uri: uri(3),
-                options: PlayOptions {
+                options: Some(PlayOptions {
                     shuffle: true,
                     repeat_context: true,
                     repeat_track: false,
-                },
+                }),
             }]
         );
     }
 
     #[test]
-    fn shuffle_and_repeat_arrive_separately_but_are_tracked_together() {
-        // Spotify sends each half in its own event; neither may clobber the
-        // other's value.
+    fn the_latest_reported_options_are_what_a_jump_hands_back() {
+        // Every field is varied between the two events, so an assertion can
+        // tell "the second report won" from "everything happened to be
+        // false". The reassembly of Spotify's two half-reports is the
+        // Spotify layer's job and is tested there; this pins that the core
+        // keeps what it was last told.
         let mut sim = Sim::baseline_playing();
         sim.transport(TransportEvent::OptionsChanged {
-            shuffle: true,
-            repeat_context: false,
+            shuffle: false,
+            repeat_context: true,
             repeat_track: false,
         });
         sim.transport(TransportEvent::OptionsChanged {
@@ -3296,8 +3310,17 @@ mod tests {
         });
         assert_eq!(
             sim.s.play_options,
-            PlayOptions { shuffle: true, repeat_context: false, repeat_track: true }
+            Some(PlayOptions { shuffle: true, repeat_context: false, repeat_track: true })
         );
+    }
+
+    #[test]
+    fn options_stay_unknown_until_spotify_reports_them() {
+        // Librespot emits these only on a change, so an untouched session
+        // never reports at all. Standing in a default would hand the DJ
+        // settings they never chose on the first back-jump.
+        let sim = Sim::baseline_playing();
+        assert_eq!(sim.s.play_options, None);
     }
 
     #[test]
