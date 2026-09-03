@@ -76,6 +76,22 @@ pub struct Armed {
     pub ack: Ack,
 }
 
+/// A back-jump that has been sent to Spotify and not yet landed. It carries
+/// what the arrival has to be checked against, which differs by how the jump
+/// was made.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PendingJump {
+    /// A context jump named one exact track. Librespot silently starts a
+    /// context at track 1 when it cannot find that track, so the arrival is
+    /// checked rather than assumed.
+    Context(SpotifyUri),
+    /// Spotify's own `Previous`, which chooses the track itself: under 3 s
+    /// into a track it steps back, at or over 3 s it seeks to zero and stays
+    /// put (F16). Carries where the walk lands if it moves, so the cursor is
+    /// committed only once a different track actually arrives.
+    Previous { cursor: i64 },
+}
+
 /// `SetQueue`-driven acknowledgement of an arm. `Lost` is advisory only:
 /// librespot has no dequeue, so a blind retry after a slow ack would queue
 /// the track twice.
@@ -203,12 +219,19 @@ pub struct PlayerState {
     /// "live": the next ⏮ starts from whatever is playing. Any forward move
     /// (a skip, a play, a queued item starting) puts us back live.
     pub history_cursor: Option<i64>,
-    /// The track a context jump asked for, until a transport event confirms
-    /// it. Librespot silently starts a context at track 1 when the requested
-    /// track is not in it, so the request has to be checked, not assumed.
-    awaiting_jump: Option<SpotifyUri>,
+    /// The back-jump in flight, until a transport event settles it. What the
+    /// arrival is checked against depends on how the jump was made — see
+    /// [`PendingJump`].
+    awaiting_jump: Option<PendingJump>,
     /// The ⏮ reply, held while the shell reads the history.
     pending_reply: Option<oneshot::Sender<String>>,
+    /// A request Spotify started while a media item held the turn. It was
+    /// popped from the queue there — it has to be, or `maybe_arm` would hand
+    /// the same track to a queue librespot cannot take it back out of — and
+    /// paused straight back down, so the airing history should record is the
+    /// later one, after the media item. This holds who asked for it until
+    /// then; without it that airing files as the DJ's own baseline.
+    pending_request: Option<QueueItem>,
     /// The context the Spotify baseline is playing from, as last reported
     /// by `SetQueue`. Stamped onto history rows so a later back-jump can
     /// reopen the playlist at a track instead of replacing it with a
@@ -229,6 +252,7 @@ impl PlayerState {
             history_cursor: None,
             awaiting_jump: None,
             pending_reply: None,
+            pending_request: None,
             armed: None,
             pause_owner: None,
             inflight: InflightRing::default(),
@@ -760,25 +784,21 @@ pub fn step(state: &mut PlayerState, input: Input, now: Instant) -> Vec<Effect> 
 
         Input::Stop { reply: tx, leave_voice } => {
             // Stop is stop: the bot goes quiet and leaves the channel. It
-            // keeps the queue (`/clear` is what empties it) and never
-            // touches the Spotify session or the account — only this
-            // lifecycle. The arm is left alone: `SessionDisconnected` voids
-            // an unacked one and keeps a confirmed one, which is already the
-            // right rule for "handed to Spotify, can't be withdrawn".
+            // keeps the queue (`/clear` is what empties it) and never touches
+            // the Spotify session or the account — only this lifecycle.
             if matches!(state.active, Active::Media { .. }) {
                 fx.push(Effect::CancelMedia);
             }
-            // `Disconnect` resets librespot's device state, queue included
-            // (`became_inactive` -> `reset`, which replaces `next_tracks`
-            // with an empty vec and zeroes `queue_count`; connect/src/state.rs
-            // @1599145), so a surviving arm is a ghost: `maybe_arm` would
-            // refuse to re-arm behind it, and the next `SetQueue` would read
-            // its absence as "deleted on the phone" and drop the request.
-            state.armed = None;
             state.armed_snapshot = None;
-            // A jump still resolving is abandoned along with everything else.
+            // A jump still resolving is abandoned along with everything else,
+            // and a request whose airing was being held will never air now.
             state.awaiting_jump = None;
             state.history_cursor = None;
+            state.pending_request = None;
+            // The card is gone, so the next airing is new even if it is the
+            // same track: without this the duplicate-card guard also swallows
+            // that airing's history row.
+            state.last_heard_track = None;
             // Audibility, not the turn: Spotify reaches the bridge whenever
             // no media item holds it, `Active::None` included.
             if state.device_active {
@@ -787,6 +807,22 @@ pub fn step(state: &mut PlayerState, input: Input, now: Instant) -> Vec<Effect> 
                 }
                 fx.push(Effect::Spirc(SpircCmd::Disconnect));
                 state.device_active = false;
+                // `Disconnect` resets librespot's device state, queue
+                // included (`became_inactive` -> `reset`, which replaces
+                // `next_tracks` with an empty vec and zeroes `queue_count`;
+                // connect/src/state.rs @1599145), so a surviving arm is a
+                // ghost: `maybe_arm` would refuse to re-arm behind it, and
+                // the next `SetQueue` would read its absence as "deleted on
+                // the phone" and drop the request. Clearing it belongs to
+                // this branch alone — with no `Disconnect` sent, the track
+                // really is still in Spotify's queue, and dropping the arm
+                // would let `maybe_arm` queue it a second time with no way
+                // to take either copy back.
+                state.armed = None;
+                // The device is released, so the mirror must not go on
+                // claiming it is playing — the same pairing `LinkDown` and
+                // `SessionDisconnected` already make.
+                state.sp = SpDevice::Inactive;
             }
             fx.push(Effect::ClearBridge);
             // `LeaveVoice` arms the shell's deliberate-leave guard, which is
@@ -987,7 +1023,7 @@ pub fn step(state: &mut PlayerState, input: Input, now: Instant) -> Vec<Effect> 
                 // DJ's environment intact.
                 Some(PreviousTrack { id, uri, context_uri: Some(context_uri) }) => {
                     state.history_cursor = Some(id);
-                    state.awaiting_jump = Some(uri.clone());
+                    state.awaiting_jump = Some(PendingJump::Context(uri.clone()));
                     fx.push(Effect::Spirc(SpircCmd::LoadContext {
                         context_uri,
                         track_uri: uri,
@@ -998,7 +1034,15 @@ pub fn step(state: &mut PlayerState, input: Input, now: Instant) -> Vec<Effect> 
                 // Heard, but with no context to reopen (a one-off link, or a
                 // row written before contexts were recorded). Spotify's own
                 // history is the only honest fallback.
-                Some(_) => {
+                //
+                // The cursor rides along rather than being dropped: without
+                // it the next ⏮ re-anchors on the newest row — the one this
+                // jump is about to write — and walks forward into the track
+                // it started from. It is carried on the jump rather than
+                // committed here because `Previous` only steps back under
+                // 3 s in (F16); the arrival decides.
+                Some(PreviousTrack { id, .. }) => {
+                    state.awaiting_jump = Some(PendingJump::Previous { cursor: id });
                     fx.push(Effect::Spirc(SpircCmd::Previous));
                     reply(&mut fx, tx, "⏮ Previous track.");
                 }
@@ -1042,6 +1086,15 @@ pub fn step(state: &mut PlayerState, input: Input, now: Instant) -> Vec<Effect> 
             // the first time anyone pressed ⏮.
             state.context_uri = None;
             state.play_options = PlayOptions::default();
+            // Same reasoning, same account boundary: an account switch comes
+            // through as a bare `LinkUp` with no `LinkDown` before it, so
+            // anything the previous session left in flight has to be dropped
+            // here too. A jump issued to a session that no longer exists can
+            // never land, and a walk position points into another DJ's
+            // listening.
+            state.awaiting_jump = None;
+            state.history_cursor = None;
+            state.pending_request = None;
             let snapshot_ok = state.armed_snapshot.as_ref().is_some_and(|s| {
                 now.saturating_duration_since(s.at) < SNAPSHOT_TTL
                     && state.queue.find_first(|i| i.item_id == s.armed.item_id).is_some()
@@ -1084,9 +1137,11 @@ pub fn step(state: &mut PlayerState, input: Input, now: Instant) -> Vec<Effect> 
             state.sp = SpDevice::Inactive;
             state.link_up = false;
             // Same reasoning as `SessionDisconnected`: a pending jump can no
-            // longer land, so it must not outlive the link.
+            // longer land, so it must not outlive the link — and a request
+            // whose airing was being held will never reach it.
             state.awaiting_jump = None;
             state.history_cursor = None;
+            state.pending_request = None;
             // Snapshot the arm and clear it: a `Confirmed` ghost would
             // wedge arming forever, but a fresh reconnect can restore it.
             if let Some(a) = state.armed.take() {
@@ -1320,29 +1375,58 @@ fn handle_transport(state: &mut PlayerState, ev: TransportEvent, now: Instant, f
             // says so only in its own log — so the arrival has to be checked
             // rather than assumed, or a bad jump silently replays a playlist
             // from the top.
-            if let Some(wanted) = state.awaiting_jump.take() {
-                if wanted != uri {
-                    fx.push(Effect::Ui(UiMsg::Notice(
-                        "⚠️ Spotify couldn't find that track in the playlist and started from the beginning instead."
-                            .to_string(),
-                    )));
-                    state.history_cursor = None;
+            // A DIFFERENT track is the only thing that counts as movement.
+            // Librespot re-emits `Playing` on a resume or a seek, and reading
+            // those as movement would throw the walk away — bringing back
+            // exactly the two-track bounce the cursor prevents.
+            let moved = state.last_heard_track.as_deref() != Some(uri_str.as_str());
+            match state.awaiting_jump.take() {
+                Some(PendingJump::Context(wanted)) => {
+                    if wanted != uri {
+                        fx.push(Effect::Ui(UiMsg::Notice(
+                            "⚠️ Spotify couldn't find that track in the playlist and started from the beginning instead."
+                                .to_string(),
+                        )));
+                        state.history_cursor = None;
+                    }
                 }
-            } else if state.last_heard_track.as_deref() != Some(uri_str.as_str()) {
-                // A DIFFERENT track playing means the playlist moved on past
-                // wherever ⏮ walked to: we are live again. Librespot also
-                // re-emits `Playing` on a resume or a seek, and treating
-                // those as movement would throw the walk away — bringing
-                // back exactly the two-track bounce the cursor prevents.
-                state.history_cursor = None;
+                // Spotify picked the track. Over 3 s into one it seeks to
+                // zero instead of stepping back (F16), which re-emits the
+                // same track — no step happened, so the walk stays where it
+                // was rather than claiming a move it did not make.
+                Some(PendingJump::Previous { cursor }) => {
+                    if moved {
+                        state.history_cursor = Some(cursor);
+                    }
+                }
+                // Nothing in flight: the playlist moved on past wherever ⏮
+                // walked to, so we are live again.
+                None => {
+                    if moved {
+                        state.history_cursor = None;
+                    }
+                }
             }
             // Bookkeeping first: a matching request is consumed wherever it
             // sits (a track the DJ's playlist reaches isn't also aired
             // later), and the armed marker clears only for the armed uri.
-            let popped = state.queue.remove_first(
+            let mut popped = state.queue.remove_first(
                 |i| matches!(&i.source, MediaSource::Spotify { uri: u, .. } if u == &uri),
             );
-            if state.armed.as_ref().is_some_and(|a| a.uri == uri) {
+            // Nothing left in the queue to consume, but this track was popped
+            // under an earlier media turn and held: that deferred airing is
+            // happening now, so take its attribution back.
+            if popped.is_none()
+                && state.pending_request.as_ref().is_some_and(
+                    |i| matches!(&i.source, MediaSource::Spotify { uri: u, .. } if u == &uri),
+                )
+            {
+                popped = state.pending_request.take();
+            }
+            // Read before the arm is cleared just below: it decides whether
+            // this airing came out of Spotify's queue or out of the context.
+            let from_arm = state.armed.as_ref().is_some_and(|a| a.uri == uri);
+            if from_arm {
                 state.armed = None;
             } else if let Active::SpotifyPending { uri: wanted, .. } = &state.active {
                 // Our own advance landed somewhere other than the armed
@@ -1364,7 +1448,15 @@ fn handle_transport(state: &mut PlayerState, ev: TransportEvent, now: Instant, f
                 // Not its turn: pause it back, keep the card suppressed,
                 // leave the turn with the media item. It airs after the
                 // queue — the resume at media end plays it from where this
-                // pause lands.
+                // pause lands, and *that* airing is the one history records.
+                // The item has already left the queue above (it must, or
+                // `maybe_arm` would hand the same track to a queue librespot
+                // cannot take it back out of), so its requester is held here
+                // rather than lost — otherwise the later airing files as the
+                // DJ's own baseline with nobody's name on it.
+                if popped.is_some() {
+                    state.pending_request = popped;
+                }
                 fx.push(Effect::Spirc(SpircCmd::Pause));
                 state.inflight.record_pause(now);
                 state.pause_owner = Some(PauseOwner::BotForMedia);
@@ -1393,6 +1485,7 @@ fn handle_transport(state: &mut PlayerState, ev: TransportEvent, now: Instant, f
                             &uri_str,
                             Some(m),
                             popped.as_ref(),
+                            from_arm,
                         )));
                         fx.push(Effect::Announce(AnnounceKind::Track {
                             title: m.title.clone(),
@@ -1572,11 +1665,15 @@ fn handle_transport(state: &mut PlayerState, ev: TransportEvent, now: Instant, f
                         |i| matches!(&i.source, MediaSource::Spotify { uri: u, .. } if u == &uri),
                     )
                     .cloned();
+                // The arm is still set here for the same reason: the
+                // `Playing` that clears it has not arrived yet.
+                let from_arm = state.armed.as_ref().is_some_and(|a| a.uri == uri);
                 fx.push(Effect::RecordAired(aired_spotify(
                     state,
                     &uri_str,
                     Some(&meta),
                     queued.as_ref(),
+                    from_arm,
                 )));
                 state.last_heard_track = Some(uri_str);
             }
@@ -1635,9 +1732,11 @@ fn handle_transport(state: &mut PlayerState, ev: TransportEvent, now: Instant, f
             state.sp = SpDevice::Inactive;
             // A jump can no longer land, and leaving the marker set would
             // make some later unrelated `Playing` report a mismatch for a
-            // jump nobody remembers asking for.
+            // jump nobody remembers asking for. A held request's airing is
+            // gone with the session too.
             state.awaiting_jump = None;
             state.history_cursor = None;
+            state.pending_request = None;
             // An unacked AddToQueue was void (F2): clear it so the next
             // opportunity re-arms instead of trusting a ghost. A Confirmed
             // arm is real device-side state and survives (clearing it would
@@ -1727,8 +1826,9 @@ fn after_media_boundary(state: &mut PlayerState, now: Instant, fx: &mut Vec<Effe
             } else if matches!(state.sp, SpDevice::Playing(_)) {
                 state.active = Active::Spotify { track: None };
             } else {
-                // Human/stop pauses stay honoured; a BotForMedia debt while
-                // the device is unreachable stays recorded for LinkUp.
+                // A human pause stays honoured, and so does no owner at all;
+                // a BotForMedia debt while the device is unreachable stays
+                // recorded for LinkUp.
                 state.active = Active::None;
                 fx.push(Effect::Presence(PresenceState::Idle));
             }
@@ -1736,12 +1836,6 @@ fn after_media_boundary(state: &mut PlayerState, now: Instant, fx: &mut Vec<Effe
     }
 }
 
-/// Arm exactly one track: when nothing is armed, this device is active, the
-/// baseline has a context (`Playing`/`Paused`/`Boundary`) and the queue
-/// holds a Spotify item anywhere, queue the first such item behind the
-/// current context. Arming before the boundary is what stops librespot's
-/// auto-advance from eating a context track. No-op while a load is pending
-/// (arming the pending uri would double it).
 /// A Spotify request reaching its turn claims the Connect device: queuing
 /// the track *was* the request to hear it here. Only a session coming up
 /// on its own (boot, on-demand) never claims (F15). Returns `false` when
@@ -1761,6 +1855,12 @@ fn claim_device(state: &mut PlayerState, fx: &mut Vec<Effect>) -> bool {
     true
 }
 
+/// Arm exactly one track: when nothing is armed, this device is active, the
+/// baseline has a context (`Playing`/`Paused`/`Boundary`) and the queue
+/// holds a Spotify item anywhere, queue the first such item behind the
+/// current context. Arming before the boundary is what stops librespot's
+/// auto-advance from eating a context track. No-op while a load is pending
+/// (arming the pending uri would double it).
 fn maybe_arm(state: &mut PlayerState, now: Instant, fx: &mut Vec<Effect>) {
     if state.armed.is_some() || !state.device_active {
         return;
@@ -1787,6 +1887,12 @@ fn maybe_arm(state: &mut PlayerState, now: Instant, fx: &mut Vec<Effect>) {
 fn begin_load(state: &mut PlayerState, uri: SpotifyUri, now: Instant, fx: &mut Vec<Effect>) {
     ensure_voice(state, fx);
     state.pause_owner = None;
+    // A `Load` replaces the device's context, so the name we are holding is
+    // stale the moment it is sent. Spotify reports a bare track's context as
+    // an empty string, which arrives as `None` and so never overwrites — left
+    // standing, the old playlist gets stamped onto this track's history row
+    // and a later ⏮ reopens a playlist the track was never in.
+    state.context_uri = None;
     state.active = Active::SpotifyPending { uri: uri.clone(), sent: now, retried: false };
     fx.push(Effect::Spirc(SpircCmd::Load(uri)));
     fx.push(Effect::SetTimer(TimerKind::SpotifyPending, PENDING_TIMEOUT));
@@ -1798,11 +1904,9 @@ fn begin_load(state: &mut PlayerState, uri: SpotifyUri, now: Instant, fx: &mut V
 ///
 /// Spotify audio needs this exactly as much as a media item does: it reaches
 /// Discord through the same bridge, and the bridge is only drained by a live
-/// call. Live 2026-09-01: after a `/stop` (which now leaves the channel), a
-/// bare `/play` re-claimed the Connect device and the DJ's phone started a
-/// track, so librespot decoded into a bridge nothing was reading — the card
-/// said "playing", the channel was silent, and only `/login` brought the bot
-/// back.
+/// call. So every route to audio calls this, not just the media ones — a
+/// Spotify path that skips it decodes into a bridge nothing reads, and the
+/// card reads "playing" over a silent channel.
 fn ensure_voice(state: &mut PlayerState, fx: &mut Vec<Effect>) {
     if matches!(state.voice, VoiceStatus::Ready) {
         return;
@@ -1817,11 +1921,21 @@ fn ensure_voice(state: &mut PlayerState, fx: &mut Vec<Effect>) {
 /// the queue item this airing consumed, when there was one — its presence is
 /// what makes this a request rather than the DJ's own context reaching a
 /// track, and it carries who asked for it.
+///
+/// `from_arm` says the track came off the arm, i.e. out of Spotify's own
+/// queue rather than out of the context. Such a track is not in the playlist
+/// that happens to be loaded, so it is recorded with no context: stamping one
+/// makes a later ⏮ ask for a track the context does not contain, which
+/// librespot answers by restarting that context from the top. It is a
+/// narrower test than `popped.is_some()`, because the pop also fires when the
+/// DJ's own context reaches a track that was queued — and that airing really
+/// is inside the context.
 fn aired_spotify(
     state: &PlayerState,
     uri_str: &str,
     meta: Option<&TrackMeta>,
     popped: Option<&QueueItem>,
+    from_arm: bool,
 ) -> AiredTrack {
     AiredTrack {
         source: match popped {
@@ -1829,7 +1943,7 @@ fn aired_spotify(
             None => AiredSource::Baseline,
         },
         track_ref: uri_str.to_string(),
-        context_uri: state.context_uri.clone(),
+        context_uri: if from_arm { None } else { state.context_uri.clone() },
         title: meta.map(|m| m.title.clone()),
         artist: meta.map(|m| m.artist.clone()),
         queued_by: popped.map(|i| i.queued_by.clone()),
@@ -3197,6 +3311,46 @@ mod tests {
     }
 
     #[test]
+    fn a_context_less_back_jump_still_walks_backwards() {
+        // The fallback hands the step to Spotify, so it names no track — but
+        // it must still move the walk, or the next press re-anchors on the
+        // newest row (the one this jump is about to write) and lands on the
+        // track we started from.
+        let mut sim = Sim::baseline_playing();
+        sim.previous();
+        sim.step(Input::PreviousResolved { track: Some(prev_track(7, 3, None)) });
+        assert_eq!(sim.s.history_cursor, None, "not committed until it lands");
+
+        sim.transport(TransportEvent::Playing { uri: uri(3), meta: Some(meta("Third")) });
+        assert_eq!(
+            sim.s.history_cursor,
+            Some(7),
+            "a different track arrived, so the step really happened"
+        );
+    }
+
+    #[test]
+    fn a_back_jump_that_only_seeks_to_zero_leaves_the_walk_where_it_was() {
+        // F16: librespot's `Previous` steps back only under 3 s into a
+        // track; at or over 3 s it seeks to zero and keeps playing the same
+        // one. Re-emitting the same track is not a step, so the walk must
+        // not claim a move it did not make. This is what stops the
+        // `moved` check being "simplified" into an unconditional commit,
+        // which would leave the cursor a whole track ahead of the truth.
+        let mut sim = Sim::baseline_playing();
+        sim.s.history_cursor = Some(11);
+        sim.previous();
+        sim.step(Input::PreviousResolved { track: Some(prev_track(7, 9, None)) });
+
+        sim.transport(TransportEvent::Playing { uri: uri(9), meta: None });
+        assert_eq!(
+            sim.s.history_cursor,
+            Some(11),
+            "same track back at 0:00 — the walk stays put"
+        );
+    }
+
+    #[test]
     fn reaching_the_start_of_the_history_says_so() {
         let mut sim = Sim::baseline_playing();
         sim.previous();
@@ -3455,6 +3609,90 @@ mod tests {
             sim.s.queue.peek().unwrap().source.display_title(),
             "queued-by-a-human"
         );
+    }
+
+    #[test]
+    fn an_armed_request_is_recorded_without_a_context() {
+        // A request reaches the device through Spotify's queue, not through
+        // the playlist that happens to be loaded. Stamping that playlist on
+        // its row makes a later ⏮ ask for a track the context does not hold,
+        // which librespot answers by restarting the context from the top.
+        let mut sim = Sim::baseline_playing();
+        sim.transport(TransportEvent::SetQueue {
+            current: Some(uri(9)),
+            queued: vec![],
+            context_uri: Some("spotify:playlist:abc".into()),
+        });
+        let id = sim.push_spotify(4, "requested");
+        sim.arm(4, id, Ack::Confirmed);
+
+        let fx = sim.transport(TransportEvent::Playing {
+            uri: uri(4),
+            meta: Some(meta("Requested")),
+        });
+
+        let rows = aired(&fx);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].source, AiredSource::Request);
+        assert_eq!(rows[0].context_uri, None, "it was never in that playlist");
+    }
+
+    #[test]
+    fn a_track_the_playlist_reaches_keeps_its_context_even_though_it_was_queued() {
+        // The narrow half of the same rule: the pop also fires when the DJ's
+        // own context reaches a track someone had queued. That airing really
+        // is inside the context, so it keeps it.
+        let mut sim = Sim::baseline_playing();
+        sim.transport(TransportEvent::SetQueue {
+            current: Some(uri(9)),
+            queued: vec![],
+            context_uri: Some("spotify:playlist:abc".into()),
+        });
+        sim.push_spotify(5, "also-queued");
+
+        let fx = sim.transport(TransportEvent::Playing {
+            uri: uri(5),
+            meta: Some(meta("Also queued")),
+        });
+
+        let rows = aired(&fx);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].source, AiredSource::Request, "someone did queue it");
+        assert_eq!(
+            rows[0].context_uri.as_deref(),
+            Some("spotify:playlist:abc"),
+            "but the playlist is what reached it"
+        );
+    }
+
+    #[test]
+    fn a_request_that_surfaces_under_a_media_turn_still_names_its_requester() {
+        // Spotify starts the armed request while a media item holds the
+        // turn: it is popped there (it must be, or it could be armed twice)
+        // and paused straight back down. The airing history records is the
+        // later one, and it has to carry who asked for it.
+        let mut sim = Sim::media_over_paused_baseline();
+        let id = sim.push_spotify(4, "requested");
+        sim.arm(4, id, Ack::Confirmed);
+
+        let early = sim.transport(TransportEvent::Playing {
+            uri: uri(4),
+            meta: Some(meta("Requested")),
+        });
+        assert!(aired(&early).is_empty(), "it is not audible yet");
+        assert!(sim.s.pending_request.is_some(), "its requester is held");
+
+        sim.media_ended(MediaOutcome::Finished);
+        let fx = sim.transport(TransportEvent::Playing {
+            uri: uri(4),
+            meta: Some(meta("Requested")),
+        });
+
+        let rows = aired(&fx);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].source, AiredSource::Request);
+        assert_eq!(rows[0].queued_by.as_deref(), Some("dj"));
+        assert!(sim.s.pending_request.is_none(), "and consumed once");
     }
 
     fn aired(fx: &[Effect]) -> Vec<&AiredTrack> {
@@ -3797,6 +4035,114 @@ mod tests {
         assert!(matches!(sim.s.active, Active::None));
         let fx = sim.step(Input::MediaEnded { epoch: 1, outcome: MediaOutcome::Cancelled });
         assert!(fx.is_empty(), "the dead runner's report is stale");
+    }
+
+    #[test]
+    fn a_load_without_voice_joins_first() {
+        // The Spotify half of the same rule as the media case below. This
+        // path had no test, and it is one of the two that shipped the live
+        // 2026-09-01 silence — audio decoding into a bridge no call drains.
+        let mut sim = Sim::idle_device();
+        sim.s.voice = VoiceStatus::Down;
+        let fx = sim.enqueue_start(spotify_item(1, "s1"));
+        let join = fx.iter().position(|e| matches!(e, Effect::JoinVoice));
+        let load = fx
+            .iter()
+            .position(|e| matches!(e, Effect::Spirc(SpircCmd::Load(_))));
+        assert!(join.is_some() && load.is_some());
+        assert!(join < load, "the join is requested before the load");
+        assert_eq!(sim.s.voice, VoiceStatus::Joining);
+    }
+
+    #[test]
+    fn a_bare_load_drops_the_playlist_it_replaces() {
+        // A `Load` replaces the device's context, and Spotify reports a bare
+        // track's context as absent — which never overwrites. Left standing,
+        // the old playlist is stamped on this track's history row and a
+        // later ⏮ reopens a playlist it was never in.
+        let mut sim = Sim::idle_device();
+        sim.s.context_uri = Some("spotify:playlist:old".into());
+        sim.enqueue_start(spotify_item(1, "s1"));
+        assert_eq!(sim.s.context_uri, None);
+    }
+
+    #[test]
+    fn arming_is_refused_once_the_device_is_released() {
+        // The F2 half of `maybe_arm`'s guard, on its own: a command sent
+        // while this device is not the active one is silently dropped, so an
+        // arm issued there is void rather than queued.
+        //
+        // The mirror is deliberately left reporting a live context, because
+        // that is the only other thing that could refuse the arm. With it
+        // saying `Playing`, the device check is the sole reason nothing goes
+        // out — so deleting that check fails this test.
+        let mut sim = Sim::baseline_playing();
+        sim.s.device_active = false;
+        assert!(matches!(sim.s.sp, SpDevice::Playing(_)));
+
+        let fx = sim.enqueue(spotify_item(1, "s1"));
+
+        assert!(spircs(&fx).is_empty(), "nothing is sent to a released device");
+        assert!(sim.s.armed.is_none());
+    }
+
+    #[test]
+    fn stop_releases_the_device_mirror_with_the_device() {
+        let mut sim = Sim::baseline_playing();
+        sim.stop();
+        assert_eq!(
+            sim.s.sp,
+            SpDevice::Inactive,
+            "the mirror must not claim a released device is playing"
+        );
+    }
+
+    #[test]
+    fn stop_lets_the_same_track_be_recorded_again() {
+        // The card is gone after a stop, so the next airing is new even if
+        // it is the same track. Without clearing this, the duplicate-card
+        // guard also swallows that airing's history row.
+        let mut sim = Sim::baseline_playing();
+        sim.stop();
+        assert_eq!(sim.s.last_heard_track, None);
+    }
+
+    #[test]
+    fn stop_keeps_an_arm_it_sends_no_disconnect_for() {
+        // Clearing the arm is justified only by `Disconnect` resetting
+        // librespot's own queue. With the device already released no
+        // `Disconnect` goes out, so the track really is still queued there —
+        // and dropping the arm would let `maybe_arm` queue it a second time,
+        // which librespot has no way to undo.
+        let mut sim = Sim::baseline_playing();
+        let id = sim.push_spotify(1, "s1");
+        sim.arm(1, id, Ack::Confirmed);
+        sim.s.device_active = false;
+
+        let fx = sim.stop();
+        assert!(
+            !spircs(&fx).contains(&SpircCmd::Disconnect),
+            "nothing to disconnect from"
+        );
+        assert!(sim.s.armed.is_some(), "so the arm is still real device state");
+    }
+
+    #[test]
+    fn a_new_session_drops_the_previous_djs_walk() {
+        // An account switch arrives as a bare `LinkUp` with no `LinkDown`
+        // before it, so anything the previous session left in flight has to
+        // be dropped here — a jump into a session that no longer exists can
+        // never land, and a walk position points at another DJ's listening.
+        let mut sim = Sim::baseline_playing();
+        sim.s.history_cursor = Some(42);
+        sim.s.awaiting_jump = Some(PendingJump::Context(uri(3)));
+        sim.s.pending_request = Some(spotify_item(4, "held"));
+
+        sim.step(Input::LinkUp { gen: sim.s.link_gen });
+
+        assert_eq!(sim.s.history_cursor, None);
+        assert_eq!(sim.s.awaiting_jump, None);
+        assert!(sim.s.pending_request.is_none());
     }
 
     #[test]
