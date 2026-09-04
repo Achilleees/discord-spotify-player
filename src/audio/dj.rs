@@ -277,8 +277,8 @@ fn decode_mp3_to_f32_stereo(path: &Path) -> Result<Vec<f32>, String> {
     let bytes = &output.stdout;
     if bytes.len() < 4 { return Err("no audio data".to_string()); }
 
-    Ok(bytes.chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+    Ok(bytes.as_chunks::<4>().0.iter()
+        .map(|chunk| f32::from_le_bytes(*chunk))
         .collect())
 }
 
@@ -325,7 +325,7 @@ async fn kokoro_socket_generate(text: &str, output_path: &str) -> Result<(), Str
             "text": text,
             "output": output_path
         });
-        let msg = format!("{}\n", req.to_string());
+        let msg = format!("{req}\n");
 
         stream.write_all(msg.as_bytes()).await
             .map_err(|e| format!("socket write failed: {}", e))?;

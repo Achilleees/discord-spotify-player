@@ -45,8 +45,10 @@ fn split_stereo_frames(carry: &mut Vec<u8>, chunk: &[u8]) -> Vec<f32> {
     bytes.extend_from_slice(chunk);
     let usable = bytes.len() - (bytes.len() % 8);
     let samples: Vec<f32> = bytes[..usable]
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|chunk| f32::from_le_bytes(*chunk))
         .collect();
     carry.clear();
     carry.extend_from_slice(&bytes[usable..]);

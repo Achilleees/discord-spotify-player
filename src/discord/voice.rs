@@ -135,7 +135,9 @@ impl Read for SimpleBridgeReader {
         let bytes_written = samples_needed * 4;
         debug_assert!(bytes_written <= buf.len());
         for (chunk, &sample) in buf[..bytes_written]
-            .chunks_exact_mut(4)
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
             .zip(self.scratch[..samples_needed].iter())
         {
             chunk.copy_from_slice(&sample.to_le_bytes());
