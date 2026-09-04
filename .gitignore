@@ -27,6 +27,7 @@ spotibot.db*
 # IDE
 .idea/
 .claude/
+.codex/
 *.swp
 *.swo
 

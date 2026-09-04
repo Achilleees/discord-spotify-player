@@ -2,8 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, audit3-burndown, device-auth]
-  pull_request:
+    branches: [dev, main]
   workflow_dispatch:
 
 env:

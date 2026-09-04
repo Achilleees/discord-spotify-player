@@ -13,6 +13,27 @@ go in the gitignored `.local/`, not `docs/`.
 - No user-specific identifiers or tokens in code or docs.
 - Prefer documenting settings in `.env.example`.
 
+## Git workflow
+- `dev` is the normal work and integration branch. Routine work is committed
+  and pushed directly there; this solo repository does not use pull requests.
+- `main` is deployment-only: every push rebuilds and restarts the VPS service.
+  Do not update or push `main` without explicit deployment intent.
+- Promote only an already-green `dev` commit to `main`, using a fast-forward,
+  so the deployed SHA is exactly the SHA CI validated.
+
+## Work tracking
+- Work lives on Bef's board under project `discord-spotify-player`, exposed by
+  the local `bef` MCP server as `mcp__bef__progress_*`. Keep its credential in
+  local agent configuration only; never commit it.
+- At session start call `progress_snapshot` for this project. Use
+  `progress_list`/`progress_get` for detail, and file agreed work with
+  `progress_create` before finishing the turn.
+- Advance or close work with `progress_update`. Keep the project headline and
+  focus current with `progress_headline`/`progress_focus`; their
+  `expected_revision` is the project revision, not a task version.
+- Pins are durable priority (`progress_pin`, `progress_unpin`,
+  `progress_pins_order`). `progress_note` is reserved for Achille's steering.
+
 ## Build and run
 - `cargo build --release`; binary is `target\release\discord-spotify-player.exe`.
 - `cargo check` for fast feedback; `cargo test`; `cargo clippy --all-targets -- -D warnings` (what CI runs).

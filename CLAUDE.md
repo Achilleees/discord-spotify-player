@@ -17,6 +17,15 @@ in `CODEMAP.md`; release notes go in `CHANGELOG.md` (prose per release, one
 bold headline per user-visible change). Working files (audits, plans) go in
 the gitignored `.local/`, never in `docs/`.
 
+## Git Workflow
+
+- `dev` is the normal work and integration branch. Routine work is committed
+  and pushed directly there; this solo repository does not use pull requests.
+- `main` is deployment-only: every push rebuilds and restarts the VPS service.
+  Do not update or push `main` without explicit deployment intent.
+- Promote only an already-green `dev` commit to `main`, using a fast-forward,
+  so the deployed SHA is exactly the SHA CI validated.
+
 ## Build and Run
 
 ```
@@ -115,3 +124,36 @@ Spotify / YouTube / files / DJ ─> AudioBridge ─> SimpleBridgeReader ─> Son
 ## Safety and secrets
 - Never print or commit `.env`, `spotibot.db*`, `.user_creds*`, `.spotify_cache/`
   (all gitignored). No user-specific identifiers in code or docs.
+
+## Work tracking — Bef's board, project `discord-spotify-player`
+
+Work for this repo lives on Bef's board (the Sidearm runtime on the VPS), reached
+through the `bef` MCP server registered in each local agent client for this directory
+(local-only config, never committed; `/track-project` registers Claude Code once per
+checkout and worktree); its tools appear as `mcp__bef__progress_*`. Its bearer maps to
+the runtime operator `discord-spotify-player`, which is scoped to this project and
+nothing else. Every call names the project:
+
+- `progress_snapshot {project: "discord-spotify-player"}` — counts and the ranked
+  workset. Read it at session start.
+- `progress_list {project: "discord-spotify-player", status: "open"}` — the open rows
+  (filters: status, priority, kind, group, tag, query, limit; 50 per call).
+- `progress_get {project: "discord-spotify-player", id}` — one row in full.
+- `progress_create {project: "discord-spotify-player", title, context?, steps?, kind?, priority?, tags?}`
+  — file work the moment it is agreed.
+- `progress_update {project: "discord-spotify-player", id, expected_version?, status?, steps?, context_append?, …}`
+  — advance or close a row; unknown keys and stale versions are refused.
+
+- `progress_headline {project: "discord-spotify-player", expected_revision, text}` and
+  `progress_focus {…}` — the board's own state: the headline is where the work stands,
+  the focus is what the board is for. `expected_revision` is the PROJECT revision from
+  `progress_snapshot`, never a task version.
+- `progress_pin {project: "discord-spotify-player", id, expected_version, position, intent?}`,
+  `progress_unpin` and `progress_pins_order` — a standing statement of priority that
+  survives re-ranking.
+
+Rules: file before you finish; one row per unit of work; `context` carries the why and
+the numbers, never narration of the change. The headline is yours to write, so keep it
+current and let this file and `docs/PORT.md` carry the longer narrative.
+`progress_note` is the one board verb this session does not hold — it is Achille's own
+lane for steering a row.
