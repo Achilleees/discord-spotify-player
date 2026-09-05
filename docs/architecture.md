@@ -246,9 +246,12 @@ displace a queue someone is already using.
 
 ⏮ walks the bot's own history rather than asking Spotify, because the two
 diverge the moment anyone touches a phone. The core stays pure: it emits
-`Effect::ResolvePrevious { before }`, the actor does the blocking read on
-a worker thread, and the answer returns through the mailbox as
-`Input::PreviousResolved`.
+`Effect::ResolvePrevious { before }`. The actor queues that read on the same
+worker as `RecordAired`, behind earlier history writes, so a Back press just
+after a track starts sees its row. The answer returns through the mailbox as
+`Input::PreviousResolved`; the actor never waits for the database. The read
+streams older rows in descending id order until it finds a Spotify reference,
+skipping media and invalid references without a fixed row-count cutoff.
 
 Playing the result uses `SpircCmd::LoadContext`, which becomes
 `LoadRequest::from_context_uri(..., playing_track: Uri(target))` — it

@@ -16,7 +16,7 @@
 //! one-track context.
 
 use crate::player::state::{AiredSource, AiredTrack};
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::Connection;
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -104,14 +104,21 @@ impl HistoryStore {
         Ok(())
     }
 
-    /// The row aired immediately before `before`, or the one before the
+    /// The latest accepted row aired before `before`, or before the
     /// newest row when `before` is `None` (i.e. "the track before whatever
     /// is playing"). `None` means there is nothing further back.
     ///
     /// Back-navigation walks by row id rather than re-reading "the
     /// second-newest row" each time: replaying a track appends a row of its
     /// own, so the naive query would bounce between two tracks forever.
-    pub fn aired_before(&self, before: Option<i64>) -> rusqlite::Result<Option<HistoryRow>> {
+    /// Skipped rows do not count as the end of history. The predicate scans
+    /// one descending query, without allocating the whole history or issuing
+    /// a separate query for each media item back-navigation cannot play.
+    pub fn aired_before(
+        &self,
+        before: Option<i64>,
+        mut accept: impl FnMut(&HistoryRow) -> bool,
+    ) -> rusqlite::Result<Option<HistoryRow>> {
         let conn = self.lock();
         let anchor: i64 = match before {
             Some(id) => id,
@@ -125,10 +132,12 @@ impl HistoryStore {
                 }
             }
         };
-        conn.query_row(
+        let mut stmt = conn.prepare(
             "SELECT id, CAST(strftime('%s', aired_at) AS INTEGER), source, track_ref,
                     context_uri, title, artist, queued_by
-             FROM play_history WHERE id < ?1 ORDER BY id DESC LIMIT 1",
+             FROM play_history WHERE id < ?1 ORDER BY id DESC",
+        )?;
+        let rows = stmt.query_map(
             [anchor],
             |row| {
                 let source: String = row.get(2)?;
@@ -143,8 +152,14 @@ impl HistoryStore {
                     queued_by: row.get(7)?,
                 })
             },
-        )
-        .optional()
+        )?;
+        for row in rows {
+            let row = row?;
+            if accept(&row) {
+                return Ok(Some(row));
+            }
+        }
+        Ok(None)
     }
 
     /// The most recently aired tracks, newest first.
@@ -271,13 +286,13 @@ mod tests {
         }
 
         // From live: the track before whatever is playing ("three").
-        let first_back = s.aired_before(None).unwrap().unwrap();
+        let first_back = s.aired_before(None, |_| true).unwrap().unwrap();
         assert_eq!(first_back.track_ref, "two");
 
         // Replaying it appends a row — and the next step back must still go
         // to "one", not back to "two".
         s.record(&baseline("two")).unwrap();
-        let second_back = s.aired_before(Some(first_back.id)).unwrap().unwrap();
+        let second_back = s.aired_before(Some(first_back.id), |_| true).unwrap().unwrap();
         assert_eq!(second_back.track_ref, "one");
     }
 
@@ -287,13 +302,13 @@ mod tests {
         s.record(&baseline("only")).unwrap();
         // Nothing aired before the single row.
         let oldest = s.recent(1).unwrap()[0].id;
-        assert_eq!(s.aired_before(Some(oldest)).unwrap(), None);
+        assert_eq!(s.aired_before(Some(oldest), |_| true).unwrap(), None);
     }
 
     #[test]
     fn walking_back_on_an_empty_history_is_not_an_error() {
         let s = store();
-        assert_eq!(s.aired_before(None).unwrap(), None);
+        assert_eq!(s.aired_before(None, |_| true).unwrap(), None);
     }
 
     #[test]

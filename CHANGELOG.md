@@ -10,6 +10,11 @@ git tag (release) in this repository.
 
 ## Unreleased
 
+**Back-navigation waits for the current track's history record.** Pressing Back
+just after a track starts no longer races its pending history write and skips
+the wrong track. Older Spotify tracks also remain reachable after more than
+50 YouTube or file entries in the history.
+
 **The queue survives restarts, and the bot keeps a record of what it played.** Requests no longer vanish when the bot restarts — which happens routinely, since it redeploys on every update. There is deliberately no expiry: nothing plays unless the bot is in a voice channel with someone in it, so a queue left over from last night simply waits rather than going stale, and it never starts playing on its own when the bot comes back. Alongside that, every track that actually airs is now written to a play history, including the ones Spotify chose itself, with the playlist it came from — groundwork for looking back at what was played on a given evening.
 
 **`/history` shows what has actually played.** Newest first, with the name of whoever asked for a track next to it so requests read apart from whatever the DJ's own playlist reached on its own. Takes a count between 1 and 25, and trims itself rather than being rejected outright when the titles run long.

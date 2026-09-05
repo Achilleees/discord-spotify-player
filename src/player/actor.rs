@@ -238,15 +238,19 @@ fn empty_snapshot() -> PlayerSnapshot {
     }
 }
 
-/// One durable write. Both variants go through a single writer so their
-/// order is the order the actor decided them in.
-enum StoreWrite {
+/// Store work in actor order. Previous-track reads must see every earlier
+/// aired-track write, even if the user presses Back before it commits.
+enum StoreRequest {
     /// The whole queue, latest-wins — an older snapshot committing last
     /// would leave the table permanently behind memory.
     Queue(Vec<QueueItem>),
     /// One aired track. Order matters here too: history row ids are what
     /// back-navigation walks, so an out-of-order insert misorders the walk.
     Aired(crate::player::state::AiredTrack),
+    ResolvePrevious {
+        before: Option<i64>,
+        reply: mpsc::UnboundedSender<Input>,
+    },
 }
 
 /// The one thread allowed to write to the stores.
@@ -256,40 +260,68 @@ enum StoreWrite {
 /// so two saves landing out of order persist the older queue with nothing
 /// to reconcile it. Queue snapshots coalesce — only the newest pending one
 /// is worth writing.
-fn spawn_store_writer(
+fn spawn_store_worker(
     history: Option<Arc<crate::history::HistoryStore>>,
     queue_store: Option<Arc<crate::queue_store::QueueStore>>,
-) -> mpsc::UnboundedSender<StoreWrite> {
-    let (tx, mut rx) = mpsc::unbounded_channel::<StoreWrite>();
-    tokio::task::spawn_blocking(move || {
-        while let Some(first) = rx.blocking_recv() {
-            // Drain whatever else is already queued so a burst of queue
-            // mutations costs one rewrite rather than one per mutation.
-            let mut batch = vec![first];
-            while let Ok(next) = rx.try_recv() {
-                batch.push(next);
-            }
-            let mut latest_queue = None;
-            for write in batch {
-                match write {
-                    StoreWrite::Queue(items) => latest_queue = Some(items),
-                    StoreWrite::Aired(track) => {
-                        if let Some(h) = &history {
-                            if let Err(e) = h.record(&track) {
-                                tracing::warn!(error = %e, "failed to record play history");
-                            }
+) -> mpsc::UnboundedSender<StoreRequest> {
+    let (tx, rx) = mpsc::unbounded_channel();
+    tokio::task::spawn_blocking(move || run_store_worker(history, queue_store, rx));
+    tx
+}
+
+fn run_store_worker(
+    history: Option<Arc<crate::history::HistoryStore>>,
+    queue_store: Option<Arc<crate::queue_store::QueueStore>>,
+    mut rx: mpsc::UnboundedReceiver<StoreRequest>,
+) {
+    while let Some(first) = rx.blocking_recv() {
+        // Drain whatever else is already queued so a burst of queue
+        // mutations costs one rewrite rather than one per mutation.
+        let mut batch = vec![first];
+        while let Ok(next) = rx.try_recv() {
+            batch.push(next);
+        }
+        let mut latest_queue = None;
+        for request in batch {
+            match request {
+                StoreRequest::Queue(items) => latest_queue = Some(items),
+                StoreRequest::Aired(track) => {
+                    if let Some(h) = &history {
+                        if let Err(e) = h.record(&track) {
+                            tracing::warn!(error = %e, "failed to record play history");
                         }
                     }
                 }
-            }
-            if let (Some(items), Some(store)) = (latest_queue, &queue_store) {
-                if let Err(e) = store.save(&items) {
-                    tracing::warn!(error = %e, "failed to persist the queue");
+                StoreRequest::ResolvePrevious { before, reply } => {
+                    let track = history.as_ref().and_then(|history| {
+                        match history.aired_before(before, |row| {
+                            SpotifyUri::from_uri(&row.track_ref).is_ok()
+                        }) {
+                            Ok(row) => row.and_then(|row| {
+                                SpotifyUri::from_uri(&row.track_ref).ok().map(|uri| {
+                                    PreviousTrack {
+                                        id: row.id,
+                                        uri,
+                                        context_uri: row.context_uri,
+                                    }
+                                })
+                            }),
+                            Err(e) => {
+                                tracing::warn!(error = %e, "could not read the play history");
+                                None
+                            }
+                        }
+                    });
+                    let _ = reply.send(Input::PreviousResolved { track });
                 }
             }
         }
-    });
-    tx
+        if let (Some(items), Some(store)) = (latest_queue, &queue_store) {
+            if let Err(e) = store.save(&items) {
+                tracing::warn!(error = %e, "failed to persist the queue");
+            }
+        }
+    }
 }
 
 /// Spawn the player actor and return its handle. Called once, when the bot
@@ -297,7 +329,7 @@ fn spawn_store_writer(
 pub fn spawn(deps: PlayerDeps) -> PlayerHandle {
     let (tx, rx) = mpsc::unbounded_channel();
     let handle = PlayerHandle { tx: tx.clone(), spirc: deps.spirc_cmd_tx.clone() };
-    let store_tx = spawn_store_writer(deps.history.clone(), deps.queue_store.clone());
+    let store_tx = spawn_store_worker(deps.history.clone(), deps.queue_store.clone());
     let actor = Actor {
         deps,
         store_tx,
@@ -315,8 +347,8 @@ pub fn spawn(deps: PlayerDeps) -> PlayerHandle {
 
 struct Actor {
     deps: PlayerDeps,
-    /// Serialized durable writes; see [`spawn_store_writer`].
-    store_tx: mpsc::UnboundedSender<StoreWrite>,
+    /// Durable writes and ordered history reads; see [`spawn_store_worker`].
+    store_tx: mpsc::UnboundedSender<StoreRequest>,
     /// Own mailbox sender, cloned into runners/timers/join tasks so their
     /// completions come back as inputs.
     tx: mpsc::UnboundedSender<Input>,
@@ -404,7 +436,7 @@ impl Actor {
             if self.state.queue.revision() != queue_rev {
                 let _ = self
                     .store_tx
-                    .send(StoreWrite::Queue(self.state.queue.snapshot()));
+                    .send(StoreRequest::Queue(self.state.queue.snapshot()));
             }
 
             // A `StartMedia` in this batch names whose item is airing, which
@@ -543,7 +575,7 @@ impl Actor {
                 // Handed to the serialized writer, never written here: the
                 // actor must not block on the database, and row order is the
                 // order back-navigation walks.
-                let _ = self.store_tx.send(StoreWrite::Aired(aired));
+                let _ = self.store_tx.send(StoreRequest::Aired(aired));
             }
 
             Effect::ResolveMeta(uri) => {
@@ -573,47 +605,15 @@ impl Actor {
             }
 
             Effect::ResolvePrevious { before } => {
-                // Blocking read, off the actor thread; the answer returns
-                // through the mailbox like every other asynchronous result.
-                let history = self.deps.history.clone();
-                let tx = self.tx.clone();
-                tokio::task::spawn_blocking(move || {
-                    // Walk back until a row we can actually jump to, rather
-                    // than stopping at the first one we can't: a YouTube or
-                    // file row has no Spotify uri, and treating it as the end
-                    // would wall off every Spotify track behind it — which on
-                    // a bot built for mixing sources is most of them.
-                    // Bounded so a history made entirely of media items can't
-                    // walk the whole table.
-                    const MAX_STEPS: usize = 50;
-                    let mut track = None;
-                    if let Some(history) = history {
-                        let mut anchor = before;
-                        for _ in 0..MAX_STEPS {
-                            let row = match history.aired_before(anchor) {
-                                Ok(Some(row)) => row,
-                                Ok(None) => break,
-                                Err(e) => {
-                                    tracing::warn!(
-                                        error = %e,
-                                        "could not read the play history"
-                                    );
-                                    break;
-                                }
-                            };
-                            anchor = Some(row.id);
-                            if let Ok(uri) = SpotifyUri::from_uri(&row.track_ref) {
-                                track = Some(PreviousTrack {
-                                    id: row.id,
-                                    uri,
-                                    context_uri: row.context_uri,
-                                });
-                                break;
-                            }
-                        }
-                    }
-                    let _ = tx.send(Input::PreviousResolved { track });
-                });
+                // The same FIFO as RecordAired: a lookup cannot race ahead
+                // of the row for the track the room is hearing right now.
+                // Sending stays synchronous; the worker returns via our mailbox.
+                if self.store_tx.send(StoreRequest::ResolvePrevious {
+                    before,
+                    reply: self.tx.clone(),
+                }).is_err() {
+                    let _ = self.tx.send(Input::PreviousResolved { track: None });
+                }
             }
 
             Effect::LeaveVoice => {
@@ -870,4 +870,138 @@ async fn media_runner(
     };
 
     let _ = ctx.input_tx.send(Input::MediaEnded { epoch, outcome });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::history::HistoryStore;
+    use crate::player::state::{AiredSource, AiredTrack};
+
+    fn aired(n: u64) -> AiredTrack {
+        AiredTrack {
+            source: AiredSource::Baseline,
+            track_ref: format!("spotify:track:{n:022}"),
+            context_uri: Some("spotify:playlist:test".into()),
+            title: None,
+            artist: None,
+            queued_by: None,
+            queued_by_id: None,
+        }
+    }
+
+    fn lookup(before: Option<i64>, reply: &mpsc::UnboundedSender<Input>) -> StoreRequest {
+        StoreRequest::ResolvePrevious { before, reply: reply.clone() }
+    }
+
+    fn resolved(rx: &mut mpsc::UnboundedReceiver<Input>) -> Option<PreviousTrack> {
+        match rx.try_recv().expect("every lookup must answer") {
+            Input::PreviousResolved { track } => track,
+            _ => panic!("unexpected worker reply"),
+        }
+    }
+
+    fn run_batch(history: Option<Arc<HistoryStore>>, requests: Vec<StoreRequest>) {
+        // Queue everything before the worker starts. This deterministically
+        // tests interleaved reads/writes in one drained batch, without sleeps
+        // or depending on which OS thread happens to win a race.
+        let (tx, rx) = mpsc::unbounded_channel();
+        for request in requests {
+            assert!(tx.send(request).is_ok());
+        }
+        drop(tx);
+        run_store_worker(history, None, rx);
+    }
+
+    #[test]
+    fn a_back_read_sees_earlier_airings_but_not_later_ones_in_the_same_batch() {
+        let history = Arc::new(HistoryStore::open(":memory:").unwrap());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        run_batch(Some(history), vec![
+            StoreRequest::Aired(aired(1)),
+            StoreRequest::Aired(aired(2)),
+            lookup(None, &tx),
+            StoreRequest::Aired(aired(3)),
+            lookup(None, &tx),
+        ]);
+        let first = resolved(&mut rx).unwrap();
+        assert_eq!(first.uri.to_uri(), aired(1).track_ref);
+        assert_eq!(first.context_uri, aired(1).context_uri);
+        assert_eq!(resolved(&mut rx).unwrap().uri.to_uri(), aired(2).track_ref);
+    }
+
+    #[test]
+    fn back_reads_skip_more_than_fifty_media_rows_and_bad_references() {
+        let history = Arc::new(HistoryStore::open(":memory:").unwrap());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut requests = vec![StoreRequest::Aired(aired(1))];
+        for n in 0..60 {
+            let mut media = aired(n);
+            media.source = AiredSource::Request;
+            media.track_ref = format!("https://example.invalid/media/{n}");
+            requests.push(StoreRequest::Aired(media));
+        }
+        let mut invalid = aired(9);
+        invalid.track_ref = "spotify:track:!".into();
+        requests.push(StoreRequest::Aired(invalid));
+        requests.push(StoreRequest::Aired(aired(2)));
+        requests.push(lookup(None, &tx));
+        run_batch(Some(history), requests);
+        assert_eq!(resolved(&mut rx).unwrap().uri.to_uri(), aired(1).track_ref);
+    }
+
+    #[test]
+    fn a_replay_does_not_move_an_explicit_history_cursor_forward() {
+        let history = Arc::new(HistoryStore::open(":memory:").unwrap());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        run_batch(Some(history), vec![
+            StoreRequest::Aired(aired(1)),
+            StoreRequest::Aired(aired(2)),
+            StoreRequest::Aired(aired(3)),
+            lookup(None, &tx),
+            StoreRequest::Aired(aired(2)),
+            lookup(Some(2), &tx),
+            lookup(Some(1), &tx),
+        ]);
+        assert_eq!(resolved(&mut rx).unwrap().id, 2);
+        assert_eq!(resolved(&mut rx).unwrap().id, 1);
+        assert_eq!(resolved(&mut rx), None);
+    }
+
+    #[test]
+    fn missing_empty_and_media_only_history_all_answer_without_a_track() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        run_batch(None, vec![lookup(None, &tx)]);
+        assert_eq!(resolved(&mut rx), None);
+        let history = Arc::new(HistoryStore::open(":memory:").unwrap());
+        let mut media = aired(1);
+        media.track_ref = "https://example.invalid/media".into();
+        run_batch(Some(history), vec![
+            lookup(None, &tx),
+            StoreRequest::Aired(media.clone()),
+            lookup(None, &tx),
+            StoreRequest::Aired(media),
+            lookup(None, &tx),
+        ]);
+        for _ in 0..3 {
+            assert_eq!(resolved(&mut rx), None);
+        }
+    }
+
+    #[tokio::test]
+    async fn the_spawned_worker_returns_history_through_the_player_mailbox() {
+        let history = Arc::new(HistoryStore::open(":memory:").unwrap());
+        let store = spawn_store_worker(Some(history), None);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        assert!(store.send(StoreRequest::Aired(aired(1))).is_ok());
+        assert!(store.send(StoreRequest::Aired(aired(2))).is_ok());
+        assert!(store.send(lookup(None, &tx)).is_ok());
+        drop(store);
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await.expect("worker must answer").unwrap();
+        match reply {
+            Input::PreviousResolved { track: Some(track) } => assert_eq!(track.id, 1),
+            _ => panic!("expected the track before the latest queued airing"),
+        }
+    }
 }
