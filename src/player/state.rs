@@ -31,6 +31,9 @@ pub const SNAPSHOT_TTL: Duration = Duration::from_secs(60);
 /// Echo window for pause provenance: a `Paused` event arriving within this
 /// long of a `Pause` we sent is read as our own echo, not a human pause.
 pub const INFLIGHT_TTL: Duration = Duration::from_secs(2);
+/// Correlation window for back-jump arrivals (transport supplies no command id).
+pub const BACK_JUMP_TTL: Duration = Duration::from_secs(5);
+const MAX_RECENT_JUMPS: usize = 8;
 
 /// Track metadata as the core carries it — a plain struct so no transport
 /// type leaks in here. The actor maps it to/from librespot lookups and
@@ -228,6 +231,12 @@ pub struct PlayerState {
     /// arrival is checked against depends on how the jump was made — see
     /// [`PendingJump`].
     awaiting_jump: Option<PendingJump>,
+    jump_sent: Option<Instant>,
+    /// Keep completed targets too: superseded and duplicate Playing events
+    /// can arrive after the newest jump has landed. Bounded with back-pressure,
+    /// never eviction of a still-live target. URI correlation is a heuristic:
+    /// a genuine replay of one of these targets inside the TTL looks like an echo.
+    recent_jumps: Vec<(SpotifyUri, Instant)>,
     /// The ⏮ reply, held while the shell reads the history.
     pending_reply: Option<oneshot::Sender<String>>,
     /// A request Spotify started while a media item held the turn. It was
@@ -256,6 +265,8 @@ impl PlayerState {
             play_options: None,
             history_cursor: None,
             awaiting_jump: None,
+            jump_sent: None,
+            recent_jumps: Vec::new(),
             pending_reply: None,
             pending_request: None,
             armed: None,
@@ -267,6 +278,23 @@ impl PlayerState {
             media_epoch: 0,
             last_heard_track: None,
             armed_snapshot: None,
+        }
+    }
+
+    fn clear_jumps(&mut self) {
+        self.awaiting_jump = None;
+        self.jump_sent = None;
+        self.recent_jumps.clear();
+    }
+
+    fn expire_jumps(&mut self, now: Instant, fx: &mut Vec<Effect>) {
+        self.recent_jumps.retain(|(_, at)| now.saturating_duration_since(*at) < BACK_JUMP_TTL);
+        if self.jump_sent.is_some_and(|at| now.saturating_duration_since(at) >= BACK_JUMP_TTL) {
+            self.clear_jumps();
+            self.history_cursor = None;
+            fx.push(Effect::Ui(UiMsg::Notice(
+                "⚠️ Spotify didn't confirm the back-jump in time. Back will start from the current track.".into(),
+            )));
         }
     }
 }
@@ -294,6 +322,7 @@ pub enum TimerKind {
     ArmAck,
     SpotifyPending,
     SnapshotExpiry,
+    BackJump,
 }
 
 /// Where an aired track came from. Not who queued it — a request aired
@@ -611,6 +640,9 @@ pub enum Effect {
 /// only from `now`.
 pub fn step(state: &mut PlayerState, input: Input, now: Instant) -> Vec<Effect> {
     let mut fx = Vec::new();
+    // Also prune on commands: a delayed timer must not hold back-pressure
+    // indefinitely. Old timers revalidate against the newest jump's timestamp.
+    state.expire_jumps(now, &mut fx);
     match input {
         Input::Enqueue { item, pos, start_if_idle, reply: tx } => {
             let queued_title = item.source.display_title().to_string();
@@ -686,6 +718,8 @@ pub fn step(state: &mut PlayerState, input: Input, now: Instant) -> Vec<Effect> 
         }
 
         Input::Skip { reply: tx } => {
+            state.clear_jumps();
+            state.history_cursor = None;
             if matches!(state.active, Active::Media { .. }) {
                 // A media skip cancels only; the next start comes from
                 // `MediaEnded{epoch, Cancelled}` — feeder cancellation is
@@ -803,7 +837,7 @@ pub fn step(state: &mut PlayerState, input: Input, now: Instant) -> Vec<Effect> 
             state.armed_snapshot = None;
             // A jump still resolving is abandoned along with everything else,
             // and a request whose airing was being held will never air now.
-            state.awaiting_jump = None;
+            state.clear_jumps();
             state.history_cursor = None;
             state.pending_request = None;
             // The card is gone, so the next airing is new even if it is the
@@ -1000,10 +1034,12 @@ pub fn step(state: &mut PlayerState, input: Input, now: Instant) -> Vec<Effect> 
                 // Spotify's: the bot drives the account, so what the room
                 // heard is the authoritative record. The answer comes back
                 // as `PreviousResolved`.
-                if state.pending_reply.is_some() {
-                    // A ⏮ is already being resolved; answering this one
-                    // separately would either drop the first caller's reply
-                    // channel or walk back twice for one intent.
+                if state.pending_reply.is_some()
+                    || matches!(state.awaiting_jump, Some(PendingJump::Previous { .. }))
+                    || state.recent_jumps.len() >= MAX_RECENT_JUMPS
+                {
+                    // Keep the first caller's reply and every live target.
+                    // A target-less Previous cannot be safely overlapped.
                     reply(&mut fx, tx, "⏮ Already going back — one moment.");
                 } else {
                     fx.push(Effect::ResolvePrevious { before: state.history_cursor });
@@ -1035,6 +1071,9 @@ pub fn step(state: &mut PlayerState, input: Input, now: Instant) -> Vec<Effect> 
                 Some(PreviousTrack { id, uri, context_uri: Some(context_uri) }) => {
                     state.history_cursor = Some(id);
                     state.awaiting_jump = Some(PendingJump::Context(uri.clone()));
+                    state.recent_jumps.push((uri.clone(), now));
+                    state.jump_sent = Some(now);
+                    fx.push(Effect::SetTimer(TimerKind::BackJump, BACK_JUMP_TTL));
                     fx.push(Effect::Spirc(SpircCmd::LoadContext {
                         context_uri,
                         track_uri: uri,
@@ -1053,7 +1092,15 @@ pub fn step(state: &mut PlayerState, input: Input, now: Instant) -> Vec<Effect> 
                 // committed here because `Previous` only steps back under
                 // 3 s in (F16); the arrival decides.
                 Some(PreviousTrack { id, .. }) => {
+                    // Previous has no exact target to correlate. Do not mix
+                    // it with context echoes still inside the correlation window.
+                    if !state.recent_jumps.is_empty() {
+                        reply(&mut fx, tx, "⏮ Already going back — one moment.");
+                        return fx;
+                    }
                     state.awaiting_jump = Some(PendingJump::Previous { cursor: id });
+                    state.jump_sent = Some(now);
+                    fx.push(Effect::SetTimer(TimerKind::BackJump, BACK_JUMP_TTL));
                     fx.push(Effect::Spirc(SpircCmd::Previous));
                     reply(&mut fx, tx, "⏮ Previous track.");
                 }
@@ -1103,7 +1150,7 @@ pub fn step(state: &mut PlayerState, input: Input, now: Instant) -> Vec<Effect> 
             // here too. A jump issued to a session that no longer exists can
             // never land, and a walk position points into another DJ's
             // listening.
-            state.awaiting_jump = None;
+            state.clear_jumps();
             state.history_cursor = None;
             state.pending_request = None;
             let snapshot_ok = state.armed_snapshot.as_ref().is_some_and(|s| {
@@ -1150,7 +1197,7 @@ pub fn step(state: &mut PlayerState, input: Input, now: Instant) -> Vec<Effect> 
             // Same reasoning as `SessionDisconnected`: a pending jump can no
             // longer land, so it must not outlive the link — and a request
             // whose airing was being held will never reach it.
-            state.awaiting_jump = None;
+            state.clear_jumps();
             state.history_cursor = None;
             state.pending_request = None;
             // Snapshot the arm and clear it: a `Confirmed` ghost would
@@ -1315,6 +1362,7 @@ pub fn step(state: &mut PlayerState, input: Input, now: Instant) -> Vec<Effect> 
         }
 
         Input::Tick(kind) => match kind {
+            TimerKind::BackJump => {} // Expiry is checked before every input.
             TimerKind::ArmAck => {
                 // Lost is advisory only — never a blind retry: a slow ack
                 // plus a retry would queue the track twice, and librespot
@@ -1376,6 +1424,9 @@ pub fn step(state: &mut PlayerState, input: Input, now: Instant) -> Vec<Effect> 
 fn handle_transport(state: &mut PlayerState, ev: TransportEvent, now: Instant, fx: &mut Vec<Effect>) {
     match ev {
         TransportEvent::Playing { uri, meta } => {
+            // TrackChanged may already have updated the card/history, so
+            // movement must use the transport mirror, not last_heard_track.
+            let moved = !matches!(&state.sp, SpDevice::Playing(u) | SpDevice::Paused(u) if u == &uri);
             state.sp = SpDevice::Playing(uri.clone());
             // Playing on this device is proof it holds the active slot —
             // this is also how a post-`Transfer` reconnect re-marks it.
@@ -1390,31 +1441,38 @@ fn handle_transport(state: &mut PlayerState, ev: TransportEvent, now: Instant, f
             // Librespot re-emits `Playing` on a resume or a seek, and reading
             // those as movement would throw the walk away — bringing back
             // exactly the two-track bounce the cursor prevents.
-            let moved = state.last_heard_track.as_deref() != Some(uri_str.as_str());
-            match state.awaiting_jump.take() {
-                Some(PendingJump::Context(wanted)) => {
-                    if wanted != uri {
-                        fx.push(Effect::Ui(UiMsg::Notice(
-                            "⚠️ Spotify couldn't find that track in the playlist and started from the beginning instead."
-                                .to_string(),
-                        )));
-                        state.history_cursor = None;
+            // The latest target wins, including when two history rows name
+            // the same URI. Earlier/duplicate arrivals keep both its pending
+            // check and its cursor, but still run all playback bookkeeping.
+            let latest = matches!(&state.awaiting_jump, Some(PendingJump::Context(wanted)) if wanted == &uri);
+            let echo = !latest && state.recent_jumps.iter().any(|(wanted, _)| wanted == &uri);
+            if !echo {
+                state.jump_sent = None;
+                match state.awaiting_jump.take() {
+                    Some(PendingJump::Context(wanted)) => {
+                        if wanted != uri {
+                            fx.push(Effect::Ui(UiMsg::Notice(
+                                "⚠️ Spotify couldn't find that track in the playlist and started from the beginning instead."
+                                    .to_string(),
+                            )));
+                            state.history_cursor = None;
+                            state.recent_jumps.clear();
+                        }
                     }
-                }
-                // Spotify picked the track. Over 3 s into one it seeks to
-                // zero instead of stepping back (F16), which re-emits the
-                // same track — no step happened, so the walk stays where it
-                // was rather than claiming a move it did not make.
-                Some(PendingJump::Previous { cursor }) => {
-                    if moved {
-                        state.history_cursor = Some(cursor);
+                    // Spotify picked the track. Over 3 s into one it seeks
+                    // to zero (F16): the same track means no step happened.
+                    Some(PendingJump::Previous { cursor }) => {
+                        if moved {
+                            state.history_cursor = Some(cursor);
+                        }
                     }
-                }
-                // Nothing in flight: the playlist moved on past wherever ⏮
-                // walked to, so we are live again.
-                None => {
-                    if moved {
-                        state.history_cursor = None;
+                    // Nothing in flight: the playlist moved on past
+                    // wherever ⏮ walked to, so we are live again.
+                    None => {
+                        if moved {
+                            state.history_cursor = None;
+                            state.recent_jumps.clear();
+                        }
                     }
                 }
             }
@@ -1745,7 +1803,7 @@ fn handle_transport(state: &mut PlayerState, ev: TransportEvent, now: Instant, f
             // make some later unrelated `Playing` report a mismatch for a
             // jump nobody remembers asking for. A held request's airing is
             // gone with the session too.
-            state.awaiting_jump = None;
+            state.clear_jumps();
             state.history_cursor = None;
             state.pending_request = None;
             // An unacked AddToQueue was void (F2): clear it so the next
@@ -1896,6 +1954,8 @@ fn maybe_arm(state: &mut PlayerState, now: Instant, fx: &mut Vec<Effect>) {
 /// device_active` (a load destroys the DJ's context otherwise). Sets up the
 /// pending state and its escape-hatch timer.
 fn begin_load(state: &mut PlayerState, uri: SpotifyUri, now: Instant, fx: &mut Vec<Effect>) {
+    state.clear_jumps();
+    state.history_cursor = None;
     ensure_voice(state, fx);
     state.pause_owner = None;
     // A `Load` replaces the device's context, so the name we are holding is
@@ -1965,6 +2025,8 @@ fn aired_spotify(
 /// Hand the turn to a media item: bump the epoch, make sure voice is coming
 /// up, and emit the gated start plus its card.
 fn start_media(state: &mut PlayerState, item: QueueItem, gate: StartGate, fx: &mut Vec<Effect>) {
+    state.clear_jumps();
+    state.history_cursor = None;
     state.media_epoch += 1;
     // The media card replaces whatever was up: the next Spotify `Playing`
     // is new to the card even if it's the same track as before.
@@ -3417,6 +3479,189 @@ mod tests {
         // The context then advances on its own: no longer browsing history.
         sim.transport(TransportEvent::Playing { uri: uri(4), meta: Some(meta("next")) });
         assert_eq!(sim.s.history_cursor, None);
+    }
+
+    #[test]
+    fn rapid_back_taps_keep_the_latest_walk_for_every_arrival_order() {
+        for order in [[3, 2, 1], [3, 1, 2], [2, 3, 1], [2, 1, 3], [1, 3, 2], [1, 2, 3]] {
+            let mut sim = Sim::baseline_playing();
+            for n in [3, 2, 1] {
+                sim.previous();
+                sim.step(Input::PreviousResolved {
+                    track: Some(prev_track(n as i64, n, Some("spotify:playlist:abc"))),
+                });
+            }
+            // Include duplicate echoes and real TrackChanged-before-Playing ordering.
+            for n in order.into_iter().chain(order) {
+                sim.transport(TransportEvent::TrackChanged { uri: uri(n), meta: meta("arrival") });
+                let fx = sim.transport(TransportEvent::Playing {
+                    uri: uri(n), meta: Some(meta("arrival")),
+                });
+                assert!(!fx.iter().any(|e| matches!(e, Effect::Ui(UiMsg::Notice(_)))), "order {order:?}, arrival {n}");
+                assert_eq!(sim.s.history_cursor, Some(1), "order {order:?}, arrival {n}");
+                assert_eq!(sim.s.sp, SpDevice::Playing(uri(n)), "telemetry still follows reality");
+            }
+            let fx = sim.previous();
+            assert!(fx.iter().any(|e| matches!(e, Effect::ResolvePrevious { before: Some(1) })));
+        }
+    }
+
+    #[test]
+    fn double_back_keeps_waiting_for_the_latest_target() {
+        let mut sim = Sim::baseline_playing();
+        for n in [3, 2] {
+            sim.previous();
+            sim.step(Input::PreviousResolved {
+                track: Some(prev_track(n as i64, n, Some("spotify:playlist:abc"))),
+            });
+        }
+        let fx = sim.transport(TransportEvent::Playing { uri: uri(3), meta: Some(meta("first")) });
+        assert!(!fx.iter().any(|e| matches!(e, Effect::Ui(UiMsg::Notice(_)))));
+        assert_eq!(sim.s.history_cursor, Some(2));
+        assert_eq!(sim.s.awaiting_jump, Some(PendingJump::Context(uri(2))));
+        // An unknown arrival still fails the latest jump, despite the old echo.
+        let fx = sim.transport(TransportEvent::Playing { uri: uri(99), meta: None });
+        assert!(fx.iter().any(|e| matches!(e, Effect::Ui(UiMsg::Notice(_)))));
+        assert_eq!(sim.s.history_cursor, None);
+        assert!(sim.s.recent_jumps.is_empty());
+    }
+
+    #[test]
+    fn repeated_history_uris_settle_the_latest_jump() {
+        let mut sim = Sim::baseline_playing();
+        for id in [7, 6] {
+            sim.previous();
+            sim.step(Input::PreviousResolved {
+                track: Some(prev_track(id, 3, Some("spotify:playlist:abc"))),
+            });
+        }
+        sim.transport(TransportEvent::Playing { uri: uri(3), meta: None });
+        assert_eq!(sim.s.history_cursor, Some(6));
+        assert_eq!(sim.s.awaiting_jump, None);
+        assert_eq!(sim.s.jump_sent, None);
+    }
+
+    #[test]
+    fn back_jump_timers_revalidate_and_timeout_only_the_latest_jump() {
+        let mut sim = Sim::baseline_playing();
+        sim.previous();
+        let fx = sim.step(Input::PreviousResolved {
+            track: Some(prev_track(7, 3, Some("spotify:playlist:abc"))),
+        });
+        assert!(fx.iter().any(|e| matches!(e, Effect::SetTimer(TimerKind::BackJump, d) if *d == BACK_JUMP_TTL)));
+        sim.advance(Duration::from_secs(1));
+        sim.previous();
+        sim.step(Input::PreviousResolved {
+            track: Some(prev_track(6, 2, Some("spotify:playlist:abc"))),
+        });
+        sim.advance(BACK_JUMP_TTL - Duration::from_secs(1));
+        assert!(sim.step(Input::Tick(TimerKind::BackJump)).is_empty());
+        assert_eq!(sim.s.awaiting_jump, Some(PendingJump::Context(uri(2))));
+        sim.advance(Duration::from_secs(1));
+        let fx = sim.step(Input::Tick(TimerKind::BackJump));
+        assert_eq!(sim.s.awaiting_jump, None);
+        assert_eq!(sim.s.history_cursor, None);
+        assert!(fx.iter().any(|e| matches!(e, Effect::Ui(UiMsg::Notice(s)) if s.contains("in time"))));
+        assert!(sim.step(Input::Tick(TimerKind::BackJump)).is_empty());
+        assert!(sim.previous().iter().any(|e| matches!(e, Effect::ResolvePrevious { before: None })));
+    }
+
+    #[test]
+    fn expired_completed_targets_no_longer_hide_forward_movement() {
+        let mut sim = Sim::baseline_playing();
+        for n in [3, 2] {
+            sim.previous();
+            sim.step(Input::PreviousResolved {
+                track: Some(prev_track(n as i64, n, Some("spotify:playlist:abc"))),
+            });
+        }
+        sim.transport(TransportEvent::Playing { uri: uri(2), meta: None });
+        sim.advance(BACK_JUMP_TTL);
+        assert!(sim.step(Input::Tick(TimerKind::BackJump)).is_empty());
+        assert_eq!(sim.s.history_cursor, Some(2), "expiry alone is not movement");
+        sim.transport(TransportEvent::TrackChanged { uri: uri(3), meta: meta("forward") });
+        let fx = sim.transport(TransportEvent::Playing { uri: uri(3), meta: None });
+        assert!(!fx.iter().any(|e| matches!(e, Effect::Ui(UiMsg::Notice(_)))));
+        assert_eq!(sim.s.history_cursor, None);
+    }
+
+    #[test]
+    fn rapid_back_memory_is_bounded_without_evicting_live_targets() {
+        let mut sim = Sim::baseline_playing();
+        for n in 1..=MAX_RECENT_JUMPS as u64 {
+            sim.previous();
+            sim.step(Input::PreviousResolved {
+                track: Some(prev_track(n as i64, n, Some("spotify:playlist:abc"))),
+            });
+        }
+        let fx = sim.previous();
+        assert!(reply_text(&fx).contains("Already going back"));
+        assert!(!fx.iter().any(|e| matches!(e, Effect::ResolvePrevious { .. })));
+        assert_eq!(sim.s.recent_jumps.len(), MAX_RECENT_JUMPS);
+        let fx = sim.transport(TransportEvent::Playing { uri: uri(1), meta: None });
+        assert!(!fx.iter().any(|e| matches!(e, Effect::Ui(UiMsg::Notice(_)))));
+        sim.advance(BACK_JUMP_TTL);
+        // No timer delivery required to release the bound.
+        assert!(sim.previous().iter().any(|e| matches!(e, Effect::ResolvePrevious { .. })));
+        assert!(sim.s.recent_jumps.is_empty());
+    }
+
+    #[test]
+    fn context_less_back_waits_for_context_echoes_then_recovers() {
+        let mut sim = Sim::baseline_playing();
+        sim.previous();
+        sim.step(Input::PreviousResolved {
+            track: Some(prev_track(7, 3, Some("spotify:playlist:abc"))),
+        });
+        sim.previous();
+        let fx = sim.step(Input::PreviousResolved { track: Some(prev_track(6, 2, None)) });
+        assert!(reply_text(&fx).contains("Already going back"));
+        assert!(spircs(&fx).is_empty());
+        assert_eq!(sim.s.history_cursor, Some(7));
+        sim.transport(TransportEvent::Playing { uri: uri(3), meta: None });
+        sim.advance(BACK_JUMP_TTL);
+        sim.previous();
+        let fx = sim.step(Input::PreviousResolved { track: Some(prev_track(6, 2, None)) });
+        assert_eq!(spircs(&fx), vec![SpircCmd::Previous]);
+        assert!(reply_text(&sim.previous()).contains("Already going back"));
+        sim.advance(BACK_JUMP_TTL);
+        sim.step(Input::Tick(TimerKind::BackJump));
+        assert!(sim.previous().iter().any(|e| matches!(e, Effect::ResolvePrevious { .. })));
+    }
+
+    #[test]
+    fn track_changed_before_previous_arrival_still_commits_movement() {
+        let mut sim = Sim::baseline_playing();
+        sim.previous();
+        sim.step(Input::PreviousResolved { track: Some(prev_track(7, 3, None)) });
+        sim.transport(TransportEvent::TrackChanged { uri: uri(3), meta: meta("previous") });
+        sim.transport(TransportEvent::Playing { uri: uri(3), meta: None });
+        assert_eq!(sim.s.history_cursor, Some(7));
+    }
+
+    #[test]
+    fn stopping_switching_or_advancing_clears_back_jump_memory() {
+        for action in 0..7 {
+            let mut sim = Sim::baseline_playing();
+            sim.previous();
+            sim.step(Input::PreviousResolved {
+                track: Some(prev_track(7, 3, Some("spotify:playlist:abc"))),
+            });
+            match action {
+                0 => { sim.stop(); }
+                1 => { sim.step(Input::LinkUp { gen: 2 }); }
+                2 => { sim.step(Input::LinkDown { gen: 1 }); }
+                3 => { sim.transport(TransportEvent::SessionDisconnected); }
+                4 => { sim.skip(); }
+                5 => { start_media(&mut sim.s, media_item("new"), StartGate::Immediate, &mut Vec::new()); }
+                _ => { begin_load(&mut sim.s, uri(4), sim.now, &mut Vec::new()); }
+            }
+            assert_eq!(sim.s.awaiting_jump, None, "action {action}");
+            assert!(sim.s.recent_jumps.is_empty(), "action {action}");
+            assert_eq!(sim.s.history_cursor, None, "action {action}");
+            sim.advance(BACK_JUMP_TTL);
+            assert!(sim.step(Input::Tick(TimerKind::BackJump)).is_empty());
+        }
     }
 
     #[test]

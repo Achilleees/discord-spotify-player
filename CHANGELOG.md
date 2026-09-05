@@ -10,6 +10,11 @@ git tag (release) in this repository.
 
 ## Unreleased
 
+**Rapid Back taps no longer break the history walk.** Earlier track arrivals
+from double or triple taps no longer trigger a false playlist warning or
+reset the latest position. Unconfirmed jumps time out instead of leaving
+navigation pending indefinitely.
+
 **Back-navigation waits for the current track's history record.** Pressing Back
 just after a track starts no longer races its pending history write and skips
 the wrong track. Older Spotify tracks also remain reachable after more than

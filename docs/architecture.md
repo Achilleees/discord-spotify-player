@@ -270,11 +270,28 @@ exactly that reason. Two properties of librespot shape the rest:
 Two guards fall out of that. The walk carries a cursor (`history_cursor`)
 rather than re-reading "the second-newest row", because replaying a track
 appends a row of its own and the naive query would bounce between two
-tracks forever; the cursor clears itself as soon as something other than
-the jump target plays, which is what "we're live again" means. And the
+tracks forever; the cursor clears when playback moves beyond the walk,
+which is what "we're live again" means. And the
 arrival is checked (`awaiting_jump`): librespot silently starts a context
 at track 1 when it cannot find the track requested, so a mismatch is
 surfaced instead of quietly restarting the playlist.
+
+Rapid taps can leave several context loads in flight. The core remembers up
+to eight requested targets for five seconds, including completed ones:
+superseded or duplicate arrivals still update playback telemetry, but neither
+fail the newest jump nor reset its cursor. The newest target takes precedence
+when history rows share a URI. This is bounded URI correlation, not command-id
+matching: a genuine replay of a remembered target within that window also
+looks like an echo. Unknown mismatches still warn immediately; a jump with no
+confirmed arrival times out, reports that fact, and resets the walk. Timers
+revalidate the newest send time, and commands also prune expired memory.
+
+At the eight-target limit further taps receive "Already going back" until
+space expires. Context-less `Previous` cannot name its arrival, so it waits
+until context echoes expire and cannot itself be overlapped. Stop, session
+loss/switch, skip, and a new media or explicit Spotify load clear the jump
+memory. Movement uses the transport mirror, not the card's last track:
+`TrackChanged` can update the latter before `Playing` arrives.
 
 ## librespot facts the design rests on
 
