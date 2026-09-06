@@ -8,11 +8,14 @@ bot in Discord's slash-command picker or use its own playback card.
 | Command | Required channel permissions (caller and bot) | Behavior |
 |---|---|---|
 | `/slowmode seconds` | Manage Channels | Sets text/voice channel slowmode from 0 to 21600 seconds; 0 disables it. Threads are not supported yet. |
-| `/purge count` | Manage Messages, View Channel, Read Message History | Inspects 1-100 recent messages and deletes eligible ones. Preserves pins, interactive bot menus, and messages within two minutes of Discord's 14-day bulk-delete limit or older. |
+| `/purge count` | Manage Messages, View Channel, Read Message History | Inspects 1-100 recent messages and deletes eligible ones. Preserves pins, bot messages, and messages within two minutes of Discord's 14-day bulk-delete limit or older. |
 
 These commands exist only on nob, are limited to its configured guild and
 reply privately. They use server permissions independently of voice membership.
-Cleanup reports the number confirmed by Discord; failures do not report success.
+Cleanup preserves all bot/webhook messages because Discord may omit their
+[button data](https://docs.discord.com/developers/resources/message#message-object)
+without the Message Content intent. It reports confirmed outcomes; failures
+do not report success.
 
 ## Voice-channel gate
 

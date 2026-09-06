@@ -112,7 +112,7 @@ src/
     ├── search.rs                Add music modal, private result rendering,
     │                          bounded owner/guild/expiry-checked single-use menus
     ├── admin.rs                  nob-only slowmode/purge: invocation permissions,
-    │                          bounded cleanup, pin/interactive-menu preservation
+    │                          bounded cleanup, pin/bot-message preservation
     ├── account.rs                /login /logout /forget, device-code poll,
     │                          account-switch bookkeeping, boot auto-start
     ├── ui.rs                     one task owning the now-playing/controls

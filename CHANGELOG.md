@@ -16,7 +16,7 @@ credentials, database, caches and Spotify device identity. Startup locks
 prevent accidental shared writable state. Both hosts offer offline config
 checks; Spotibot keeps its existing binary and default paths. Nob also gains
 permission-checked slowmode and recent-message cleanup that preserves pins
-and interactive bot menus.
+and bot messages.
 
 **Add music directly from the playback card.** Search YouTube by song or
 artist, choose from private results, or paste a Spotify/YouTube/SoundCloud

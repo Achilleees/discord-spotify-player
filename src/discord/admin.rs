@@ -22,7 +22,7 @@ pub(super) fn register_commands(profile: Profile) -> Vec<CreateCommand> {
                 .max_int_value(21600),
             ),
         CreateCommand::new("purge")
-            .description("Clean recent messages, keeping pins and interactive bot menus")
+            .description("Clean recent messages, keeping pins and bot messages")
             .default_member_permissions(Permissions::MANAGE_MESSAGES)
             .add_option(
                 CreateCommandOption::new(
@@ -72,10 +72,12 @@ fn integer_option(cmd: &CommandInteraction, name: &str, min: i64, max: i64) -> O
         .filter(|n| (min..=max).contains(n))
 }
 
-fn purge_eligible(pinned: bool, interactive_bot: bool, timestamp: i64, now: i64) -> bool {
+fn purge_eligible(pinned: bool, bot_message: bool, timestamp: i64, now: i64) -> bool {
+    // Preserve all bot/webhook messages: without MESSAGE_CONTENT, another
+    // bot's components may be absent even on an active playback card.
     // A two-minute margin keeps a boundary-age message from crossing Discord's
     // bulk-delete limit between fetching the batch and executing the request.
-    !pinned && !interactive_bot && timestamp > now - (14 * 24 * 60 * 60 - 120)
+    !pinned && !bot_message && timestamp > now - (14 * 24 * 60 * 60 - 120)
 }
 
 pub(super) async fn handle(
@@ -130,7 +132,7 @@ async fn execute(
     ctx: &Context,
     cmd: &CommandInteraction,
     guild: GuildId,
-) -> serenity::Result<String> {
+) -> Result<String, Box<serenity::Error>> {
     if cmd.data.name == "slowmode" {
         let Some(seconds) = integer_option(cmd, "seconds", 0, 21600) else {
             return Ok("Choose a slowmode interval from 0 to 21600 seconds.".into());
@@ -177,7 +179,7 @@ async fn execute(
             .filter(|m| {
                 purge_eligible(
                     m.pinned,
-                    m.author.bot && !m.components.is_empty(),
+                    m.author.bot || m.webhook_id.is_some(),
                     m.timestamp.unix_timestamp(),
                     now,
                 )
@@ -190,7 +192,7 @@ async fn execute(
         }
         tracing::info!(actor = %cmd.user.id, channel = %cmd.channel_id, deleted = ids.len(), "channel cleanup completed");
         Ok(format!(
-            "Deleted {} message(s). Kept {} pinned, older or interactive bot message(s).",
+            "Deleted {} message(s). Kept {} pinned, older or bot/webhook message(s).",
             ids.len(),
             messages.len() - ids.len()
         ))
@@ -258,7 +260,7 @@ mod tests {
     }
 
     #[test]
-    fn purge_preserves_pins_menus_and_boundary_age_messages() {
+    fn purge_preserves_pins_bot_messages_and_boundary_age_messages() {
         let now = 2_000_000;
         assert!(purge_eligible(false, false, now - 10, now));
         assert!(!purge_eligible(true, false, now - 10, now));
