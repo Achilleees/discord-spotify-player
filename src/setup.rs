@@ -178,16 +178,7 @@ pub async fn run_setup_wizard() -> Result<Config, SetupError> {
         channel_kind_label(channel_kind)
     );
     println!("  Device name:    {device_name}");
-    // chars(), not byte slices: a multi-byte char at either cut would panic
-    // on a non-char boundary.
-    let masked_token = if token.chars().count() >= 10 {
-        let head: String = token.chars().take(6).collect();
-        let tail: String = token.chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect();
-        format!("{}...{}", head, tail)
-    } else {
-        "(invalid?)".to_string()
-    };
-    println!("  Token:          {masked_token}");
+    println!("  Token:          (provided)");
     println!();
 
     let confirmed = blocking(|| {
@@ -208,9 +199,8 @@ pub async fn run_setup_wizard() -> Result<Config, SetupError> {
     println!();
     println!(".env written successfully!");
 
-    // dotenvy::dotenv() only fills vars that are currently unset, so a prior
-    // failed from_env in the same process would shadow the freshly-written
-    // values. Set them explicitly so the reload below sees the new config.
+    // Process variables win over the env file. Set the wizard values
+    // explicitly so pre-existing variables cannot shadow the new choices.
     std::env::set_var("DISCORD_TOKEN", &token);
     std::env::set_var("DISCORD_GUILD_ID", guild_id_u64.to_string());
     std::env::set_var("DISCORD_CHANNEL_ID", channel_id_u64.to_string());

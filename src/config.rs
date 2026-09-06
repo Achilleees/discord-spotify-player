@@ -1,7 +1,8 @@
-use std::env;
+use crate::runtime::{Profile, Settings};
 
 #[derive(Clone)]
 pub struct Config {
+    pub profile: Profile,
     pub discord_token: String,
     pub discord_guild_id: u64,
     pub discord_channel_id: u64,
@@ -20,8 +21,8 @@ pub struct Config {
 
 /// Parse a numeric env var, warning (rather than silently defaulting) when a
 /// value is present but unparseable — so a typo is distinguishable from unset.
-fn env_num<T: std::str::FromStr>(key: &str) -> Option<T> {
-    parse_num(key, env::var(key).ok().as_deref())
+fn env_num<T: std::str::FromStr>(settings: &Settings, key: &str) -> Option<T> {
+    parse_num(key, settings.get(key))
 }
 
 /// The pure half of [`env_num`]: None for unset/blank, Some for a valid parse,
@@ -58,44 +59,75 @@ fn parse_id(key: &'static str, raw: &str) -> Result<u64, ConfigError> {
 
 impl Config {
     pub fn from_env() -> Result<Self, ConfigError> {
-        dotenvy::dotenv().ok();
+        let settings = Settings::load(Profile::Spotibot, None)
+            .map_err(|_| ConfigError::Invalid("env file"))?;
+        Self::from_settings(&settings)
+    }
 
-        let preamp_db = env_num::<f32>("PREAMP_DB").unwrap_or(0.0).clamp(-12.0, 12.0);
-        let bass_boost_db = env_num::<f32>("BASS_BOOST_DB").unwrap_or(0.0).clamp(0.0, 12.0);
-        let treble_boost_db = env_num::<f32>("TREBLE_BOOST_DB").unwrap_or(0.0).clamp(-6.0, 6.0);
-        let audio_buffer_seconds = env_num::<usize>("AUDIO_BUFFER_SECONDS").unwrap_or(8).clamp(1, 12);
-        let prebuffer_seconds = env_num::<f32>("PREBUFFER_SECONDS").unwrap_or(2.0).clamp(0.0, 8.0);
+    pub fn from_settings(settings: &Settings) -> Result<Self, ConfigError> {
+        let preamp_db = env_num::<f32>(settings, "PREAMP_DB")
+            .unwrap_or(0.0)
+            .clamp(-12.0, 12.0);
+        let bass_boost_db = env_num::<f32>(settings, "BASS_BOOST_DB")
+            .unwrap_or(0.0)
+            .clamp(0.0, 12.0);
+        let treble_boost_db = env_num::<f32>(settings, "TREBLE_BOOST_DB")
+            .unwrap_or(0.0)
+            .clamp(-6.0, 6.0);
+        let audio_buffer_seconds = env_num::<usize>(settings, "AUDIO_BUFFER_SECONDS")
+            .unwrap_or(8)
+            .clamp(1, 12);
+        let prebuffer_seconds = env_num::<f32>(settings, "PREBUFFER_SECONDS")
+            .unwrap_or(2.0)
+            .clamp(0.0, 8.0);
 
-        let device_id = env::var("DEVICE_ID")
-            .ok()
+        let device_id = settings
+            .get("DEVICE_ID")
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
 
-        let token_enc_key = env::var("TOKEN_ENC_KEY")
-            .ok()
+        let token_enc_key = settings
+            .get("TOKEN_ENC_KEY")
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty());
 
         let discord_channel_id = parse_id(
             "DISCORD_CHANNEL_ID",
-            &env::var("DISCORD_CHANNEL_ID").map_err(|_| ConfigError::Missing("DISCORD_CHANNEL_ID"))?,
+            settings
+                .get("DISCORD_CHANNEL_ID")
+                .ok_or(ConfigError::Missing("DISCORD_CHANNEL_ID"))?,
         )?;
 
         let discord_guild_id = parse_id(
             "DISCORD_GUILD_ID",
-            &env::var("DISCORD_GUILD_ID").map_err(|_| ConfigError::Missing("DISCORD_GUILD_ID"))?,
+            settings
+                .get("DISCORD_GUILD_ID")
+                .ok_or(ConfigError::Missing("DISCORD_GUILD_ID"))?,
         )?;
 
         let discord_text_channel_id =
-            resolve_text_channel_id(env::var("TEXT_CHANNEL_ID").ok().as_deref(), discord_channel_id);
+            resolve_text_channel_id(settings.get("TEXT_CHANNEL_ID"), discord_channel_id);
 
+        let discord_token = settings
+            .get("DISCORD_TOKEN")
+            .filter(|v| !v.trim().is_empty())
+            .ok_or(ConfigError::Missing("DISCORD_TOKEN"))?
+            .trim()
+            .to_string();
         Ok(Config {
-            discord_token: env::var("DISCORD_TOKEN")
-                .map_err(|_| ConfigError::Missing("DISCORD_TOKEN"))?,
+            profile: settings.profile,
+            discord_token,
             discord_guild_id,
             discord_channel_id,
             discord_text_channel_id,
-            device_name: env::var("DEVICE_NAME").unwrap_or_else(|_| "Discord Player".to_string()),
+            device_name: settings
+                .get("DEVICE_NAME")
+                .unwrap_or(if settings.profile == Profile::Nob {
+                    "nob"
+                } else {
+                    "Discord Player"
+                })
+                .to_string(),
             device_id,
             audio_buffer_seconds,
             prebuffer_seconds,
@@ -132,7 +164,10 @@ mod tests {
 
     #[test]
     fn accepts_valid_snowflake() {
-        assert_eq!(parse_id("X", "428011920184967168").unwrap(), 428011920184967168);
+        assert_eq!(
+            parse_id("X", "123456789012345678").unwrap(),
+            123456789012345678
+        );
     }
 
     #[test]

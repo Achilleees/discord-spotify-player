@@ -48,6 +48,7 @@ pub(super) async fn run(input: &str) -> Result<String, YoutubeError> {
             "--remote-components",
             "ejs:github",
         ]);
+        command.arg("--cache-dir").arg(super::extractor_cache_path());
         let cookies = super::cookies_path();
         if std::path::Path::new(&cookies).is_file() {
             command.args(["--cookies", &cookies]);

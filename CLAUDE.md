@@ -54,16 +54,20 @@ the VPS layout under `/var/lib/spotibot`. `--setup` runs the wizard;
 otherwise the app loads `.env`. OAuth needs no config — it authenticates
 against Spotify's desktop client id.
 
+Nob uses `.env.nob.example` -> `.env.nob`, or `NOB_*` process variables.
+Both hosts support `--env-file PATH` and offline `--check-config`.
+
 `RUST_LOG`: a preset (`trace|debug|info|warn|error`, app-centric) or a raw
 `EnvFilter`. Default `warn`.
 
 ## Architecture
 
-The root package is the first Cargo workspace member. `src/main.rs` owns the
-Tokio runtime and calls `discord_spotify_player::run()` in `src/lib.rs`, which
-owns startup and the private runtime modules. The first imported UI adds
-private search/link entry; nob's separate host and remaining features follow. Run each identity
-in its own process with independent configuration, database and caches.
+The root package remains the default workspace member. Its binary calls
+`run()`; `crates/nob` calls `run_nob()` in the same library, in a separate
+process. `runtime.rs` selects config, freezes paths and locks writable state
+before startup. Never add a nob fallback to Spotibot credentials or caches.
+Nob-only server utilities are in `discord/admin.rs`; they check caller and
+bot permissions on invocation. See `docs/two-bots.md` for both hosts.
 
 ### Audio pipeline
 ```

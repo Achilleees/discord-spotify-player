@@ -21,7 +21,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
-const CACHE_DIR: &str = ".spotify_cache";
 const DEVICE_ID_FILE: &str = "device_id";
 const MAX_FAST_RECONNECTS: usize = 5;
 const MIN_STABLE_SESSION_SECS: u64 = 60;
@@ -146,19 +145,19 @@ pub struct SpotifyPlayer;
 
 impl SpotifyPlayer {
     fn cache_dir() -> PathBuf {
-        PathBuf::from(CACHE_DIR)
-    }
-
-    fn device_id_path() -> PathBuf {
-        Self::cache_dir().join(DEVICE_ID_FILE)
+        crate::runtime::paths().spotify_cache.clone()
     }
 
     fn resolve_device_id(config: &Config) -> String {
-        if let Some(id) = config.device_id.as_deref() {
+        Self::resolve_device_id_at(config.device_id.as_deref(), &Self::cache_dir())
+    }
+
+    fn resolve_device_id_at(explicit: Option<&str>, cache_dir: &std::path::Path) -> String {
+        if let Some(id) = explicit {
             return id.to_string();
         }
 
-        let path = Self::device_id_path();
+        let path = cache_dir.join(DEVICE_ID_FILE);
         if let Ok(id) = std::fs::read_to_string(&path) {
             let trimmed = id.trim();
             if !trimmed.is_empty() {
@@ -167,7 +166,7 @@ impl SpotifyPlayer {
         }
 
         let id = hex::encode(rand::random::<[u8; 20]>());
-        if std::fs::create_dir_all(Self::cache_dir()).is_ok() {
+        if std::fs::create_dir_all(cache_dir).is_ok() {
             let _ = std::fs::write(&path, id.as_bytes());
         }
         id
@@ -631,5 +630,24 @@ mod tests {
     #[test]
     fn no_artists_joins_to_nothing() {
         assert_eq!(join_unique(Vec::<String>::new()), "");
+    }
+}
+
+#[cfg(test)]
+mod device_identity_tests {
+    use super::SpotifyPlayer;
+
+    #[test]
+    fn identity_is_stable_per_cache_and_separate_between_hosts() {
+        let root = std::env::temp_dir().join(format!("bot-device-test-{}", uuid::Uuid::new_v4()));
+        let spot = root.join("spotibot");
+        let nob = root.join("nob");
+        let first = SpotifyPlayer::resolve_device_id_at(None, &spot);
+        assert_eq!(first.len(), 40);
+        assert_eq!(first, SpotifyPlayer::resolve_device_id_at(None, &spot));
+        assert_ne!(first, SpotifyPlayer::resolve_device_id_at(None, &nob));
+        assert_eq!(SpotifyPlayer::resolve_device_id_at(Some("explicit-test-id"), &spot), "explicit-test-id");
+        assert_eq!(first, SpotifyPlayer::resolve_device_id_at(None, &spot));
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

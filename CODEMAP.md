@@ -5,10 +5,11 @@ Technical file map. For behavior and rationale, see `docs/architecture.md`,
 
 ## Workspace
 
-`Cargo.toml` defines a workspace whose initial/default member is the existing
-`discord-spotify-player` package. It builds a library and the same named
-binary; root build/run commands and the deployment artifact path are retained.
-CI checks all workspace members with the committed lockfile.
+`Cargo.toml` defines the default `discord-spotify-player` member and the thin
+`crates/nob` host. Root build/run commands preserve the existing Spotibot
+binary; `cargo build --workspace --release --locked` builds both executables.
+CI checks all members. `tests/host_cli.rs` and `crates/nob/tests/cli.rs` exercise
+offline configuration through both real entry points using synthetic fixtures.
 
 ## `src/`
 
@@ -20,6 +21,8 @@ src/
 │                         logging, config load, YouTube/ffmpeg
 │                         checks, OAuth client, credential store, AudioBridge,
 │                         Discord bot startup, then parks
+├── runtime.rs            profile/CLI, isolated env maps, resolved paths and
+│                         process-held state locks; no playback policy
 ├── config.rs             .env → Config: required Discord ids, audio tuning,
 │                         TOKEN_ENC_KEY; numeric parsing with warn-on-typo
 ├── setup.rs               `--setup` first-run wizard: prompts for the bot
@@ -108,6 +111,8 @@ src/
     │                          resolution/enqueue with post-lookup voice check
     ├── search.rs                Add music modal, private result rendering,
     │                          bounded owner/guild/expiry-checked single-use menus
+    ├── admin.rs                  nob-only slowmode/purge: invocation permissions,
+    │                          bounded cleanup, pin/interactive-menu preservation
     ├── account.rs                /login /logout /forget, device-code poll,
     │                          account-switch bookkeeping, boot auto-start
     ├── ui.rs                     one task owning the now-playing/controls

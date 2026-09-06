@@ -7,3 +7,4 @@ mod ui;
 mod voice;
 
 pub use bot::DiscordBot;
+mod admin;

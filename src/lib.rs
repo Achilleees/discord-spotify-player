@@ -13,6 +13,7 @@ mod player;
 mod presence;
 mod queue;
 mod queue_store;
+mod runtime;
 mod setup;
 mod spotify;
 mod users;
@@ -44,9 +45,31 @@ fn app_centric_filter(level: &str) -> String {
 /// performs configuration/setup, starts Discord and waits for the bot lifetime.
 /// Separate bot identities must run in separate processes with isolated state.
 pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let env_filter = match std::env::var("RUST_LOG") {
-        Err(_) => tracing_subscriber::EnvFilter::new(app_centric_filter("warn")),
-        Ok(value) => {
+    run_profile(runtime::Profile::Spotibot).await
+}
+
+/// Run nob's independent identity with `.env.nob` / `NOB_*` configuration.
+/// Must run in its own process; shares the music implementation with Spotibot.
+pub async fn run_nob() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    run_profile(runtime::Profile::Nob).await
+}
+
+async fn run_profile(profile: runtime::Profile) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let options = runtime::Options::parse(std::env::args().skip(1))?;
+    if options.help {
+        println!("{} [--env-file PATH] [--check-config] [--help]", profile.name());
+        println!("Config: {}. nob accepts NOB_* process variables; Spotibot accepts unprefixed variables.", profile.env_file());
+        println!("--check-config validates settings without connecting or writing state.");
+        if profile == runtime::Profile::Spotibot { println!("--setup runs the interactive .env wizard."); }
+        return Ok(());
+    }
+    if options.setup && profile == runtime::Profile::Nob {
+        return Err(io::Error::other("configure nob with .env.nob (see .env.nob.example) or NOB_* variables; --setup is for Spotibot").into());
+    }
+    let mut settings = runtime::Settings::load(profile, options.env_file.as_deref())?;
+    let env_filter = match settings.get("RUST_LOG") {
+        None => tracing_subscriber::EnvFilter::new(app_centric_filter("warn")),
+        Some(value) => {
             let trimmed = value.trim().to_ascii_lowercase();
             match trimmed.as_str() {
                 "trace" => tracing_subscriber::EnvFilter::new(app_centric_filter("trace")),
@@ -60,23 +83,38 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     };
     tracing_subscriber::fmt().with_env_filter(env_filter).init();
 
-    tracing::info!("starting discord spotify player");
+    tracing::info!(profile = profile.name(), "starting bot");
 
-    let config = if std::env::args().any(|arg| arg == "--setup") {
-        setup::run_setup_wizard().await?
+    let allow_wizard = profile == runtime::Profile::Spotibot && options.env_file.is_none() && !options.check;
+    let config = if options.setup {
+        let config = setup::run_setup_wizard().await?;
+        settings = runtime::Settings::load(profile, None)?;
+        config
     } else {
-        match Config::from_env() {
+        match Config::from_settings(&settings) {
             Ok(config) => config,
-            Err(err) => {
+            Err(err) if allow_wizard => {
                 println!("Configuration missing or invalid: {err}");
                 println!("Launching setup wizard...");
-                setup::run_setup_wizard().await?
+                let config = setup::run_setup_wizard().await?;
+                settings = runtime::Settings::load(profile, None)?;
+                config
             }
+            Err(err) => return Err(err.into()),
         }
     };
+    let paths = runtime::Paths::resolve(&settings, &std::env::current_dir()?)?;
+    if options.check {
+        println!("{} configuration is valid; no connection or state writes performed.", profile.name());
+        return Ok(());
+    }
+    // Acquire every writable resource before cleanup, database access or login.
+    let _state_locks = paths.lock()?;
+    paths.install()?;
+    drop(settings);
 
     println!();
-    println!("Discord Spotify Player v{}", env!("CARGO_PKG_VERSION"));
+    println!("{} v{}", profile.name(), env!("CARGO_PKG_VERSION"));
     tracing::info!("configuration loaded");
 
     // Check yt-dlp and ffmpeg availability
@@ -98,15 +136,15 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let oauth: Arc<SpotifyOAuth> = Arc::new(SpotifyOAuth::new());
     tracing::info!("spotify oauth enabled (device authorization)");
 
-    let db_path = std::env::var("SPOTIBOT_DB").unwrap_or_else(|_| "spotibot.db".to_string());
+    let db_path = runtime::paths().database.to_str().ok_or_else(|| io::Error::other("database path must be valid UTF-8"))?;
     let user_store = Arc::new(
-        UserStore::open(&db_path, config.token_enc_key.as_deref())
+        UserStore::open(db_path, config.token_enc_key.as_deref())
             .map_err(|e| io::Error::other(format!("failed to open credential store: {e}")))?,
     );
 
     // History is a nice-to-have: if the table can't be opened the bot still
     // plays, it just stops keeping a record.
-    let history = match history::HistoryStore::open(&db_path) {
+    let history = match history::HistoryStore::open(db_path) {
         Ok(h) => Some(Arc::new(h)),
         Err(e) => {
             tracing::warn!(error = %e, "play history disabled — could not open the table");
@@ -116,7 +154,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // Same story as history: a queue that can't be persisted is a lost
     // convenience, not a reason to refuse to play.
-    let queue_store = match queue_store::QueueStore::open(&db_path) {
+    let queue_store = match queue_store::QueueStore::open(db_path) {
         Ok(q) => Some(Arc::new(q)),
         Err(e) => {
             tracing::warn!(error = %e, "queue persistence disabled — could not open the table");

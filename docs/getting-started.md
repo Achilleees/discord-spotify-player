@@ -30,6 +30,11 @@ cargo test --workspace --locked
 cargo build --workspace --release --locked
 ```
 
+To build both hosts, use the workspace release command above. The second
+binary is `target/release/nob` (`nob.exe` on Windows). Configure it using
+`.env.nob.example`; see [running both bots](two-bots.md). Each process requires
+a different Discord bot token and its own state.
+
 ## First run
 
 Two ways to configure the bot:

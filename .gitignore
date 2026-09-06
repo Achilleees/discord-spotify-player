@@ -8,6 +8,11 @@ build.bat
 
 # Environment and secrets
 .env
+.env.*
+!.env.example
+!.env.nob.example
+.nob/
+*.bot.lock
 *.pem
 *.key
 

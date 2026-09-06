@@ -79,7 +79,7 @@ async fn download_youtube(url: &str, token: &CancellationToken) -> Result<std::p
     let output_template = format!("{}/yt-{}.%(ext)s", crate::youtube::tmp_dir(), id);
 
     let cookies_path = crate::youtube::cookies_path();
-    let mut args = vec!["-f".to_string(), "bestaudio*".to_string(), "--no-playlist".to_string(), "--no-part".to_string(), "--remote-components".to_string(), "ejs:github".to_string(), "-o".to_string(), output_template.clone()];
+    let mut args = vec!["--ignore-config".to_string(), "--cache-dir".to_string(), super::extractor_cache_path().to_string_lossy().into_owned(), "-f".to_string(), "bestaudio*".to_string(), "--no-playlist".to_string(), "--no-part".to_string(), "--remote-components".to_string(), "ejs:github".to_string(), "-o".to_string(), output_template.clone()];
     if std::path::Path::new(&cookies_path).exists() {
         args.extend(["--cookies".to_string(), cookies_path.clone()]);
     }

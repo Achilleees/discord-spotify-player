@@ -2,17 +2,20 @@
 
 ## Workspace and process entry point
 
-The root `discord-spotify-player` package is the initial Cargo workspace
-member. `src/main.rs` creates Tokio and calls `discord_spotify_player::run()`
-in `src/lib.rs`. The library owns the existing startup sequence and private
-modules. The executable name, setup flow and configuration paths are retained.
+The default workspace member is `discord-spotify-player`; its existing binary
+calls `run()` in `src/lib.rs`. The `crates/nob` binary calls `run_nob()` in the
+same library. Both use the same private music modules and run in separate
+processes. Nob registers the additional server commands in `discord/admin.rs`.
 
-This is the foundation for two bot hosts sharing music code. Each identity
-will run in a separate process with its own configuration, database, caches
-and Spotify device identity. The current library entry point initializes
-process-global logging and is called once per process. The initial imported
-UI adds private search/link interactions through the existing player handle.
-The separate nob host and remaining features follow; see [PORT.md](PORT.md).
+`runtime.rs` selects the profile, loads an isolated configuration map and
+resolves state paths before connecting. Process-held file locks protect the
+database, Spotify cache/device identity, download scratch directory, cookie jar and DJ
+cache from concurrent use by these hosts. Paths are frozen once for media
+helpers. Older builds do not participate in these locks.
+
+Startup initializes process-global logging once. `--check-config` exits before
+state creation, dependency probes or network connections. See
+[two-bots.md](two-bots.md) and [configuration.md](configuration.md).
 
 ## Audio pipeline
 

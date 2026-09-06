@@ -1,5 +1,19 @@
 # Commands and controls
 
+Both bots share the music commands and controls below. Choose the intended
+bot in Discord's slash-command picker or use its own playback card.
+
+## Nob server utilities
+
+| Command | Required channel permissions (caller and bot) | Behavior |
+|---|---|---|
+| `/slowmode seconds` | Manage Channels | Sets text/voice channel slowmode from 0 to 21600 seconds; 0 disables it. Threads are not supported yet. |
+| `/purge count` | Manage Messages, View Channel, Read Message History | Inspects 1-100 recent messages and deletes eligible ones. Preserves pins, interactive bot menus, and messages within two minutes of Discord's 14-day bulk-delete limit or older. |
+
+These commands exist only on nob, are limited to its configured guild and
+reply privately. They use server permissions independently of voice membership.
+Cleanup reports the number confirmed by Discord; failures do not report success.
+
 ## Voice-channel gate
 
 Anything that makes the bot audible requires you to share its voice channel:

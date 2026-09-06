@@ -124,7 +124,7 @@ fn search_results_from_json(output: &str, max_secs: u64) -> Vec<YoutubeSearchRes
 pub async fn search_youtube(query: &str) -> Result<Vec<YoutubeSearchResult>, YoutubeError> {
     let input = search_input(query)?;
     let output = super::probe::run(&input).await?;
-    let max = resolve_max_duration_secs(std::env::var("YOUTUBE_MAX_DURATION_SECS").ok().as_deref());
+    let max = resolve_max_duration_secs(crate::runtime::paths().youtube_max_duration.as_deref());
     Ok(search_results_from_json(&output, max))
 }
 
@@ -234,7 +234,7 @@ pub async fn fetch_youtube_metadata(url: &str) -> Result<YoutubeMetadata, Youtub
     let stdout = super::probe::run(&url).await?;
     let first_line = stdout.lines().next().unwrap_or("");
     let max =
-        resolve_max_duration_secs(std::env::var("YOUTUBE_MAX_DURATION_SECS").ok().as_deref());
+        resolve_max_duration_secs(crate::runtime::paths().youtube_max_duration.as_deref());
     metadata_from_json(first_line, max)
 }
 

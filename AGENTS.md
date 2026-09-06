@@ -43,14 +43,17 @@ go in the gitignored `.local/`, not `docs/`.
   `cargo clippy --workspace --all-targets --locked -- -D warnings`, and
   `cargo build --workspace --release --locked`.
 - Stop a running bot before `cargo build --release` — it locks the exe.
-- First-run setup: `--setup` writes `.env`. OAuth needs no config.
+- First-run Spotibot setup: `--setup` writes `.env`. Nob uses `.env.nob.example`.
+- Both hosts support `--env-file PATH` and offline `--check-config`.
+- Nob-only server commands enforce caller and bot permissions at invocation.
 - `.cargo/config.toml` (tracked) carries the cmake fix; MSVC toolchain on Windows.
 
 ## Architecture (see `docs/architecture.md`, `CODEMAP.md`)
-- The root package is the initial workspace member. `src/main.rs` creates
-  Tokio and calls the library's `run()` in `src/lib.rs`; existing runtime
-  modules remain private there. Each future bot host runs as its own process
-  with separate configuration, database, cache and Spotify device identity.
+- The root package remains the default workspace member and Spotibot host;
+  `crates/nob` calls `run_nob()` in the same library as a separate process.
+  `runtime.rs` owns profile config, frozen paths and process-held state locks.
+  Nob uses `.env.nob` / `NOB_*` variables and `.nob` state by default; never
+  introduce a fallback to Spotibot credentials or shared writable caches.
 - Two audio producers push PCM f32 into `AudioBridge`; `SimpleBridgeReader`
   pulls it out for Songbird. One player actor (`player/actor.rs`, pure
   decision core in `player/state.rs`) owns the queue, the armed Spotify

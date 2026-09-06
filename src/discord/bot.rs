@@ -318,7 +318,9 @@ impl EventHandler for Handler {
     async fn ready(&self, ctx: Context, ready: Ready) {
         tracing::info!(user = %ready.user.name, "discord bot connected");
 
-        match self.guild_id.set_commands(&ctx, commands::register_commands(self.ytdlp_available)).await {
+        let mut registered = commands::register_commands(self.ytdlp_available);
+        registered.extend(super::admin::register_commands(self.config.profile));
+        match self.guild_id.set_commands(&ctx, registered).await {
             Ok(cmds) => tracing::info!("registered {} slash commands", cmds.len()),
             Err(e) => tracing::warn!(error = ?e, "failed to register slash commands"),
         }

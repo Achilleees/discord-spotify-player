@@ -10,6 +10,14 @@ git tag (release) in this repository.
 
 ## Unreleased
 
+**Nob runs alongside Spotibot from the same workspace.** A separate `nob`
+executable shares the music engine and UI while using its own env file,
+credentials, database, caches and Spotify device identity. Startup locks
+prevent accidental shared writable state. Both hosts offer offline config
+checks; Spotibot keeps its existing binary and default paths. Nob also gains
+permission-checked slowmode and recent-message cleanup that preserves pins
+and interactive bot menus.
+
 **Add music directly from the playback card.** Search YouTube by song or
 artist, choose from private results, or paste a Spotify/YouTube/SoundCloud
 track link. The richer card adds labeled playback, Stop, Queue and History

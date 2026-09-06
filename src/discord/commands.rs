@@ -410,6 +410,7 @@ impl Handler {
         };
         tracing::debug!(command = %cmd.data.name, "processing slash command");
         if cmd.guild_id != Some(self.guild_id) { return; }
+        if super::admin::handle(&ctx, &cmd, self.config.profile, self.guild_id).await { return; }
 
         let user_id = cmd.user.id.to_string();
         let user_id_u64 = cmd.user.id.get();

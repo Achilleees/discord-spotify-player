@@ -28,12 +28,13 @@ The eventual project name is `never-off-beat`.
   this project and archiving the old nob repository under a legacy name.
   Both bot identities survive.
 
-The initial workspace member is the existing `discord-spotify-player`
-package. `src/main.rs` calls the library entry point in `src/lib.rs`; runtime
-modules stay in place and the executable path is retained. The first imported
-UI adds search/link entry, private results and richer playback controls.
-Nob's separate host and remaining features are tracked on the existing
-`discord-spotify-player` board.
+The default workspace member is `discord-spotify-player`; `crates/nob` adds
+a thin, independently runnable host. Both call the shared library in
+`src/lib.rs`. Music includes private search/link entry and richer playback
+controls; nob additionally has slowmode and message cleanup. Configuration,
+databases, caches and generated Spotify device identities are isolated; see
+[two-bots.md](two-bots.md). Remaining server modules, soundboard, companion
+behavior and live two-room acceptance are tracked on the existing board.
 
 ## Historical transfer dossier — superseded migration plan
 

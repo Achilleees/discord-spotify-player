@@ -1,0 +1,8 @@
+[package]
+name = "nob"
+version = "0.5.0-rc2"
+edition = "2021"
+
+[dependencies]
+discord-spotify-player = { path = "../.." }
+tokio = { version = "1", features = ["full"] }

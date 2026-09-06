@@ -3,15 +3,12 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use tracing;
 
-const DEFAULT_DJ_CLIPS_DIR: &str = "/var/lib/spotibot/dj-clips";
-const DEFAULT_DJ_CACHE_DIR: &str = "/var/lib/spotibot/dj-cache";
-
-/// DJ clip / cache directories, overridable via env (defaults are the VPS layout).
+/// Frozen paths belong to this process, including TTS output/cache eviction.
 fn dj_clips_dir() -> String {
-    std::env::var("DJ_CLIPS_DIR").unwrap_or_else(|_| DEFAULT_DJ_CLIPS_DIR.to_string())
+    crate::runtime::paths().dj_clips.to_string_lossy().into_owned()
 }
 fn dj_cache_dir() -> String {
-    std::env::var("DJ_CACHE_DIR").unwrap_or_else(|_| DEFAULT_DJ_CACHE_DIR.to_string())
+    crate::runtime::paths().dj_cache.to_string_lossy().into_owned()
 }
 // Local typed aliases of the canonical bridge format.
 const SAMPLE_RATE: u32 = crate::audio_bridge::SAMPLE_RATE as u32;
@@ -292,13 +289,10 @@ fn simple_hash(text: &str) -> u64 {
 }
 
 
-#[cfg(unix)]
-const DEFAULT_KOKORO_SOCKET: &str = "/var/lib/spotibot/kokoro.sock";
-
 /// Kokoro TTS unix-socket path, overridable via env (default is the VPS layout).
 #[cfg(unix)]
 fn kokoro_socket() -> String {
-    std::env::var("KOKORO_SOCKET").unwrap_or_else(|_| DEFAULT_KOKORO_SOCKET.to_string())
+    crate::runtime::paths().kokoro_socket.to_string_lossy().into_owned()
 }
 
 /// Kokoro TTS is reached over a Unix domain socket, so generation is

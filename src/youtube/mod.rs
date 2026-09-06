@@ -2,17 +2,19 @@ pub mod metadata;
 pub mod feeder;
 mod probe;
 
-const DEFAULT_TMP_DIR: &str = "/tmp/spotibot-youtube";
-const DEFAULT_COOKIES: &str = "/var/lib/spotibot/youtube-cookies.txt";
-
-/// Scratch dir for downloaded audio, overridable via env (default is the VPS layout).
+/// This process's resolved scratch directory; locked before startup cleanup.
 pub fn tmp_dir() -> String {
-    std::env::var("YOUTUBE_TMP_DIR").unwrap_or_else(|_| DEFAULT_TMP_DIR.to_string())
+    crate::runtime::paths().youtube_tmp.to_string_lossy().into_owned()
 }
 
-/// yt-dlp cookies file, overridable via env; used only if it exists on disk.
+/// This process's explicit cookies path, used only if the file exists.
 pub fn cookies_path() -> String {
-    std::env::var("YOUTUBE_COOKIES").unwrap_or_else(|_| DEFAULT_COOKIES.to_string())
+    crate::runtime::paths().youtube_cookies.to_string_lossy().into_owned()
+}
+
+/// Extractor/signature cache stays within the locked per-instance scratch dir.
+pub(super) fn extractor_cache_path() -> std::path::PathBuf {
+    crate::runtime::paths().youtube_tmp.join("extractor-cache")
 }
 
 pub fn check_ytdlp_available() -> bool {

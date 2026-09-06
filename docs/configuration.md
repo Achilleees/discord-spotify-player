@@ -1,9 +1,42 @@
 # Configuration
 
-All configuration is environment variables, loaded from `.env` in the
-working directory (via `dotenvy`) or from the real environment — a real
-environment variable is not overridden by `.env`. `--setup` writes a `.env`
-file interactively instead of requiring you to fill these in by hand.
+Spotibot loads `.env` from the process working directory; unprefixed process
+variables override it. Nob loads `.env.nob` and accepts only `NOB_*` process
+overrides (`NOB_DISCORD_TOKEN`, `NOB_STATE_DIR`, etc.). File keys are unprefixed
+for both profiles. Nob never falls back to Spotibot's `.env` or unprefixed
+process settings. Use literal credential values in the selected file; dotenv
+variable interpolation explicitly references process variables.
+
+`--env-file PATH` selects a different file without loading a default file or
+searching parent directories. `--check-config` validates required settings
+and resolves paths without connecting, probing tools or writing state. It
+does not authenticate credentials or test filesystem access. `--help` needs
+no configuration. Only Spotibot's default launch offers the `.env` setup
+wizard; nob and explicit-file/check launches fail on invalid configuration.
+
+## Instance paths
+
+| Setting | Spotibot default | Nob default |
+|---|---|---|
+| `STATE_DIR` | working directory, with legacy VPS media paths | `.nob` in working directory |
+| `DATABASE_PATH` | `spotibot.db` | `nob.db` beneath state directory |
+| `SPOTIFY_CACHE_DIR` | `.spotify_cache` | `.spotify_cache` beneath state directory |
+
+With an explicit `STATE_DIR`, all relative paths below resolve beneath it,
+including overrides. Absolute paths stay absolute. The state directory itself
+is relative to the process working directory, not the env file. Setting a new
+state directory selects new state; it does not migrate an existing database.
+`SPOTIBOT_DB` remains a Spotibot-only legacy override relative to the working
+directory; `DATABASE_PATH` takes precedence when both are set.
+
+Nob, and Spotibot with explicit `STATE_DIR`, default to `youtube-tmp`,
+`youtube-cookies.txt`, `dj-clips`, `dj-cache` and `kokoro.sock` under that state
+directory. The tables below show Spotibot's legacy defaults when `STATE_DIR`
+is absent. Writable database/cache directories must be accessible at startup;
+file locks refuse concurrent use by another current host before cleanup,
+including the writable YouTube cookie jar. yt-dlp uses `extractor-cache`
+under its scratch directory and ignores ambient downloader configuration.
+See [two-bots.md](two-bots.md) for running two identities.
 
 ## Discord (required)
 
@@ -14,9 +47,8 @@ file interactively instead of requiring you to fill these in by hand.
 | `DISCORD_CHANNEL_ID` | yes | — | The voice channel the bot joins and plays into. Must be a non-zero snowflake. |
 | `TEXT_CHANNEL_ID` | no | the voice channel's built-in text chat | Text channel for the now-playing card and controls. An unset or invalid value falls back to the voice channel's chat. |
 
-Missing or invalid values here fail `Config::from_env()` and drop the process
-into the setup wizard (or, under `--setup`, cause the wizard to run from the
-start).
+Missing or invalid required values prevent startup. The Spotibot default
+launch can open its setup wizard; nob never opens or rewrites Spotibot config.
 
 ## Spotify session / storage
 
@@ -97,7 +129,7 @@ a different host layout.
 
 ## Where state lives
 
-- **`spotibot.db`** (path from `SPOTIBOT_DB`) — SQLite database. Tables:
+- **Database** (`DATABASE_PATH`, legacy `SPOTIBOT_DB`, or the profile default) — SQLite database. Tables:
   `spotify_credentials` (per-user OAuth tokens, one row per Discord user,
   exactly one row `is_active = 1` at a time) and `settings` (bot-level
   toggles, e.g. the `/announce` state, so it survives restarts).
