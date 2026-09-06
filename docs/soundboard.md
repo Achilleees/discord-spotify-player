@@ -91,8 +91,8 @@ exposing local paths or decoder output.
 ## Playback and recovery
 
 A visit reserves nob's voice ownership before decoding or joining. It uses
-its own Songbird track at 0.5 gain, without the normal music join greeting,
-queue insertion or bridge overlay. Playback success comes from the track's
+its own Songbird track, without the normal music join greeting, queue
+insertion or bridge overlay. Playback success comes from the track's
 end event; errors and timeouts report failure. Decoding is bounded to ten
 seconds, joining to twelve seconds, and the visit to forty seconds overall.
 After voice setup, nob waits 1.5 seconds before playing, then stays for two
@@ -100,6 +100,15 @@ seconds after a successful clip finishes. These pauses release the voice
 transition lock and cancel immediately if the requester moves or music
 takes over. Failures skip the departure pause.
 Cleanup then attempts to leave only the connection the visit still owns.
+
+Clip volume defaults to full source level. Set `SOUNDBOARD_VOLUME_PERCENT`
+in `.env.nob` to a value from `0` to `100`, including decimals, or use the
+process override `NOB_SOUNDBOARD_VOLUME_PERCENT`. Unset or blank values use
+`100`; `0` is silent. Invalid, non-finite or out-of-range values fail startup
+and offline `--check-config` validation. Restart nob after changing it.
+The new default is about 6 dB above the previous fixed 50 percent gain;
+prepare local audio with headroom. This affects only the soundboard track,
+so existing music volume stays unchanged.
 
 Discord's native join/leave notification is separate from the clip. The
 [supported voice API](https://docs.discord.com/developers/events/gateway-events#update-voice-state)

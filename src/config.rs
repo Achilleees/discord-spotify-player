@@ -15,6 +15,8 @@ pub struct Config {
     pub preamp_db: f32,
     pub bass_boost_db: f32,
     pub treble_boost_db: f32,
+    /// Soundboard track gain, normalized from a 0-100 percent setting.
+    pub soundboard_volume: f32,
     /// Base64 or hex 32-byte key for encrypting stored OAuth tokens at rest.
     /// When absent, tokens are stored unencrypted (with a startup warning).
     pub token_enc_key: Option<String>,
@@ -56,6 +58,17 @@ fn parse_id(key: &'static str, raw: &str) -> Result<u64, ConfigError> {
         return Err(ConfigError::Invalid(key));
     }
     Ok(id)
+}
+
+fn soundboard_volume(raw: Option<&str>) -> Result<f32, ConfigError> {
+    let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(1.0);
+    };
+    raw.parse::<f64>()
+        .ok()
+        .filter(|value| value.is_finite() && (0.0..=100.0).contains(value))
+        .map(|value| (value / 100.0) as f32)
+        .ok_or(ConfigError::Invalid("SOUNDBOARD_VOLUME_PERCENT"))
 }
 
 impl Config {
@@ -136,6 +149,7 @@ impl Config {
             preamp_db,
             bass_boost_db,
             treble_boost_db,
+            soundboard_volume: soundboard_volume(settings.get("SOUNDBOARD_VOLUME_PERCENT"))?,
             token_enc_key,
         })
     }
@@ -162,7 +176,30 @@ impl std::error::Error for ConfigError {}
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_id, parse_num, resolve_text_channel_id};
+    use super::{parse_id, parse_num, resolve_text_channel_id, soundboard_volume};
+
+    #[test]
+    fn soundboard_volume_defaults_and_percentages_are_validated() {
+        for raw in [None, Some(""), Some("  "), Some("100")] {
+            assert_eq!(soundboard_volume(raw).unwrap(), 1.0);
+        }
+        assert_eq!(soundboard_volume(Some("0")).unwrap(), 0.0);
+        assert_eq!(soundboard_volume(Some(" 75 ")).unwrap(), 0.75);
+        assert_eq!(soundboard_volume(Some("12.5")).unwrap(), 0.125);
+        for raw in [
+            "-1",
+            "-1e-100",
+            "100.000001",
+            "NaN",
+            "inf",
+            "-inf",
+            "1e999",
+            "loud",
+            "75%",
+        ] {
+            assert!(soundboard_volume(Some(raw)).is_err(), "{raw}");
+        }
+    }
 
     #[test]
     fn accepts_valid_snowflake() {

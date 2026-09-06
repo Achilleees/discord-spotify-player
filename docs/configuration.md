@@ -107,12 +107,21 @@ a different host layout.
 | Variable | Required | Default | What it does |
 |---|---|---|---|
 | `SOUNDBOARD_DIR` | no | `soundboard` beneath `STATE_DIR` (`.nob/soundboard` by default) | Local directory containing `catalogue.json` and the audio files for nob's private `/soundboard`. |
+| `SOUNDBOARD_VOLUME_PERCENT` | no | `100` | Soundboard clip gain from 0 to 100 percent; decimals such as `72.5` are accepted. `100` plays at full source level; `0` is silent. |
 
 Use the unprefixed key in `.env.nob`, or `NOB_SOUNDBOARD_DIR` as a process
 override. Relative paths resolve beneath the state directory; absolute paths
 stay absolute. Nob loads the catalogue at startup; restart after editing it.
 The soundboard needs `ffmpeg` on `PATH` independently of yt-dlp availability.
 It does not require a Spotify login.
+
+Set `SOUNDBOARD_VOLUME_PERCENT` in `.env.nob`, or use the process override
+`NOB_SOUNDBOARD_VOLUME_PERCENT`. Unset or blank values default to `100`.
+Malformed, non-finite or out-of-range values fail configuration validation,
+including `--check-config`. Restart nob after changing the setting.
+This gain applies only to soundboard tracks; music volume is unchanged.
+The default is about 6 dB louder than the previous fixed 50 percent gain.
+Master local audio with headroom so full source level remains comfortable.
 
 A missing directory or manifest gives an empty menu. A present invalid
 catalogue prevents nob startup. Limits are 128 entries, a 64 KiB manifest,

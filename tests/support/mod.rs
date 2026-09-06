@@ -50,6 +50,38 @@ pub fn check_host(binary: &str, nob: bool) {
         .success());
     assert!(!root.join("custom-state-must-not-exist").exists());
 
+    // Exercise the volume parser through both real hosts without connecting or
+    // creating state. Slightly over 100 must not round into the valid range.
+    for (volume, valid) in [
+        ("0", true),
+        ("37.5", true),
+        ("100", true),
+        ("NaN", false),
+        ("inf", false),
+        ("-inf", false),
+        ("-1", false),
+        ("100.000001", false),
+    ] {
+        fs::write(
+            root.join("volume.env"),
+            format!("DISCORD_TOKEN=test-only-never-connect\nDISCORD_GUILD_ID=1\nDISCORD_CHANNEL_ID=2\nSTATE_DIR=volume-state-must-not-exist\nSOUNDBOARD_VOLUME_PERCENT={volume}\n"),
+        )
+        .unwrap();
+        let output = command()
+            .args(["--env-file", "volume.env", "--check-config"])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.success(), valid, "volume case {volume}");
+        if valid {
+            assert!(String::from_utf8_lossy(&output.stdout)
+                .contains("no connection or state writes"));
+        } else {
+            assert!(String::from_utf8_lossy(&output.stderr)
+                .contains("SOUNDBOARD_VOLUME_PERCENT"));
+        }
+        assert!(!root.join("volume-state-must-not-exist").exists());
+    }
+
     // Both real entrypoints validate paired routing without binding sockets or
     // authenticating either Discord identity. All values here are synthetic.
     let base = "DISCORD_TOKEN=test-only-never-connect\nDISCORD_GUILD_ID=1\nDISCORD_CHANNEL_ID=2\nSTATE_DIR=paired-state-must-not-exist\n";

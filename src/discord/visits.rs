@@ -81,6 +81,7 @@ impl Handler {
             owner: self.voice_owner.clone(),
             lease,
             leaving: self.leaving_voice.clone(),
+            volume: self.config.soundboard_volume,
             track: None,
             cleaned: false,
         };
@@ -125,6 +126,7 @@ struct Visit {
     owner: Arc<VoiceOwner>,
     lease: VoiceLease,
     leaving: Arc<AtomicUsize>,
+    volume: f32,
     track: Option<TrackHandle>,
     cleaned: bool,
 }
@@ -209,7 +211,7 @@ impl Visit {
         let (result, mut finished) = watch::channel(None);
         let raw = RawAdapter::new(CursorSource(std::io::Cursor::new(bytes)), 44_100, 2);
         let mut track = Track::new(raw.into());
-        track.volume = 0.5;
+        track.volume = self.volume;
         for (event, success) in [(TrackEvent::End, true), (TrackEvent::Error, false)] {
             track.events.add_event(
                 EventData::new(

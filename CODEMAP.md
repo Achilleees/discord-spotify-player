@@ -24,7 +24,8 @@ src/
 ├── runtime.rs            profile/CLI, isolated env maps, resolved paths and
 │                         process-held state locks; no playback policy
 ├── config.rs             .env → Config: required Discord ids, audio tuning,
-│                         TOKEN_ENC_KEY; numeric parsing with warn-on-typo
+│                         TOKEN_ENC_KEY; numeric parsing with warn-on-typo,
+│                         strict soundboard volume percent → clip gain
 ├── setup.rs               `--setup` first-run wizard: prompts for the bot
 │                         token, picks guild/channel via the Discord API,
 │                         writes `.env`
@@ -168,7 +169,9 @@ src/
 - **Soundboard → temporary visit.** `discord::soundboard` validates private
   selections; `discord::visits` reserves an idle `VoiceOwner` lease and asks
   `soundboard::Catalogue` to decode one local clip. It uses a separate
-  Songbird track at 0.5 gain. Completion or cancellation stops only that track
+  Songbird track at `Config.soundboard_volume` gain, configured with
+  `SOUNDBOARD_VOLUME_PERCENT` (0–100, default 100). Completion or cancellation
+  stops only that track
   and removes only its still-owned connection; music can preempt the visit.
   It never inserts a queue item, overlays the music bridge or receives voice.
 - **Credentials.** `discord::account` reads/writes through `users::UserStore`,
@@ -193,7 +196,7 @@ of the suite:
   `src/discord/visits.rs` — private menu/page bounds, requester and revision
   checks, visit/music priority, stale cleanup and departure bookkeeping.
 - `src/config.rs` — env parsing (snowflake validation, numeric clamping,
-  text-channel fallback).
+  text-channel fallback, strict finite soundboard volume bounds).
 - `src/users/mod.rs`, `src/users/crypto.rs` — credential store CRUD,
   encryption roundtrip, plaintext-downgrade rejection, wrong-key handling.
 - `src/youtube/metadata.rs` — yt-dlp JSON mapping, duration cap, live-stream/
