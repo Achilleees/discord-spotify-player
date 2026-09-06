@@ -88,8 +88,10 @@ src/
 │   ├── mod.rs                yt-dlp/ffmpeg availability checks, tmp-dir/
 │   │                        cookies path resolution
 │   ├── metadata.rs            fetch_youtube_metadata via `yt-dlp --dump-json`;
-│   │                        duration cap, live-stream rejection, attachment
-│   │                        validation
+│   │                        bounded YouTube text-search results, duration
+│   │                        cap, live-stream rejection, attachment validation
+│   ├── probe.rs               shared metadata-only subprocess: concurrency
+│   │                        cap, timeout, kill-on-drop and bounded output
 │   └── feeder.rs               feed_youtube_to_bridge / feed_file_to_bridge:
 │                              spawn yt-dlp|ffmpeg, decode, push PCM into
 │                              AudioBridge, cancellable
@@ -102,11 +104,15 @@ src/
     │                          start_background
     ├── commands.rs              slash-command registration + dispatch:
     │                          voice-gate checks, /play /queue /skip /stop
-    │                          /np /announce, button routing
+    │                          /np /announce, button routing, shared track
+    │                          resolution/enqueue with post-lookup voice check
+    ├── search.rs                Add music modal, private result rendering,
+    │                          bounded owner/guild/expiry-checked single-use menus
     ├── account.rs                /login /logout /forget, device-code poll,
     │                          account-switch bookkeeping, boot auto-start
     ├── ui.rs                     one task owning the now-playing/controls
-    │                          card (UiMsg mailbox, one card_id)
+    │                          card (UiMsg mailbox, one card_id), cached pause/
+    │                          account state and periodic missing-card recovery
     ├── voice.rs                  SimpleBridgeReader (Songbird MediaSource,
     │                          prebuffers on first read), TrackErrorHandler
     └── presence.rs                run_presence_loop: renders PresenceUpdate

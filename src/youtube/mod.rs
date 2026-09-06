@@ -1,5 +1,6 @@
 pub mod metadata;
 pub mod feeder;
+mod probe;
 
 const DEFAULT_TMP_DIR: &str = "/tmp/spotibot-youtube";
 const DEFAULT_COOKIES: &str = "/var/lib/spotibot/youtube-cookies.txt";

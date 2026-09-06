@@ -30,8 +30,9 @@ The eventual project name is `never-off-beat`.
 
 The initial workspace member is the existing `discord-spotify-player`
 package. `src/main.rs` calls the library entry point in `src/lib.rs`; runtime
-modules stay in place and the executable path is retained. Nob's separate
-host and imported menus are subsequent work, tracked on the existing
+modules stay in place and the executable path is retained. The first imported
+UI adds search/link entry, private results and richer playback controls.
+Nob's separate host and remaining features are tracked on the existing
 `discord-spotify-player` board.
 
 ## Historical transfer dossier — superseded migration plan

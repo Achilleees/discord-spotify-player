@@ -26,6 +26,16 @@ use serenity::model::application::CommandOptionType;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
+pub(super) const PLAY_VOICE_REQUIRED: &str =
+    "Join a voice channel first (or the bot's channel if it's already in one) to add music.";
+
+struct TrackRequest {
+    url: Option<String>,
+    attachment: Option<serenity::all::Attachment>,
+    next: bool,
+    start_if_idle: bool,
+}
+
 pub(super) fn register_commands(ytdlp_available: bool) -> Vec<CreateCommand> {
     let mut cmds = vec![
         CreateCommand::new("login")
@@ -254,8 +264,8 @@ fn command_drives_playback(name: &str) -> bool {
 }
 
 /// Commands that change the queue without touching audio. These take the
-/// looser gate — the caller must be in a voice channel, but not necessarily
-/// the bot's, because the bot may be in none.
+/// follow gate: share the bot's channel when connected, or be in any voice
+/// channel while the bot is out of voice.
 ///
 /// `/clear` is here rather than above for a reason `/stop` creates: `/stop`
 /// leaves the channel and its reply says the queue survived and to use
@@ -267,7 +277,7 @@ fn command_mutates_queue(name: &str) -> bool {
 
 /// The button equivalents of [`command_drives_playback`].
 fn button_drives_playback(custom_id: &str) -> bool {
-    matches!(custom_id, "ctrl_prev" | "ctrl_next" | "ctrl_pause_toggle")
+    matches!(custom_id, "ctrl_prev" | "ctrl_next" | "ctrl_pause_toggle" | "ctrl_stop")
 }
 
 /// The button equivalents of [`command_mutates_queue`]. The queue-hint
@@ -297,13 +307,28 @@ fn render_now_playing(now: &NowPlaying) -> String {
 
 impl Handler {
     pub(super) async fn dispatch_interaction(&self, ctx: Context, interaction: Interaction) {
+        if let Interaction::Modal(modal) = &interaction {
+            self.handle_music_modal(&ctx, modal).await;
+            return;
+        }
         if let Interaction::Component(component) = &interaction {
+            if component.guild_id != Some(self.guild_id) { return; }
             let custom_id = component.data.custom_id.as_str();
+            if custom_id == "ctrl_add_music" {
+                self.open_music_modal(&ctx, component).await;
+                return;
+            }
+            if custom_id.starts_with("music_pick:") {
+                self.handle_music_pick(&ctx, component).await;
+                return;
+            }
             tracing::debug!(custom_id, "button interaction received");
 
             // The clear confirmation is gated in its own right: a user can
             // leave voice between raising the prompt and pressing the button.
-            let allowed = if button_drives_playback(custom_id) {
+            let allowed = if custom_id == "ctrl_play" {
+                self.user_can_play(&ctx, component.user.id)
+            } else if button_drives_playback(custom_id) {
                 self.user_in_bot_voice_channel(&ctx, component.user.id)
             } else if button_mutates_queue(custom_id) {
                 self.user_in_any_voice_channel(&ctx, component.user.id)
@@ -313,7 +338,9 @@ impl Handler {
             if !allowed {
                 let response = CreateInteractionResponse::Message(
                     CreateInteractionResponseMessage::new()
-                        .content(if button_drives_playback(custom_id) {
+                        .content(if custom_id == "ctrl_play" {
+                            PLAY_VOICE_REQUIRED
+                        } else if button_drives_playback(custom_id) {
                             "You must be in the bot's voice channel to control playback."
                         } else {
                             "You must be in a voice channel to change the queue."
@@ -328,8 +355,16 @@ impl Handler {
             // line of text for the ephemeral reply below.
             match custom_id {
                 "ctrl_queue_hint" => {
+                    if component.defer_ephemeral(&ctx).await.is_err() { return; }
                     let content = self.format_queue_listing().await;
-                    respond_ephemeral(&ctx, component, content).await;
+                    let _ = component.edit_response(&ctx, EditInteractionResponse::new()
+                        .content(super::ui::clipped(&content, 1900))).await;
+                    return;
+                }
+                "ctrl_history" => {
+                    if component.defer_ephemeral(&ctx).await.is_err() { return; }
+                    let content = self.handle_history(10).await;
+                    let _ = component.edit_response(&ctx, EditInteractionResponse::new().content(content)).await;
                     return;
                 }
                 // Both halves of the clear prompt replace the prompt itself
@@ -352,10 +387,12 @@ impl Handler {
             }
 
             let reply_content: String = match custom_id {
+                "ctrl_play" => self.player.play().await,
                 "ctrl_prev" => self.player.previous().await,
                 // Same semantics as /skip: the actor cancels the current
                 // media item or advances whatever the queue head says.
                 "ctrl_next" => self.player.skip().await,
+                "ctrl_stop" => self.player.stop().await,
                 // ⏯: the actor pauses/resumes the active media item, pauses
                 // a playing baseline, or starts/resumes whatever is next.
                 "ctrl_pause_toggle" => self.player.toggle_pause().await,
@@ -372,6 +409,7 @@ impl Handler {
             None => { tracing::warn!("interaction was not a command or component"); return; }
         };
         tracing::debug!(command = %cmd.data.name, "processing slash command");
+        if cmd.guild_id != Some(self.guild_id) { return; }
 
         let user_id = cmd.user.id.to_string();
         let user_id_u64 = cmd.user.id.get();
@@ -552,7 +590,7 @@ impl Handler {
             lines.push("Use `/queue <spotify_url>` to add Spotify tracks.".to_string());
         }
         if self.ytdlp_available {
-            lines.push("Use `/play <youtube_url>` to add YouTube tracks.".to_string());
+            lines.push("Use **Add music** to search or paste a track link.".to_string());
         }
         lines.push(render_now_playing(&snap.now));
         if snap.queue_len > 0 {
@@ -584,7 +622,7 @@ impl Handler {
     /// Whether a user may queue via /play: if the bot is already in a channel,
     /// they must share it (the control rule); if the bot is in no channel yet,
     /// they only need to be in one so the bot can follow them in.
-    fn user_can_play(&self, ctx: &Context, user_id: UserId) -> bool {
+    pub(super) fn user_can_play(&self, ctx: &Context, user_id: UserId) -> bool {
         let (bot_ch, user_ch) = self.voice_channels(ctx, user_id);
         voice_gate(bot_ch, user_ch, true)
     }
@@ -646,155 +684,103 @@ impl Handler {
         }
     }
 
+    /// One resolver/enqueue path for slash commands, link modals and search
+    /// selections. Slow lookup never carries an old voice authorization into
+    /// the eventual mutation.
+    async fn add_track(&self, ctx: &Context, user: &serenity::all::User, request: TrackRequest) -> String {
+        let allowed = || if request.start_if_idle {
+            self.user_can_play(ctx, user.id)
+        } else {
+            self.user_in_bot_voice_channel(ctx, user.id)
+        };
+        if !allowed() { return PLAY_VOICE_REQUIRED.into(); }
+        let discord_name = user.global_name.clone().unwrap_or_else(|| user.name.clone());
+        let spotify = request.url.as_deref().map(classify_link);
+        let item = if let Some(LinkKind::Spotify(uri)) = spotify {
+            match self.supervisor.ensure_session(&self.oauth, &self.user_store).await {
+                EnsureOutcome::NoAccount => return "No Spotify account is connected — someone needs to run `/login`.".into(),
+                EnsureOutcome::Failed(reason) => {
+                    tracing::warn!(error = %reason, "ensure_session failed for track request");
+                    return "⚠️ Couldn't reach Spotify — try again in a moment.".into();
+                }
+                EnsureOutcome::Ready(_) => {}
+            }
+            let Some((title, artist, album_art_url)) = self.player.lookup_spotify(&uri).await else {
+                return "⚠️ Couldn't find that Spotify track — check the link.".into();
+            };
+            QueueItem::new(MediaSource::Spotify { uri, title, artist, album_art_url }, discord_name, user.id.get())
+        } else {
+            if !self.ytdlp_available && (request.url.is_some() || request.start_if_idle) {
+                return "YouTube, SoundCloud and file playback are unavailable on this bot.".into();
+            }
+            match Self::build_media_queue_item(request.url, request.attachment, &discord_name, user.id.get()).await {
+                Ok(item) => item,
+                Err(error) => return format!("❌ {error}"),
+            }
+        };
+        let pos = if request.next {
+            // Preserve /play next:true behavior around a Spotify head that
+            // has already been committed to the external device queue.
+            if matches!(item.source, MediaSource::Spotify { .. })
+                && self.player.query().await.preview.first().is_some_and(|entry| entry.armed)
+            {
+                EnqueuePos::At(1)
+            } else {
+                EnqueuePos::Head
+            }
+        } else {
+            EnqueuePos::Tail
+        };
+        if !allowed() { return PLAY_VOICE_REQUIRED.into(); }
+        self.player.enqueue(item, pos, request.start_if_idle).await
+    }
+
+    pub(super) async fn play_link(&self, ctx: &Context, user: &serenity::all::User, url: String) -> String {
+        self.add_track(ctx, user, TrackRequest { url: Some(url), attachment: None, next: false, start_if_idle: true }).await
+    }
+
+    pub(super) fn media_lookup_on_cooldown(&self, user: UserId) -> bool {
+        const COOLDOWN: std::time::Duration = std::time::Duration::from_secs(3);
+        let now = Instant::now();
+        let mut cooldowns = self.play_cooldowns.lock();
+        cooldowns.retain(|_, last| now.saturating_duration_since(*last) < COOLDOWN);
+        if cooldowns.contains_key(&user.get()) || cooldowns.len() >= 128 {
+            return true;
+        }
+        cooldowns.insert(user.get(), now);
+        false
+    }
+
     async fn handle_play(
         &self,
         cmd: &serenity::model::application::CommandInteraction,
         ctx: &Context,
     ) {
-        let (url_arg, attachment_arg, next) = Self::parse_play_queue_options(cmd);
-
-        if url_arg.is_none() && attachment_arg.is_none() {
-            // Bare `/play` is ▶: start whatever is up when nothing is
-            // audible. It never pauses — with something playing it asks
-            // for a link, so a fat-fingered `/play` can't cut the music.
+        let (url, attachment, next) = Self::parse_play_queue_options(cmd);
+        if url.is_none() && attachment.is_none() {
             let text = self.player.play().await;
             let _ = cmd.create_response(ctx, CreateInteractionResponse::Message(
                 CreateInteractionResponseMessage::new().content(text).ephemeral(true)
             )).await;
             return;
         }
-        if url_arg.is_some() && attachment_arg.is_some() {
+        if url.is_some() && attachment.is_some() {
             let _ = cmd.create_response(ctx, CreateInteractionResponse::Message(
-                CreateInteractionResponseMessage::new()
-                    .content("❌ Provide either a URL or a file, not both.")
-                    .ephemeral(true)
+                CreateInteractionResponseMessage::new().content("❌ Provide either a URL or a file, not both.").ephemeral(true)
             )).await;
             return;
         }
-
-        let discord_name = cmd.user.global_name.clone().unwrap_or_else(|| cmd.user.name.clone());
-        let discord_id = cmd.user.id.get();
-
-        // Spotify track link: no yt-dlp probe, but `ensure_session` below
-        // can wait up to 15s for a session to come up, which blows
-        // Discord's 3s window — defer first, exactly like the media path
-        // below. Metadata resolves here in the handler task (never inside
-        // the actor); the actor then owns the enqueue-and-maybe-start
-        // decision and the reply.
-        if let Some(url) = &url_arg {
-            if let LinkKind::Spotify(spotify_uri) = classify_link(url) {
-                let _ = cmd.create_response(ctx, CreateInteractionResponse::Defer(
-                    CreateInteractionResponseMessage::new().ephemeral(true)
-                )).await;
-
-                let reply = match self.supervisor.ensure_session(&self.oauth, &self.user_store).await {
-                    EnsureOutcome::NoAccount => {
-                        "No Spotify account is connected — someone needs to run `/login`.".to_string()
-                    }
-                    EnsureOutcome::Failed(reason) => {
-                        tracing::warn!(error = %reason, "ensure_session failed for /play");
-                        "⚠️ Couldn't reach Spotify — try again in a moment.".to_string()
-                    }
-                    EnsureOutcome::Ready(_gen) => match self.player.lookup_spotify(&spotify_uri).await {
-                        None => "⚠️ Couldn't find that Spotify track — check the link.".to_string(),
-                        Some((title, artist, album_art_url)) => {
-                            let item = QueueItem {
-                                item_id: 0,
-                                source: MediaSource::Spotify { uri: spotify_uri, title, artist, album_art_url },
-                                queued_by: discord_name.clone(),
-                                queued_by_id: discord_id,
-                            };
-                            let pos = if next {
-                                // An armed head is already on Spotify's own
-                                // device queue and can't be un-queued — a
-                                // "next" item lands right behind it instead
-                                // of jumping it, so the listing matches the
-                                // air order.
-                                let head_armed = self
-                                    .player
-                                    .query()
-                                    .await
-                                    .preview
-                                    .first()
-                                    .is_some_and(|entry| entry.armed);
-                                if head_armed { EnqueuePos::At(1) } else { EnqueuePos::Head }
-                            } else {
-                                EnqueuePos::Tail
-                            };
-                            self.player.enqueue(item, pos, true).await
-                        }
-                    },
-                };
-                let _ = cmd.edit_response(ctx, EditInteractionResponse::new().content(reply)).await;
-                return;
-            }
-        }
-
-        if !self.ytdlp_available {
+        let spotify = url.as_deref().is_some_and(|s| matches!(classify_link(s), LinkKind::Spotify(_)));
+        if !spotify && self.media_lookup_on_cooldown(cmd.user.id) {
             let _ = cmd.create_response(ctx, CreateInteractionResponse::Message(
-                CreateInteractionResponseMessage::new()
-                    .content("❌ YouTube playback is not available (yt-dlp not installed).")
-                    .ephemeral(true)
+                CreateInteractionResponseMessage::new().content("⏳ Try again in a few seconds.").ephemeral(true)
             )).await;
             return;
         }
-
-        // Per-user cooldown ahead of the metadata probe: every /play spawns a
-        // yt-dlp subprocess before the queue cap applies, so rapid calls
-        // would otherwise drive unbounded process pressure.
-        const PLAY_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(3);
-        let on_cooldown = {
-            let now = Instant::now();
-            let mut lock = self.play_cooldowns.lock();
-            match lock.get(&cmd.user.id.get()) {
-                Some(last) if now.duration_since(*last) < PLAY_COOLDOWN => true,
-                _ => {
-                    lock.insert(cmd.user.id.get(), now);
-                    false
-                }
-            }
-        };
-        if on_cooldown {
-            let _ = cmd.create_response(ctx, CreateInteractionResponse::Message(
-                CreateInteractionResponseMessage::new()
-                    .content("⏳ One /play at a time — try again in a few seconds.")
-                    .ephemeral(true)
-            )).await;
-            return;
-        }
-
-        // Defer response
-        let _ = cmd.create_response(ctx, CreateInteractionResponse::Defer(
-            CreateInteractionResponseMessage::new().ephemeral(true)
-        )).await;
-
-        let queue_item = match Self::build_media_queue_item(url_arg, attachment_arg, &discord_name, discord_id).await {
-            Ok(item) => item,
-            Err(e) => {
-                let _ = cmd.edit_response(ctx, EditInteractionResponse::new()
-                    .content(format!("❌ {}", e))
-                ).await;
-                return;
-            }
-        };
-
-        // The actor owns the enqueue-and-maybe-start decision from here: it
-        // pushes into its owned queue, starts the head when nothing holds
-        // the turn, and formats the reply.
-        let reply = self
-            .player
-            .enqueue(
-                queue_item,
-                if next { EnqueuePos::Head } else { EnqueuePos::Tail },
-                true,
-            )
-            .await;
-
-        let _ = cmd.edit_response(ctx, EditInteractionResponse::new()
-            .content(reply)
-        ).await;
+        if cmd.defer_ephemeral(ctx).await.is_err() { return; }
+        let reply = self.add_track(ctx, &cmd.user, TrackRequest { url, attachment, next, start_if_idle: true }).await;
+        let _ = cmd.edit_response(ctx, EditInteractionResponse::new().content(super::ui::clipped(&reply, 1900))).await;
     }
-
     /// The last `count` tracks that actually aired, newest first. Requests
     /// name whoever asked for them; the DJ's own playlist tracks don't, so
     /// the two are told apart at a glance.
@@ -854,100 +840,22 @@ impl Handler {
         cmd: &serenity::model::application::CommandInteraction,
         ctx: &Context,
     ) {
-        let (url_arg, attachment_arg, _next) = Self::parse_play_queue_options(cmd);
-
-        if url_arg.is_none() && attachment_arg.is_none() {
-            let content = self.format_queue_listing().await;
+        let (url, attachment, _next) = Self::parse_play_queue_options(cmd);
+        if url.is_some() && attachment.is_some() {
             let _ = cmd.create_response(ctx, CreateInteractionResponse::Message(
-                CreateInteractionResponseMessage::new().content(content).ephemeral(true)
+                CreateInteractionResponseMessage::new().content("❌ Provide either a URL or a file, not both.").ephemeral(true)
             )).await;
             return;
         }
-        if url_arg.is_some() && attachment_arg.is_some() {
-            let _ = cmd.create_response(ctx, CreateInteractionResponse::Message(
-                CreateInteractionResponseMessage::new()
-                    .content("❌ Provide either a URL or a file, not both.")
-                    .ephemeral(true)
-            )).await;
-            return;
-        }
-
-        let discord_name = cmd.user.global_name.clone().unwrap_or_else(|| cmd.user.name.clone());
-        let discord_id = cmd.user.id.get();
-
-        // Spotify track link: no yt-dlp probe, but `ensure_session` below
-        // can wait up to 15s for a session to come up, which blows
-        // Discord's 3s window — defer first, exactly like the media path
-        // below. Metadata resolves here in the handler task (never inside
-        // the actor); the actor owns the tail push and the reply, with
-        // `start_if_idle` off.
-        if let Some(url) = &url_arg {
-            if let LinkKind::Spotify(spotify_uri) = classify_link(url) {
-                let _ = cmd.create_response(ctx, CreateInteractionResponse::Defer(
-                    CreateInteractionResponseMessage::new().ephemeral(true)
-                )).await;
-
-                let reply = match self.supervisor.ensure_session(&self.oauth, &self.user_store).await {
-                    EnsureOutcome::NoAccount => {
-                        "No Spotify account is connected — someone needs to run `/login`.".to_string()
-                    }
-                    EnsureOutcome::Failed(reason) => {
-                        tracing::warn!(error = %reason, "ensure_session failed for /queue");
-                        "⚠️ Couldn't reach Spotify — try again in a moment.".to_string()
-                    }
-                    EnsureOutcome::Ready(_gen) => match self.player.lookup_spotify(&spotify_uri).await {
-                        None => "⚠️ Couldn't find that Spotify track — check the link.".to_string(),
-                        Some((title, artist, album_art_url)) => {
-                            let item = QueueItem {
-                                item_id: 0,
-                                source: MediaSource::Spotify { uri: spotify_uri, title, artist, album_art_url },
-                                queued_by: discord_name.clone(),
-                                queued_by_id: discord_id,
-                            };
-                            self.player.enqueue(item, EnqueuePos::Tail, false).await
-                        }
-                    },
-                };
-                let _ = cmd.edit_response(ctx, EditInteractionResponse::new().content(reply)).await;
-                return;
-            }
-        }
-
-        // YouTube/SoundCloud URL, or a file attachment: goes on the queue's
-        // tail via the same metadata probe /play uses.
-        if url_arg.is_some() && !self.ytdlp_available {
-            let _ = cmd.create_response(ctx, CreateInteractionResponse::Message(
-                CreateInteractionResponseMessage::new()
-                    .content("❌ YouTube playback is not available (yt-dlp not installed).")
-                    .ephemeral(true)
-            )).await;
-            return;
-        }
-
-        let _ = cmd.create_response(ctx, CreateInteractionResponse::Defer(
-            CreateInteractionResponseMessage::new().ephemeral(true)
-        )).await;
-
-        let queue_item = match Self::build_media_queue_item(url_arg, attachment_arg, &discord_name, discord_id).await {
-            Ok(item) => item,
-            Err(e) => {
-                let _ = cmd.edit_response(ctx, EditInteractionResponse::new()
-                    .content(format!("❌ {}", e))
-                ).await;
-                return;
-            }
+        if cmd.defer_ephemeral(ctx).await.is_err() { return; }
+        let reply = if url.is_none() && attachment.is_none() {
+            self.format_queue_listing().await
+        } else {
+            self.add_track(ctx, &cmd.user, TrackRequest { url, attachment, next: false, start_if_idle: false }).await
         };
-
-        // `/queue` never starts playback: the actor pushes to the tail and
-        // formats the reply, with `start_if_idle` off.
-        let reply = self.player.enqueue(queue_item, EnqueuePos::Tail, false).await;
-
-        let _ = cmd.edit_response(ctx, EditInteractionResponse::new()
-            .content(reply)
-        ).await;
+        let _ = cmd.edit_response(ctx, EditInteractionResponse::new().content(super::ui::clipped(&reply, 1900))).await;
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1065,7 +973,7 @@ mod tests {
 
     #[test]
     fn the_buttons_split_the_same_way_as_the_commands() {
-        for playback in ["ctrl_prev", "ctrl_next", "ctrl_pause_toggle"] {
+        for playback in ["ctrl_prev", "ctrl_next", "ctrl_pause_toggle", "ctrl_stop"] {
             assert!(button_drives_playback(playback));
             assert!(!button_mutates_queue(playback), "never both");
         }

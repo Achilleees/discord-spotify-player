@@ -1,5 +1,18 @@
 # Troubleshooting
 
+## Playback card or search choices are missing
+
+The card appears in `TEXT_CHANNEL_ID`; when unset, it uses the configured
+voice channel's text chat. Check that destination and the bot's permission
+to view it and send messages/embeds. A deleted card is normally recreated
+within 30 seconds. Posting/refresh failures are logged by the UI task.
+
+Search choices are private to the requester, expire after five minutes and
+accept one selection. Use **Add music** to open fresh choices. A busy lookup
+or timeout means retrying the request; lookups share a three-process limit
+and a 30-second deadline. Text search requires yt-dlp and ffmpeg, while
+Spotify links need a connected Spotify account.
+
 ## Bot doesn't show up in Spotify's device list
 
 **Cause:** no Spotify session is running for any user, or the session hasn't

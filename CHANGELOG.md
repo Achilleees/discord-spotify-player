@@ -10,6 +10,13 @@ git tag (release) in this repository.
 
 ## Unreleased
 
+**Add music directly from the playback card.** Search YouTube by song or
+artist, choose from private results, or paste a Spotify/YouTube/SoundCloud
+track link. The richer card adds labeled playback, Stop, Queue and History
+controls, keeps pause state through account changes and recovers if deleted.
+Idle search works without a Spotify login. Lookups are bounded, result menus
+expire and voice membership is rechecked before a track is added.
+
 **Spotibot and nob now have a shared development foundation.** The repository
 is a Cargo workspace, with the existing music runtime behind a library entry
 point and the same executable and setup flow. CI checks the whole workspace

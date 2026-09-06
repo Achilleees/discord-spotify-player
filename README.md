@@ -7,9 +7,10 @@ strict order, like a radio. Control from any Spotify client or from slash
 commands and now-playing buttons in Discord.
 
 This repo is becoming the shared home for **Spotibot and nob**, continuing
-Spotibot's Git history. The first step establishes a Cargo workspace and a
-library behind the existing binary. Nob's richer menus and server features
-will be adapted into this foundation; the two bots will run as separate
+Spotibot's Git history. A Cargo workspace and library sit behind the existing
+binary, and the playback card now offers an **Add music** search/link menu
+with private results. Further nob menus and server features will be adapted
+into this foundation; the two bots will run as separate
 processes. The eventual project name is `never-off-beat`; see the accepted
 direction in [docs/PORT.md](docs/PORT.md).
 

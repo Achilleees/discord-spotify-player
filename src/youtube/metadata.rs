@@ -16,6 +16,14 @@ pub struct YoutubeMetadata {
 
 #[derive(Debug, thiserror::Error)]
 pub enum YoutubeError {
+    #[error("Music lookup is busy — try again in a moment.")]
+    Busy,
+    #[error("Music lookup took too long — try again.")]
+    Timeout,
+    #[error("That lookup returned too much data — try a different track.")]
+    ResponseTooLarge,
+    #[error("Enter a song or artist name (up to 200 characters).")]
+    InvalidQuery,
     #[error("Only Spotify track, YouTube and SoundCloud links are supported.")]
     UnsupportedUrl,
     #[error("Couldn't find a track at that URL.")]
@@ -56,6 +64,68 @@ struct YtDlpJson {
     webpage_url: Option<String>,
     #[serde(default)]
     is_live: Option<bool>,
+    #[serde(default)]
+    live_status: Option<String>,
+}
+
+pub const SEARCH_RESULTS: usize = 5;
+
+/// A discovery result, not authorization to play. Selection resolves the
+/// canonical URL again to enforce the full media policy at enqueue time.
+#[derive(Debug, Clone)]
+pub struct YoutubeSearchResult {
+    pub url: String,
+    pub title: String,
+    pub channel: String,
+    pub duration_secs: Option<u64>,
+}
+
+fn search_input(query: &str) -> Result<String, YoutubeError> {
+    let query = query.trim();
+    if query.is_empty() || query.chars().count() > 200 || query.chars().any(char::is_control) {
+        return Err(YoutubeError::InvalidQuery);
+    }
+    // Always construct the extractor prefix locally. User text can never
+    // select another extractor, change the result limit or become CLI flags.
+    Ok(format!("ytsearch{SEARCH_RESULTS}:{query}"))
+}
+
+fn search_results_from_json(output: &str, max_secs: u64) -> Vec<YoutubeSearchResult> {
+    let mut results = Vec::new();
+    for line in output.lines().take(20) {
+        let Ok(raw) = serde_json::from_str::<YtDlpJson>(line) else { continue };
+        if raw.id.len() != 11
+            || !raw.id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+            || raw.title.trim().is_empty()
+            || raw.is_live == Some(true)
+            || matches!(raw.live_status.as_deref(), Some("is_live" | "is_upcoming"))
+            || raw.duration.is_some_and(|d| !d.is_finite() || d < 0.0 || d > max_secs as f64)
+        {
+            continue;
+        }
+        // Do not trust a result's arbitrary `url`/`webpage_url` as a playback
+        // destination. ytsearch names YouTube videos; construct that URL.
+        let url = format!("https://www.youtube.com/watch?v={}", raw.id);
+        if results.iter().any(|r: &YoutubeSearchResult| r.url == url) {
+            continue;
+        }
+        results.push(YoutubeSearchResult {
+            url,
+            title: raw.title.chars().take(240).collect(),
+            channel: raw.channel.or(raw.uploader).unwrap_or_else(|| "Unknown artist".into())
+                .chars().take(80).collect(),
+            duration_secs: raw.duration.map(|d| d as u64),
+        });
+        if results.len() == SEARCH_RESULTS { break; }
+    }
+    results
+}
+
+pub async fn search_youtube(query: &str) -> Result<Vec<YoutubeSearchResult>, YoutubeError> {
+    let input = search_input(query)?;
+    let output = super::probe::run(&input).await?;
+    let max = resolve_max_duration_secs(std::env::var("YOUTUBE_MAX_DURATION_SECS").ok().as_deref());
+    Ok(search_results_from_json(&output, max))
 }
 
 /// Validate a /play URL before it reaches yt-dlp: https-only and an
@@ -86,19 +156,11 @@ pub fn validate_play_url(input: &str) -> Result<String, YoutubeError> {
     }
 }
 
-/// Concurrent yt-dlp probe cap: each /play spawns a subprocess (network
-/// fetch and JSON parse) before the queue cap applies, so without a bound a
-/// rapid caller drives unbounded CPU/PID pressure on the shared VPS.
-fn probe_permits() -> &'static tokio::sync::Semaphore {
-    static PERMITS: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
-    PERMITS.get_or_init(|| tokio::sync::Semaphore::new(3))
-}
-
-/// Classify a failed yt-dlp probe from its stderr. The raw stderr is logged
-/// server-side by the caller; the returned error is user-facing, so the
+/// Classify a failed yt-dlp probe from its stderr. The returned error is
+/// user-facing, so the
 /// fallback is deliberately generic — cookie paths and extractor internals
 /// must not reach the requester.
-fn classify_ytdlp_stderr(stderr: &str) -> YoutubeError {
+pub(super) fn classify_ytdlp_stderr(stderr: &str) -> YoutubeError {
     let s = stderr.to_lowercase();
     if s.contains("age") && (s.contains("sign in") || s.contains("confirm your age")) {
         return YoutubeError::AgeRestricted;
@@ -129,7 +191,10 @@ fn metadata_from_json(first_line: &str, max_secs: u64) -> Result<YoutubeMetadata
     let raw: YtDlpJson =
         serde_json::from_str(first_line).map_err(|e| YoutubeError::Parse(e.to_string()))?;
 
-    if raw.is_live == Some(true) || raw.duration.is_none() {
+    if raw.is_live == Some(true)
+        || matches!(raw.live_status.as_deref(), Some("is_live" | "is_upcoming"))
+        || raw.duration.is_none()
+    {
         return Err(YoutubeError::LiveStream);
     }
 
@@ -166,32 +231,7 @@ fn metadata_from_json(first_line: &str, max_secs: u64) -> Result<YoutubeMetadata
 /// Run `yt-dlp --dump-json <url>` and parse the result (metadata only, no download).
 pub async fn fetch_youtube_metadata(url: &str) -> Result<YoutubeMetadata, YoutubeError> {
     let url = validate_play_url(url)?;
-    let url = url.as_str();
-    let _permit = probe_permits()
-        .acquire()
-        .await
-        .expect("probe semaphore is never closed");
-    let cookies_path = crate::youtube::cookies_path();
-    let mut args = vec!["--dump-json", "--no-playlist", "--flat-playlist", "--remote-components", "ejs:github"];
-    if std::path::Path::new(&cookies_path).exists() {
-        args.extend(["--cookies", &cookies_path]);
-    }
-    // `--` terminates option parsing so a `-`-leading URL can't be a flag.
-    args.push("--");
-    args.push(url);
-    let output = tokio::process::Command::new("yt-dlp")
-        .args(&args)
-        .output()
-        .await
-        .map_err(|e| YoutubeError::Network(e.to_string()))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        tracing::warn!(stderr = %stderr, "yt-dlp failed");
-        return Err(classify_ytdlp_stderr(&stderr));
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = super::probe::run(&url).await?;
     let first_line = stdout.lines().next().unwrap_or("");
     let max =
         resolve_max_duration_secs(std::env::var("YOUTUBE_MAX_DURATION_SECS").ok().as_deref());
@@ -218,6 +258,52 @@ pub fn validate_attachment(filename: &str, size_bytes: u64) -> Result<String, Yo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn search_row(id: &str, duration: Option<f64>) -> serde_json::Value {
+        serde_json::json!({"id": id, "title": "A track", "uploader": "An artist", "duration": duration})
+    }
+
+    #[test]
+    fn search_cannot_change_the_extractor_or_result_limit() {
+        assert_eq!(search_input("  --exec echo  ").unwrap(), "ytsearch5:--exec echo");
+        assert_eq!(search_input("ytsearch999:track").unwrap(), "ytsearch5:ytsearch999:track");
+        assert!(search_input(" \t ").is_err());
+        assert!(search_input("one\ntwo").is_err());
+        assert!(search_input(&"x".repeat(201)).is_err());
+    }
+
+    #[test]
+    fn search_skips_bad_live_and_long_results_without_losing_valid_choices() {
+        let mut live = search_row("bbbbbbbbbbb", Some(10.0));
+        live["live_status"] = "is_live".into();
+        let mut destination = search_row("ddddddddddd", None);
+        destination["webpage_url"] = "https://127.0.0.1/private".into();
+        let lines = [
+            "not JSON".into(), search_row("bad/id", Some(10.0)).to_string(),
+            live.to_string(), search_row("ccccccccccc", Some(999.0)).to_string(),
+            destination.to_string(), search_row("aaaaaaaaaaa", Some(123.0)).to_string(),
+            search_row("aaaaaaaaaaa", Some(123.0)).to_string(),
+        ].join("\n");
+        let results = search_results_from_json(&lines, 180);
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].url, "https://www.youtube.com/watch?v=ddddddddddd");
+        assert_eq!(results[0].duration_secs, None);
+        assert_eq!(results[1].channel, "An artist");
+        assert_eq!(results[1].duration_secs, Some(123));
+    }
+
+    #[test]
+    fn search_caps_the_number_and_size_of_choices() {
+        let lines = (0..10).map(|i| {
+            let mut row = search_row(&format!("test{i:07}"), Some(20.0));
+            row["title"] = "🎵".repeat(1000).into();
+            row["channel"] = "x".repeat(500).into();
+            row.to_string()
+        }).collect::<Vec<_>>().join("\n");
+        let results = search_results_from_json(&lines, 180);
+        assert_eq!(results.len(), 5);
+        assert!(results.iter().all(|r| r.title.chars().count() <= 240 && r.channel.len() <= 80));
+    }
 
     // --- validate_play_url: the SSRF gate in front of yt-dlp ---
 

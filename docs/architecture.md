@@ -10,8 +10,9 @@ modules. The executable name, setup flow and configuration paths are retained.
 This is the foundation for two bot hosts sharing music code. Each identity
 will run in a separate process with its own configuration, database, caches
 and Spotify device identity. The current library entry point initializes
-process-global logging and is called once per process. The separate nob host
-and adapted UI/server features are subsequent slices; see [PORT.md](PORT.md).
+process-global logging and is called once per process. The initial imported
+UI adds private search/link interactions through the existing player handle.
+The separate nob host and remaining features follow; see [PORT.md](PORT.md).
 
 ## Audio pipeline
 

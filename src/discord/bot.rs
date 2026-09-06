@@ -95,6 +95,7 @@ pub(super) struct Handler {
     pub(super) announce_enabled: Arc<AtomicBool>,
     /// Last /play per user, for the metadata-probe cooldown.
     pub(super) play_cooldowns: Arc<Mutex<HashMap<u64, Instant>>>,
+    pub(super) search_menus: Mutex<super::search::SearchMenus>,
     auto_start_attempted: AtomicBool,
 }
 
@@ -340,7 +341,7 @@ impl EventHandler for Handler {
             // runs before it drains its mailbox, so sends queued below by
             // auto_start_stored_session can never race ahead of it — see
             // `ui::run`.
-            let tx = ui::spawn(ctx.clone(), self.text_channel_id);
+            let tx = ui::spawn(ctx.clone(), self.text_channel_id, self.ytdlp_available);
             *self.ui_tx.lock() = Some(tx);
         }
 
@@ -704,6 +705,7 @@ impl DiscordBot {
             ytdlp_available,
             announce_enabled,
             play_cooldowns: Arc::new(Mutex::new(HashMap::new())),
+            search_menus: Mutex::new(super::search::SearchMenus::default()),
             auto_start_attempted: AtomicBool::new(false),
         };
 

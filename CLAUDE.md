@@ -61,8 +61,8 @@ against Spotify's desktop client id.
 
 The root package is the first Cargo workspace member. `src/main.rs` owns the
 Tokio runtime and calls `discord_spotify_player::run()` in `src/lib.rs`, which
-owns startup and the private runtime modules. This is the first extraction;
-nob's separate host and imported menus are subsequent work. Run each identity
+owns startup and the private runtime modules. The first imported UI adds
+private search/link entry; nob's separate host and remaining features follow. Run each identity
 in its own process with independent configuration, database and caches.
 
 ### Audio pipeline
@@ -126,6 +126,12 @@ Spotify / YouTube / files / DJ ─> AudioBridge ─> SimpleBridgeReader ─> Son
   Both the Spotify baseline and the queue post through its mailbox (`UiMsg`)
   rather than touching the channel directly, so the two playback sources can
   never race each other's post/delete.
+- That owner caches the desired card/account/pause state and refreshes every
+  30 seconds, recreating only a confirmed missing message. Search menus live
+  in `discord/search.rs`: bounded, private, owner/guild checked, expiring and
+  single-use. Slash and menu track requests share `commands::add_track`,
+  which rechecks voice after metadata work. `youtube/probe.rs` bounds both
+  text search and link probes by concurrency, output size and time.
 
 ## Dependency gotchas
 - songbird is the crates.io release with native DAVE — not the git fork.

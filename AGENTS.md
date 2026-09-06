@@ -91,10 +91,11 @@ go in the gitignored `.local/`, not `docs/`.
   don't add others.
 
 ## Authorization
-- Controlling playback (buttons, `/play`, `/queue`, `/skip`, `/stop`, session
-  takeover) requires sharing the bot's voice channel. Exceptions: `/play` with
-  the bot out of voice needs only *some* voice channel (the bot follows the
-  requester in); `/announce` is a guild-level toggle, not gated.
+- Controlling playback requires sharing the bot's voice channel. `/play`,
+  Add music and idle Play allow a requester in any voice channel while the
+  bot is out of voice. `/clear` has that same exception after a stop. Queue
+  and History inspection buttons are private reads; `/announce` is an ungated
+  guild setting. Recheck voice after slow lookups and on result selection.
 
 ## Testing
 - Pure logic is unit-tested (parsers, crypto, store, biquads, ring buffer).

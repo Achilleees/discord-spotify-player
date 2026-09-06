@@ -5,18 +5,20 @@
 Anything that makes the bot audible requires you to share its voice channel:
 
 - If the bot **is** in a channel, you must be in that same channel.
-- If the bot is in **no** channel, `/play` will follow you in — you just need
+- If the bot is in **no** channel, `/play`, **Add music** and the idle **Play**
+  button can follow you in — you just need
   to be in some voice channel, and the bot joins it.
-- Buttons that drive playback (⏮ ⏯ ⏭) require sharing the bot's channel.
+- Previous, Pause/Resume, Skip and Stop require sharing the bot's channel.
 
-Actions that only change the queue take a looser gate: you must be in a voice
-channel, but not necessarily the bot's. That covers `/clear` and its confirm
+`/clear` and its confirmation require the bot's channel while it is connected,
+or any voice channel while the bot is out of voice. That covers the confirm
 button, and it exists because `/stop` leaves the channel while keeping the
 queue — under the strict gate, the command `/stop` tells you to use would be
 refused in exactly the state `/stop` creates.
 
-Reads and settings are ungated: `/np`, `/queue` with no argument, `/history`,
-`/who`, the "➕ Queue" hint button, and cancelling the clear prompt.
+Reads and settings are ungated: `/np`, `/history`, `/who`, the private Queue
+and History buttons, and cancelling the clear prompt. The `/queue` slash
+command retains its voice gate even when showing the listing.
 `/announce` is a guild-level toggle rather than playback control, so it can be
 set before the bot has joined.
 
@@ -47,15 +49,37 @@ playback."*)
 
 | Button | Gate | What it does |
 |---|---|---|
-| ⏮ (`ctrl_prev`) | voice gate | Steps back through the bot's own play history, not Spotify's. Reopens the playlist the track came from, positioned at it, so the DJ's context survives. Unavailable while a queue (media) item holds the turn. |
-| ⏯ (`ctrl_pause_toggle`) | voice gate | Pauses/resumes the active media item, pauses a playing Spotify baseline, or — if nothing is audible — starts/resumes whatever the queue head or Spotify state implies (see below). If the device isn't active yet, this is also the takeover gesture. |
-| ⏭ (`ctrl_next`) | voice gate | Same as `/skip`. |
-| ➕ Queue (`ctrl_queue_hint`) | none — always available | Ephemeral reply with the queue listing and how to add to it. |
-| Clear the queue (`ctrl_queue_clear_confirm`) | in any voice channel, like `/clear` | Confirms `/clear`. Gated on its own, because you can leave the channel between raising the prompt and answering it. |
+| Previous (`ctrl_prev`) | voice gate | Steps back through the bot's own play history. Reopens the playlist the track came from, positioned at it, so the DJ's context survives. Unavailable while a queue (media) item holds the turn. |
+| Pause / Resume (`ctrl_pause_toggle`) | voice gate | Pauses/resumes playback; its label and the card's paused state stay in sync through account changes. |
+| Skip (`ctrl_next`) | voice gate | Same as `/skip`. |
+| Stop (`ctrl_stop`) | voice gate | Same as `/stop`; keeps the queue and leaves voice. |
+| Play (`ctrl_play`, idle card) | voice gate with follow mode | Same as bare `/play`: resumes/starts available playback without toggling it off. |
+| Add music (`ctrl_add_music`) | voice gate with follow mode | Opens the track-link / YouTube search modal described below. |
+| Queue (`ctrl_queue_hint`) | none | Private queue listing, including the armed Spotify marker. |
+| History (`ctrl_history`) | none | Private listing of the ten most recently aired tracks. |
+| Clear the queue (`ctrl_queue_clear_confirm`) | same as `/clear` | Confirms `/clear`. Rechecks voice membership when clicked. |
 | Cancel (`ctrl_queue_clear_cancel`) | none | Dismisses the `/clear` prompt without touching the queue. |
 
 Button replies are ephemeral (only the clicker sees them), so they never
 spam the channel.
+
+## Add music and search
+
+Click **Add music** and enter a song/artist name or a Spotify, YouTube or
+SoundCloud track link. A link follows the same request path as `/play`.
+Text searches YouTube and shows up to five choices in a private message.
+Click a numbered button to add that track to the queue; playback starts
+only if idle. Search is available without a Spotify account when yt-dlp and
+ffmpeg are installed. Spotify links still need a connected account.
+
+Choices expire after five minutes and accept one selection. Open Add music
+again to make another request. Voice membership and media availability are
+checked again after a slow lookup, so moving away cannot enqueue into the
+room you left. Lookup errors and result selections stay private.
+
+The public card shows the source, artwork and paused state. Its owner refreshes
+it periodically and recreates a deleted card. Progress, seeking, EQ and saved
+playlist controls are subsequent features and are not displayed yet.
 
 ## How playback is ordered
 
@@ -102,10 +126,9 @@ Spotify's own queue along with it, so the arm goes too. The exception is a
 `/stop` with the device already released, which sends no release and so
 leaves the armed track exactly where it is.
 
-Because `/stop` leaves the channel, `/clear` deliberately takes a looser
-permission than the playback commands: you need to be in a voice channel, not
-necessarily the bot's. It never makes a sound, and gating it on the bot's
-channel would make it unusable in exactly the state `/stop` creates.
+Because `/stop` leaves the channel, `/clear` permits a requester in any voice
+channel while the bot is out of voice. While the bot is connected, it still
+requires sharing that channel.
 
 **`/play` vs `/queue`.** `/play` starts playback immediately if nothing is
 playing; otherwise it behaves like `/queue` (optionally jumping the line
