@@ -172,8 +172,10 @@ impl MusicOverlay {
         let bytes = catalogue.decode(clip_id).await?;
         let duration = Duration::from_secs_f64(bytes.len() as f64 / (44_100.0 * 2.0 * 4.0));
         let samples = bytes
-            .chunks_exact(4)
-            .map(|sample| f32::from_le_bytes(sample.try_into().expect("complete PCM sample")))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|sample| f32::from_le_bytes(*sample))
             .collect();
         let manager = songbird::get(&self.ctx)
             .await

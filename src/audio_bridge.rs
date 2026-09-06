@@ -274,7 +274,7 @@ impl AudioBridge {
         let overlay_available = overlay.remaining().min(output.len()) & !1;
         let mut music_gain = overlay.music_gain;
         let clip_gain = overlay.clip.as_ref().map_or(0.0, |clip| clip.gain);
-        for (frame_index, frame) in output.chunks_exact_mut(CHANNELS).enumerate() {
+        for (frame_index, frame) in output.as_chunks_mut::<CHANNELS>().0.iter_mut().enumerate() {
             let offset = frame_index * CHANNELS;
             let mixing = offset < overlay_available;
             music_gain = if mixing && clip_gain > 0.0 {
@@ -636,7 +636,7 @@ mod tests {
         let mut out = vec![0.0; clip_samples];
         b.pull_samples(&mut out);
         assert!(out[0] < 0.75 && out[0] > 0.74, "attack starts gradually");
-        assert!(out.chunks_exact(2).all(|frame| frame[0] == frame[1]));
+        assert!(out.as_chunks::<2>().0.iter().all(|frame| frame[0] == frame[1]));
         assert!((out[clip_samples - 1] - (0.5 * OVERLAY_MUSIC_GAIN + 0.25)).abs() < 1e-6);
         let mut release = vec![0.0; SAMPLE_RATE * CHANNELS / 4];
         b.pull_samples(&mut release);
