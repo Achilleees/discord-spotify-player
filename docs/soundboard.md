@@ -95,7 +95,18 @@ its own Songbird track at 0.5 gain, without the normal music join greeting,
 queue insertion or bridge overlay. Playback success comes from the track's
 end event; errors and timeouts report failure. Decoding is bounded to ten
 seconds, joining to twelve seconds, and the visit to forty seconds overall.
+After voice setup, nob waits 1.5 seconds before playing, then stays for two
+seconds after a successful clip finishes. These pauses release the voice
+transition lock and cancel immediately if the requester moves or music
+takes over. Failures skip the departure pause.
 Cleanup then attempts to leave only the connection the visit still owns.
+
+Discord's native join/leave notification is separate from the clip. The
+[supported voice API](https://docs.discord.com/developers/events/gateway-events#update-voice-state)
+has no silent-join option. On desktop, each listener can disable **User Join**
+and **User Leave** in **User Settings > Notifications > Sounds**; this applies
+to their join/leave notifications generally, not just nob. See
+[Discord's notification guide](https://discord.com/blog/how-to-manage-your-discord-desktop-notifications).
 
 Music has priority over temporary visits. If music replaces the visit's
 lease, late clip completion cannot stop or disconnect the music session.

@@ -25,6 +25,8 @@ use tokio::sync::watch;
 const JOIN_LIMIT: Duration = Duration::from_secs(12);
 const VISIT_LIMIT: Duration = Duration::from_secs(40);
 const LEAVE_LIMIT: Duration = Duration::from_secs(5);
+const ARRIVAL_PAUSE: Duration = Duration::from_millis(1_500);
+const DEPARTURE_PAUSE: Duration = Duration::from_secs(2);
 const CANCELLED: &str = "Visit ended early: your room changed or music took over.";
 
 /// Check the requester's actual listening room, independently of the bot's
@@ -198,6 +200,11 @@ impl Visit {
             .map_err(|_| "Stage voice setup timed out.")?
             .map_err(|_| "nob needs permission to speak on this stage.")?;
         }
+        // Give listeners a beat after joining. The visit's outer cancellation
+        // still wins immediately; never hold voice transitions while waiting.
+        drop(transition);
+        tokio::time::sleep(ARRIVAL_PAUSE).await;
+        let transition = self.owner.transitions.lock().await;
         self.validate()?;
         let (result, mut finished) = watch::channel(None);
         let raw = RawAdapter::new(CursorSource(std::io::Cursor::new(bytes)), 44_100, 2);
@@ -226,7 +233,7 @@ impl Visit {
         drop(transition);
         // End/error events are installed before playback, including tiny clips.
         // A duration timer is only a failure bound, never proof it was heard.
-        tokio::time::timeout(duration + Duration::from_secs(5), async {
+        let finished = tokio::time::timeout(duration + Duration::from_secs(5), async {
             loop {
                 if let Some(success) = *finished.borrow_and_update() {
                     return success;
@@ -237,9 +244,15 @@ impl Visit {
             }
         })
         .await
-        .map_err(|_| "The sound didn't finish in time.")?
-        .then_some(())
-        .ok_or_else(|| "The sound couldn't be played.".into())
+        .map_err(|_| "The sound didn't finish in time.")?;
+        if !finished {
+            return Err("The sound couldn't be played.".into());
+        }
+        // Only a successful clip gets a short goodbye pause. Cancellation or
+        // music preemption during it goes straight to the fenced cleanup.
+        tokio::time::sleep(DEPARTURE_PAUSE).await;
+        self.validate()?;
+        Ok(())
     }
 
     fn validate(&self) -> Result<(), String> {

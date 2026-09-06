@@ -13,6 +13,7 @@ git tag (release) in this repository.
 **Nob can visit voice calls with a private soundboard.** `/soundboard` offers
 ten local clips per page, owner-bound expiring buttons, refresh and close.
 Free nob joins the requester's room, plays one short sound and leaves;
+he pauses 1.5 seconds before the clip and two seconds after it finishes.
 Spotibot keeps playing independently. Active or paused music keeps nob busy,
 and music taking priority or voice-room changes cancel a visit. Separate
 track ownership prevents delayed clip cleanup from disconnecting music.
