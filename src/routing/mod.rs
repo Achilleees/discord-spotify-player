@@ -79,6 +79,13 @@ pub(crate) struct Target {
     pub room: Option<u64>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) enum VoiceActivity {
+    #[default]
+    Music,
+    Soundboard,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct Status {
     pub target: Target,
@@ -87,6 +94,8 @@ pub(crate) struct Status {
     pub bot: u64,
     pub ready: bool,
     pub media: bool,
+    #[serde(default)]
+    pub activity: VoiceActivity,
     pub now: String,
 }
 
@@ -188,7 +197,9 @@ pub(crate) fn choose(
     let serving: Vec<_> = bots
         .iter()
         .enumerate()
-        .filter(|(_, b)| b.ready && b.target.room == Some(room))
+        .filter(|(_, b)| {
+            b.ready && b.activity == VoiceActivity::Music && b.target.room == Some(room)
+        })
         .collect();
     match serving.as_slice() {
         [(i, _)] => return Ok(*i),
@@ -199,7 +210,12 @@ pub(crate) fn choose(
         return Err("No music bot is serving your voice room.");
     }
     bots.iter()
-        .position(|bot| bot.ready && bot.target.room.is_none() && (!needs_media || bot.media))
+        .position(|bot| {
+            bot.ready
+                && bot.activity == VoiceActivity::Music
+                && bot.target.room.is_none()
+                && (!needs_media || bot.media)
+        })
         .ok_or("Both bots are busy or unavailable. Their other rooms will keep playing.")
 }
 
@@ -218,6 +234,7 @@ mod tests {
             bot: 2,
             ready: true,
             media: true,
+            activity: VoiceActivity::Music,
             now: String::new(),
         }
     }
@@ -261,5 +278,17 @@ mod tests {
             choose(Some(10), &[spotify_only, bot(None)], true, true),
             Ok(0)
         );
+    }
+    #[test]
+    fn a_soundboard_visit_is_neither_a_music_session_nor_a_free_performer() {
+        let mut visiting = bot(Some(10));
+        visiting.activity = VoiceActivity::Soundboard;
+        assert_eq!(
+            choose(Some(10), &[bot(Some(10)), visiting.clone()], false, false),
+            Ok(0)
+        );
+        assert!(choose(Some(10), &[visiting.clone()], true, false).is_err());
+        visiting.target.room = None; // Pending visit still owns the bot.
+        assert!(choose(Some(10), &[visiting], true, false).is_err());
     }
 }

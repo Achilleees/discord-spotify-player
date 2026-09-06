@@ -73,7 +73,7 @@ impl Menus {
 }
 
 pub(super) fn register_commands() -> Vec<CreateCommand> {
-    vec![
+    let mut commands = vec![
         CreateCommand::new("play")
             .description("Play music in your voice room")
             .add_option(
@@ -97,7 +97,9 @@ pub(super) fn register_commands() -> Vec<CreateCommand> {
         CreateCommand::new("music")
             .description("Open your private music controls, queue and Spotify accounts"),
         CreateCommand::new("server").description("Open nob's server tools"),
-    ]
+    ];
+    commands.extend(super::soundboard::register_commands());
+    commands
 }
 
 enum InteractionRef<'a> {
@@ -769,7 +771,7 @@ mod tests {
             .iter()
             .map(|c| c["name"].as_str().unwrap())
             .collect();
-        assert_eq!(names, ["play", "music", "server"]);
+        assert_eq!(names, ["play", "music", "server", "soundboard"]);
         let action = input_action(Some("  song name  ".into()), None, true, true);
         assert!(
             matches!(&action, Action::Search { query, next: true, queued: true } if query == "song name")

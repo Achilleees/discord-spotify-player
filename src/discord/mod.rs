@@ -11,3 +11,6 @@ mod admin;
 mod voice_owner;
 mod routing;
 mod front;
+
+mod soundboard;
+mod visits;

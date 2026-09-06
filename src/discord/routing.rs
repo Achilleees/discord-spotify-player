@@ -71,6 +71,9 @@ impl Pairings {
 
 impl Handler {
     pub(super) fn voice_guard_current(&self, guard: &crate::player::state::VoiceGuard) -> bool {
+        if self.voice_owner.activity() == Some(crate::routing::VoiceActivity::Soundboard) {
+            return false;
+        }
         let Some(ctx) = self.ctx.lock().clone() else {
             return false;
         };
@@ -83,7 +86,11 @@ impl Handler {
     }
 
     pub(super) fn music_target(&self, ctx: &Context) -> Target {
-        let (generation, claimed) = self.voice_owner.snapshot();
+        self.music_target_activity(ctx).0
+    }
+
+    fn music_target_activity(&self, ctx: &Context) -> (Target, crate::routing::VoiceActivity) {
+        let (generation, claimed, activity) = self.voice_owner.status();
         let actual = self.guild_id.to_guild_cached(ctx).and_then(|guild| {
             guild
                 .voice_states
@@ -91,11 +98,14 @@ impl Handler {
                 .and_then(|vs| vs.channel_id)
                 .map(|ch| ch.get())
         });
-        Target {
-            boot: self.boot.clone(),
-            generation,
-            room: claimed.or(actual),
-        }
+        (
+            Target {
+                boot: self.boot.clone(),
+                generation,
+                room: claimed.or(actual),
+            },
+            activity.unwrap_or_default(),
+        )
     }
 
     pub(super) fn target_current(&self, ctx: &Context, target: &Target) -> bool {
@@ -110,7 +120,8 @@ impl Handler {
         room: Option<u64>,
         may_join: bool,
     ) -> bool {
-        self.target_current(ctx, target)
+        self.voice_owner.activity() != Some(crate::routing::VoiceActivity::Soundboard)
+            && self.target_current(ctx, target)
             && room.is_some()
             && self.voice_channels(ctx, user).1.map(|ch| ch.get()) == room
             && (target.room == room || (may_join && target.room.is_none()))
@@ -125,13 +136,20 @@ impl Handler {
         };
         if matches!(request.action, Action::Status) {
             let now = clipped(&render_now_playing(&self.player.query().await.now), 350);
+            let (target, activity) = self.music_target_activity(&ctx);
+            let now = if activity == crate::routing::VoiceActivity::Soundboard {
+                "Soundboard visit in progress.".into()
+            } else {
+                now
+            };
             return Reply::Status(Status {
-                target: self.music_target(&ctx),
+                target,
                 name: self.config.profile.name().into(),
                 guild: self.guild_id.get(),
                 bot: ctx.cache.current_user().id.get(),
                 ready: self.guild_id.to_guild_cached(&ctx).is_some(),
                 media: self.ytdlp_available,
+                activity,
                 now,
             });
         }

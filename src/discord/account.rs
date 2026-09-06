@@ -52,7 +52,7 @@ impl Handler {
     /// cleared), abort any Spotify session (deactivating its owner), reset
     /// the controls card, and optionally leave voice. Runs when the voice
     /// channel empties and when the bot is force-disconnected.
-    pub(super) async fn teardown_playback_session(&self, ctx: &Context, leave_voice: bool) {
+    pub(super) async fn teardown_playback_session(&self, ctx: &Context, leave_voice: bool, expected_voice: u64) {
         // VoiceLost first (mailbox order beats the runner's own cancel
         // report): the actor drops any active media turn and stale-ifies
         // the runner's coming `MediaEnded`. The awaited Stop then releases
@@ -64,7 +64,7 @@ impl Handler {
         // it. Voice is handled below, never by the actor: its `LeaveVoice`
         // would arm the deliberate-leave guard, and after a force disconnect
         // no gateway echo ever comes to consume it.
-        let retirement = self.voice_owner.retire();
+        let Some(retirement) = self.voice_owner.retire_music_if(expected_voice) else { return; };
         self.player.send(PlayerInput::VoiceLost);
         let _ = self.player.stop_without_leaving().await;
 

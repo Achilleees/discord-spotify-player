@@ -133,6 +133,7 @@ pub(crate) struct Paths {
     pub youtube_cookies: PathBuf,
     pub dj_clips: PathBuf,
     pub dj_cache: PathBuf,
+    pub soundboard_dir: PathBuf,
     #[cfg(unix)]
     pub kokoro_socket: PathBuf,
     pub youtube_max_duration: Option<String>,
@@ -216,6 +217,7 @@ impl Paths {
                     "kokoro.sock"
                 },
             )?,
+            soundboard_dir: resolve("SOUNDBOARD_DIR", "soundboard")?,
             youtube_max_duration: settings.get("YOUTUBE_MAX_DURATION_SECS").map(str::to_owned),
         })
     }

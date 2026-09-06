@@ -102,6 +102,25 @@ silently defaulting, so a typo is visible in the logs.
 Both defaults above target the VPS layout; override them for a local run or
 a different host layout.
 
+## Soundboard (nob)
+
+| Variable | Required | Default | What it does |
+|---|---|---|---|
+| `SOUNDBOARD_DIR` | no | `soundboard` beneath `STATE_DIR` (`.nob/soundboard` by default) | Local directory containing `catalogue.json` and the audio files for nob's private `/soundboard`. |
+
+Use the unprefixed key in `.env.nob`, or `NOB_SOUNDBOARD_DIR` as a process
+override. Relative paths resolve beneath the state directory; absolute paths
+stay absolute. Nob loads the catalogue at startup; restart after editing it.
+The soundboard needs `ffmpeg` on `PATH` independently of yt-dlp availability.
+It does not require a Spotify login.
+
+A missing directory or manifest gives an empty menu. A present invalid
+catalogue prevents nob startup. Limits are 128 entries, a 64 KiB manifest,
+20 MiB per local audio file and 15 seconds of decoded audio per clip; longer
+clips are rejected. `--check-config` resolves the setting but does not read
+the catalogue or probe ffmpeg. See [soundboard.md](soundboard.md) for the JSON
+format, clip setup and voice behavior.
+
 ## DJ (Kokoro TTS announcements)
 
 | Variable | Required | Default | What it does |

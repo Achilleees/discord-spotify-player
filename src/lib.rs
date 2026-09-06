@@ -16,6 +16,7 @@ mod queue_store;
 mod runtime;
 mod routing;
 mod setup;
+mod soundboard;
 mod spotify;
 mod users;
 mod youtube;

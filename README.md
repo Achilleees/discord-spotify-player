@@ -9,8 +9,8 @@ commands and now-playing buttons in Discord.
 This repository is the shared home for **Spotibot and nob**, continuing
 Spotibot's Git history. Two executables share the music engine, playback card
 and private search menus. Spotibot specializes in music; nob also offers
-permission-checked slowmode and message cleanup. Each runs in its own process
-with separate configuration and state. The eventual project name is
+permission-checked slowmode, message cleanup and a private soundboard. Each
+runs in its own process with separate configuration and state. The eventual project name is
 `never-off-beat`; see [docs/PORT.md](docs/PORT.md).
 
 ## Quick start
@@ -31,8 +31,10 @@ To build both bots, use `cargo build --workspace --release --locked`.
 Configure nob from `.env.nob.example`, then run `target/release/nob`
 (`nob.exe` on Windows). See [running both bots](docs/two-bots.md) for identity,
 state paths and offline configuration checks. Opt-in paired mode puts
-`/play`, `/music` and `/server` on nob, routes music to the appropriate bot,
-and leaves both playback cards usable independently.
+`/play`, `/music`, `/soundboard` and `/server` on nob, routes music to the
+appropriate bot, and leaves both playback cards usable independently.
+Nob's [soundboard](docs/soundboard.md) plays local clips during short voice
+visits while he is free, including alongside Spotibot.
 
 ## Documentation
 
@@ -41,6 +43,7 @@ and leaves both playback cards usable independently.
 | [docs/getting-started.md](docs/getting-started.md) | prerequisites, build, Discord setup, first login, running as a service |
 | [docs/commands.md](docs/commands.md) | every slash command and button, who may use it, how the queue orders playback |
 | [docs/configuration.md](docs/configuration.md) | every environment variable, logging, where state lives |
+| [docs/soundboard.md](docs/soundboard.md) | private clip picker, local catalogue setup and temporary voice visits |
 | [docs/architecture.md](docs/architecture.md) | how it works: audio pipeline, the player actor, the three lifecycles |
 | [docs/troubleshooting.md](docs/troubleshooting.md) | symptoms → causes → fixes |
 | [CODEMAP.md](CODEMAP.md) | technical map of `src/` |

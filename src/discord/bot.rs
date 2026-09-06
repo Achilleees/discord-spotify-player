@@ -93,6 +93,8 @@ pub(super) struct Handler {
     /// (a no-op when a call already exists), for the session-switch path.
     pub(super) join_voice: JoinVoiceFn,
     pub(super) voice_owner: Arc<VoiceOwner>,
+    pub(super) soundboard: Arc<crate::soundboard::Catalogue>,
+    pub(super) soundboard_menus: Mutex<super::soundboard::Menus>,
     pub(super) boot: String,
     pub(super) pairings: Mutex<super::routing::Pairings>,
     pub(super) front_menus: Mutex<super::front::Menus>,
@@ -105,7 +107,7 @@ pub(super) struct Handler {
     auto_start_attempted: AtomicBool,
 }
 
-struct CursorSource(std::io::Cursor<Vec<u8>>);
+pub(super) struct CursorSource(pub(super) std::io::Cursor<Vec<u8>>);
 
 impl Read for CursorSource {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
@@ -347,6 +349,7 @@ impl EventHandler for Handler {
             crate::routing::CommandMode::Standalone => {
                 let mut commands = commands::register_commands(self.ytdlp_available);
                 commands.extend(super::admin::register_commands(self.config.profile));
+                if self.config.profile == crate::runtime::Profile::Nob { commands.extend(super::soundboard::register_commands()); }
                 commands
             }
             crate::routing::CommandMode::Coordinator => super::front::register_commands(),
@@ -364,7 +367,7 @@ impl EventHandler for Handler {
                 Err(error) => tracing::warn!(?error, "could not inspect legacy global commands"),
                 Ok(commands) => for command in commands {
                     if command.kind == serenity::all::CommandType::ChatInput && matches!(command.name.as_str(),
-                        "login"|"logout"|"forget"|"who"|"queue"|"skip"|"stop"|"clear"|"np"|"history"|"announce"|"play"|"slowmode"|"purge"|"music"|"server") {
+                        "login"|"logout"|"forget"|"who"|"queue"|"skip"|"stop"|"clear"|"np"|"history"|"announce"|"play"|"slowmode"|"purge"|"music"|"server"|"soundboard") {
                         if let Err(error) = serenity::all::Command::delete_global_command(&ctx.http, command.id).await {
                             tracing::warn!(?error, "could not remove a legacy global command");
                         }
@@ -421,14 +424,20 @@ impl EventHandler for Handler {
         // kill the session it just started) — but its own DISCONNECT must
         // tear the session down, or an admin force-disconnect leaves
         // librespot and the feeder pushing into a dead call forever.
+        let cached_bot_channel = self.guild_id.to_guild_cached(&ctx).and_then(|guild| guild.voice_states.get(&ctx.cache.current_user().id).and_then(|vs| vs.channel_id));
         if new.user_id == ctx.cache.current_user().id {
             if let Some(channel) = new.channel_id {
-                self.voice_owner.observe_channel(channel.get());
+                if cached_bot_channel == Some(channel) { self.voice_owner.observe_channel(channel.get()); }
             } else {
                 // Our own `/stop` leave: expected, and it must not touch the
                 // session or the account.
                 if consume_deliberate_leave(&self.leaving_voice) {
                     tracing::debug!("bot left voice deliberately — no teardown");
+                    return;
+                }
+                if cached_bot_channel.is_some() { return; }
+                if self.voice_owner.activity() == Some(crate::routing::VoiceActivity::Soundboard) {
+                    self.voice_owner.cancel_visit();
                     return;
                 }
                 // Not ours, so the core has to hear about it. The teardown
@@ -438,6 +447,7 @@ impl EventHandler for Handler {
                 // neither. The core would go on believing voice was `Ready`,
                 // `ensure_voice` would return early, and the next `/play`
                 // would feed a bridge no call drains.
+                let expected_voice = self.voice_owner.snapshot().0;
                 let anything_active = {
                     let session = {
                         let lock = self.active_session.lock();
@@ -447,18 +457,23 @@ impl EventHandler for Handler {
                         !matches!(self.player.query().await.now, NowPlaying::Nothing);
                     session || playback
                 };
+                let connected_now = self.guild_id.to_guild_cached(&ctx).is_some_and(|guild| guild.voice_states.get(&ctx.cache.current_user().id).is_some_and(|state| state.channel_id.is_some()));
+                if connected_now || self.voice_owner.snapshot().0 != expected_voice { return; }
                 if anything_active {
                     tracing::info!("bot disconnected from voice — tearing down playback");
-                    self.teardown_playback_session(&ctx, false).await;
+                    self.teardown_playback_session(&ctx, false, expected_voice).await;
                 } else {
                     tracing::info!("bot disconnected from voice with nothing playing");
-                    self.voice_owner.retire();
-                    self.player.send(PlayerInput::VoiceLost);
+                    if self.voice_owner.retire_music_if(expected_voice).is_some() { self.player.send(PlayerInput::VoiceLost); }
                 }
             }
             return;
         }
 
+        let cached_user_channel = self.guild_id.to_guild_cached(&ctx).and_then(|guild| guild.voice_states.get(&new.user_id).and_then(|vs| vs.channel_id));
+        if cached_user_channel == new.channel_id {
+            self.voice_owner.requester_moved(new.user_id.get(), new.channel_id.map(|channel| channel.get()));
+        }
         let (bot_channel, humans_in_bot_channel) = {
             let bot_id = ctx.cache.current_user().id;
             match self.guild_id.to_guild_cached(&ctx) {
@@ -486,11 +501,16 @@ impl EventHandler for Handler {
         // a Spotify session exists. Gating this on a session used to let
         // YouTube/file-only playback (started via /play with no /login) keep
         // playing to an empty channel forever.
+        let (expected_voice, owned_channel) = self.voice_owner.snapshot();
         if humans_in_bot_channel == 0
-            && self.voice_owner.snapshot().1 == bot_channel.map(|channel| channel.get())
+            && owned_channel == bot_channel.map(|channel| channel.get())
         {
+            if self.voice_owner.activity() == Some(crate::routing::VoiceActivity::Soundboard) {
+                self.voice_owner.cancel_visit();
+                return;
+            }
             tracing::info!("voice channel empty — tearing down playback");
-            self.teardown_playback_session(&ctx, true).await;
+            self.teardown_playback_session(&ctx, true, expected_voice).await;
         }
     }
 
@@ -626,8 +646,7 @@ impl DiscordBot {
                     // Claim synchronously when the actor emits the effect, before
                     // its spawned task can race a later Stop or another room.
                     let target = owner
-                        .snapshot()
-                        .1
+                        .music_room()
                         .or_else(|| {
                             let ctx = ctx_store.lock().clone()?;
                             let guild = guild_id.to_guild_cached(&ctx)?;
@@ -691,11 +710,12 @@ impl DiscordBot {
             let ctx_store = ctx_store.clone();
             let leaving_voice = leaving_voice.clone();
             Arc::new(move || -> Pin<Box<dyn Future<Output = ()> + Send>> {
-                let retirement = owner.retire();
+                let retirement = owner.retire_music();
                 let owner = owner.clone();
                 let ctx_store = ctx_store.clone();
                 let leaving_voice = leaving_voice.clone();
                 Box::pin(async move {
+                    let Some(retirement) = retirement else { return; };
                     let _transition = owner.transitions.lock().await;
                     if !owner.retirement_current(retirement) { return; }
                     let Some(ctx) = ({ ctx_store.lock().clone() }) else { return };
@@ -730,6 +750,7 @@ impl DiscordBot {
             let owner = voice_owner.clone();
             let ctx_store = ctx_store.clone();
             Arc::new(move |guard: &crate::player::state::VoiceGuard| {
+                if owner.activity() == Some(crate::routing::VoiceActivity::Soundboard) { return false; }
                 let Some(ctx) = ctx_store.lock().clone() else {
                     return false;
                 };
@@ -799,6 +820,10 @@ impl DiscordBot {
         let link_up_watch = supervisor.link_up_watch();
         tokio::spawn(transport_shim(transport_rx, player.clone(), link_up_watch));
 
+        let soundboard = if config.profile == crate::runtime::Profile::Nob {
+            let path = crate::runtime::paths().soundboard_dir.clone();
+            tokio::task::spawn_blocking(move || crate::soundboard::Catalogue::load(&path)).await??
+        } else { crate::soundboard::Catalogue::default() };
         let handler = Handler {
             guild_id,
             text_channel_id,
@@ -817,6 +842,8 @@ impl DiscordBot {
             player,
             join_voice,
             voice_owner,
+            soundboard: Arc::new(soundboard),
+            soundboard_menus: Mutex::new(super::soundboard::Menus::default()),
             boot: uuid::Uuid::new_v4().to_string(),
             pairings: Mutex::new(super::routing::Pairings::default()),
             front_menus: Mutex::new(super::front::Menus::default()),

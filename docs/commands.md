@@ -9,16 +9,32 @@ Both bots share the music controls. Their slash surface depends on
 |---|---|
 | `/play query:… file:… next:…` | Plays a link, attachment or song search in your voice room; omit input to start/resume. |
 | `/music` | Private performer picker and playback, queue/history, account and announcement controls. |
+| `/soundboard` | Private, paginated clip picker; free nob visits your voice room, plays the selected sound and leaves. |
 | `/server` | Private slowmode and message-cleanup tools for this channel. |
 
 Spotibot has no slash entries in worker mode, but its card buttons continue
-working. `/soundboard` is planned and will appear with the clip implementation.
+working. Nob also keeps `/soundboard` in standalone mode.
 The private panel names its performer; both bots retain independent queues
 and Spotify accounts. An expired panel or changed voice session requires a
 fresh `/music`. Clear queue and Forget login have confirmation buttons.
 
 The individual slash commands documented below remain available in explicit
 standalone mode. In paired mode use the matching action in `/music` or `/server`.
+
+## Nob soundboard
+
+`/soundboard` is private and nob-only in both command modes. It shows ten
+local clips per page, with Previous, Next, Refresh and Close. Panels expire
+after five minutes; each accepted click consumes its token. Clip selections
+bind to the requester, guild, original voice room and nob's voice revision.
+Page changes preserve that binding; Refresh updates it after voice changes.
+
+Join a non-AFK voice channel to select a sound. Free nob can visit while
+Spotibot keeps playing. Nob's own music, including paused music, makes him
+busy and prevents a clip visit. A music takeover or requester/admin voice
+move cancels an active visit. Busy and empty menus explain their state;
+no voice audio is received and no visits happen randomly. See
+[soundboard.md](soundboard.md) for setup and playback details.
 
 ## Nob server utilities
 
@@ -36,13 +52,16 @@ do not report success.
 
 ## Voice-channel gate
 
-Anything that makes the bot audible requires you to share its voice channel:
+Music controls require you to share the performer's voice channel:
 
 - If the bot **is** in a channel, you must be in that same channel.
 - If the bot is in **no** channel, `/play`, **Add music** and the idle **Play**
   button can follow you in — you just need
   to be in some voice channel, and the bot joins it.
 - Previous, Pause/Resume, Skip and Stop require sharing the bot's channel.
+
+Soundboard selections use the separate idle-visit rules above: nob must be
+free and follows the requester into their non-AFK voice channel.
 
 `/clear` and its confirmation require the bot's channel while it is connected,
 or any voice channel while the bot is out of voice. That covers the confirm

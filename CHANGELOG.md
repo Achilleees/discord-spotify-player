@@ -10,15 +10,25 @@ git tag (release) in this repository.
 
 ## Unreleased
 
+**Nob can visit voice calls with a private soundboard.** `/soundboard` offers
+ten local clips per page, owner-bound expiring buttons, refresh and close.
+Free nob joins the requester's room, plays one short sound and leaves;
+Spotibot keeps playing independently. Active or paused music keeps nob busy,
+and music taking priority or voice-room changes cancel a visit. Separate
+track ownership prevents delayed clip cleanup from disconnecting music.
+The operator-managed catalogue uses ffmpeg, caps clips at 15 seconds and
+keeps paths and decoder output out of Discord. No random visits or voice
+reception are enabled. Live Discord acceptance and deployment remain pending.
+
 **One optional command menu controls both music bots.** Nob owns `/play`,
-`/music` and `/server`; Spotibot keeps its own playback buttons. Music follows
-the requester's existing room session or an available performer without
+`/music`, `/soundboard` and `/server`; Spotibot keeps its own playback buttons.
+Music follows the requester's existing room session or an available performer without
 moving a busy bot. Private menus retain playback, search, queue/history,
 account actions and server tools. Authenticated local requests bind to a
 specific bot session and retain outcomes across lost replies. Stop cancels
 late joins and login activation; old menus cannot control a replacement
-session. Standalone mode preserves the previous command list. Soundboard
-will add its entry when clip playback is implemented.
+session. Standalone mode preserves the previous command list and adds
+nob's soundboard.
 
 **Nob runs alongside Spotibot from the same workspace.** A separate `nob`
 executable shares the music engine and UI while using its own env file,

@@ -31,16 +31,20 @@ The eventual project name is `never-off-beat`.
 The default workspace member is `discord-spotify-player`; `crates/nob` adds
 a thin, independently runnable host. Both call the shared library in
 `src/lib.rs`. Music includes private search/link entry and richer playback
-controls; nob additionally has slowmode and message cleanup. Configuration,
-databases, caches and generated Spotify device identities are isolated; see
-[two-bots.md](two-bots.md). Remaining server modules, soundboard, companion
+controls; nob additionally has slowmode, message cleanup and a private
+soundboard. Configuration, databases, caches and generated Spotify device
+identities are isolated; see
+[two-bots.md](two-bots.md). Remaining server modules, companion
 behavior and live two-room acceptance are tracked on the existing board.
 
 Opt-in paired routing now makes nob the slash frontend (`/play`, `/music`,
-`/server`) while Spotibot retains its own card buttons. Each performer still
-owns its audio and account lifecycle; typed authenticated local requests
-link behavior without sharing state. The soundboard will add its command
-and activity rules using the voice owner already introduced for routing.
+`/soundboard`, `/server`) while Spotibot retains its own card buttons. Each
+performer still owns its audio and account lifecycle; typed authenticated local requests
+link behavior without sharing state. The [soundboard](soundboard.md) uses
+that voice owner for bounded local-clip visits, with music taking priority.
+Its private menu is available in standalone mode too. Local implementation
+does not complete live acceptance or authorize deployment; random visits and
+voice reception remain outside this feature.
 
 ## Historical transfer dossier — superseded migration plan
 

@@ -46,8 +46,12 @@ src/
 │                          queue.rs stays free of serde
 │
 ├── routing/
-│   ├── mod.rs             paired config, typed requests/replies, room selection
+│   ├── mod.rs             paired config, typed requests/replies, room/activity selection
 │   └── transport.rs        authenticated loopback frames, bounded request journal
+│
+├── soundboard/
+│   └── mod.rs             startup local catalogue, path/size validation and
+│                          bounded ffmpeg decoding; no Discord or music state
 │
 ├── player/
 │   ├── mod.rs             module doc: how state.rs and actor.rs divide work
@@ -116,6 +120,11 @@ src/
     ├── front.rs                 nob's compact slash surface, private performer menus
     ├── routing.rs               performer execution, guarded actions, local OAuth pairings
     ├── voice_owner.rs           room leases, revision fences, serialized voice transitions
+    │                          and music priority over temporary visits
+    ├── soundboard.rs            nob-only private clip picker: pagination, expiry,
+    │                          single-use owner/guild/room/revision-bound menus
+    ├── visits.rs                temporary clip track, audience checks, cancellation,
+    │                          end/error/deadline handling and fenced leave/retry
     ├── search.rs                Add music modal, private result rendering,
     │                          bounded owner/guild/expiry-checked single-use menus
     ├── admin.rs                  nob-only slowmode/purge: invocation permissions,
@@ -156,22 +165,33 @@ src/
   `youtube::feeder` (YouTube/SoundCloud/files) both push PCM into the one
   `AudioBridge`; `discord::voice::SimpleBridgeReader` pulls from it as
   Songbird's audio source. Only the player actor clears the bridge.
+- **Soundboard → temporary visit.** `discord::soundboard` validates private
+  selections; `discord::visits` reserves an idle `VoiceOwner` lease and asks
+  `soundboard::Catalogue` to decode one local clip. It uses a separate
+  Songbird track at 0.5 gain. Completion or cancellation stops only that track
+  and removes only its still-owned connection; music can preempt the visit.
+  It never inserts a queue item, overlays the music bridge or receives voice.
 - **Credentials.** `discord::account` reads/writes through `users::UserStore`,
   which encrypts token blobs via `users::crypto::TokenCipher`. Neither the
   player nor the Spotify session touches SQLite directly.
 
 ## Tests
 
-No separate `tests/` directory — every test is an inline `#[cfg(test)] mod
-tests` in the file it covers (`cargo test --workspace --locked` runs them all
-through the library target). The pure core
-carries most of the suite:
+Most tests are inline `#[cfg(test)] mod tests` in the file they cover;
+the workspace also has the host CLI tests listed above.
+`cargo test --workspace --locked` runs both. The pure core carries most
+of the suite:
 
 - `src/player/state.rs` — the bulk of the crate's tests: `step()` behavior
   per input/state combination (radio-order rules, arming/ack, pause
   provenance, timers, snapshots), deterministic since the core takes no IO.
 - `src/discord/commands.rs` — voice-gate policy, Spotify link/track-id
   parsing, now-playing rendering.
+- `src/soundboard/mod.rs` — catalogue schema, local path and size limits,
+  bounded decoding and malformed/oversized audio rejection.
+- `src/discord/soundboard.rs`, `src/discord/voice_owner.rs`,
+  `src/discord/visits.rs` — private menu/page bounds, requester and revision
+  checks, visit/music priority, stale cleanup and departure bookkeeping.
 - `src/config.rs` — env parsing (snowflake validation, numeric clamping,
   text-channel fallback).
 - `src/users/mod.rs`, `src/users/crypto.rs` — credential store CRUD,

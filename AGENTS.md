@@ -54,7 +54,10 @@ go in the gitignored `.local/`, not `docs/`.
 - Each performer owns authorization, queue and account state. Keep requests
   typed, authenticated and revision-bound; never redispatch unknown outcomes.
 - `discord/voice_owner.rs` owns pending joins and departures. Use its leases
-  for delayed setup; future soundboard activities must extend this owner.
+  for delayed setup. Soundboard visits reserve the same owner; music may
+  preempt a visit, and clip cleanup must never remove a replacement lease.
+- Nob's `/soundboard` uses an operator-owned local catalogue and separate
+  track, never the music queue/bridge. See `docs/soundboard.md` before changes.
 - See `docs/two-bots.md` and `routing/` before changing cross-bot behavior.
 
 ## Architecture (see `docs/architecture.md`, `CODEMAP.md`)

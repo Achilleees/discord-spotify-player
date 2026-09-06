@@ -307,6 +307,7 @@ pub(super) fn render_now_playing(now: &NowPlaying) -> String {
 
 impl Handler {
     pub(super) async fn dispatch_interaction(&self, ctx: Context, interaction: Interaction) {
+        if self.dispatch_soundboard(&ctx, &interaction).await { return; }
         if self.dispatch_front(&ctx, &interaction).await {
             return;
         }
@@ -610,6 +611,7 @@ impl Handler {
     /// bot's voice channel. False when the bot isn't in a channel, the user
     /// isn't in one, or they differ.
     pub(super) fn user_in_bot_voice_channel(&self, ctx: &Context, user_id: UserId) -> bool {
+        if self.voice_owner.activity() == Some(crate::routing::VoiceActivity::Soundboard) { return false; }
         let (bot_ch, user_ch) = self.voice_channels(ctx, user_id);
         voice_gate(bot_ch, user_ch, false)
     }
@@ -618,6 +620,7 @@ impl Handler {
     /// just be in a voice channel. Used by the queue-only actions, which make
     /// no sound and must stay reachable after a `/stop` has left the channel.
     fn user_in_any_voice_channel(&self, ctx: &Context, user_id: UserId) -> bool {
+        if self.voice_owner.activity() == Some(crate::routing::VoiceActivity::Soundboard) { return false; }
         let (bot_ch, user_ch) = self.voice_channels(ctx, user_id);
         voice_gate(bot_ch, user_ch, true)
     }
@@ -666,6 +669,7 @@ impl Handler {
     /// they must share it (the control rule); if the bot is in no channel yet,
     /// they only need to be in one so the bot can follow them in.
     pub(super) fn user_can_play(&self, ctx: &Context, user_id: UserId) -> bool {
+        if self.voice_owner.activity() == Some(crate::routing::VoiceActivity::Soundboard) { return false; }
         let (bot_ch, user_ch) = self.voice_channels(ctx, user_id);
         voice_gate(bot_ch, user_ch, true)
     }

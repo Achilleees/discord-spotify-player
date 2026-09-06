@@ -2,8 +2,9 @@
 
 Both executables use the same music implementation. Each process owns its
 Discord client, voice connection, player actor, queue, Spotify login, card
-and state. Nob additionally offers slowmode and message cleanup. Soundboard,
-companion behavior and the remaining legacy server modules follow separately.
+and state. Nob additionally offers slowmode, message cleanup and a private
+[soundboard](soundboard.md). Companion behavior and the remaining legacy
+server modules follow separately.
 
 ## Build and configure
 
@@ -58,14 +59,14 @@ Both addresses must be loopback IP addresses with distinct nonzero ports;
 this mode connects two services on the same host. Run both offline
 `--check-config` commands before restarting either service.
 
-Nob then registers only `/play`, `/music` and `/server`. Spotibot registers
-no slash commands and keeps its own playback-card buttons. `/soundboard`
-will join this list when the clip feature is implemented. On startup each
-paired host also removes its own known legacy global slash registrations;
+Nob then registers only `/play`, `/music`, `/soundboard` and `/server`.
+Spotibot registers no slash commands and keeps its own playback-card buttons.
+On startup each paired host also removes its own known legacy global slash registrations;
 guild registration alone does not remove global duplicates. Existing stale
 slash invocations point users back to nob. Changing registration requires
 restarting the configured host; neither bot silently changes mode on failure.
 Set `COMMAND_MODE=standalone` to retain the original independent command list.
+Nob's `/soundboard` is available in either mode.
 
 `/play` uses the bot already serving your voice room. Otherwise it chooses
 free Spotibot, then free nob, considering media support. A paused bot remains
@@ -83,6 +84,13 @@ or session changes during login, track lookup or a delayed click, open a
 fresh panel. Clear queue and Forget login require confirmation. Previous,
 Pause, Skip and Stop target an existing connection and cannot summon a spare.
 `/server` opens nob's permission-checked tools for the current text channel.
+
+`/soundboard` opens nob's private clip picker. It can invite free nob alongside
+Spotibot or into another room, without changing either music queue. Active or
+paused music on nob makes him unavailable for clips. Music taking ownership
+of a visit, or the requester moving rooms, cancels the visit. See
+[soundboard.md](soundboard.md) for local clip setup, bounded playback and
+private menu controls; companion listening and random visits are not enabled.
 
 Requests carry an instance/session revision and a unique ID. When a reply is
 lost, nob queries that request's outcome; it never repeats the action on
@@ -130,6 +138,9 @@ nob's private picker, or use the intended performer's own playback card.
 Before a live rollout, verify separate logins and queues, independent audio
 in two rooms, and that stopping/restarting one bot leaves the other running.
 Also check nob's moderation permissions and the shared private music menus.
+For soundboard, verify private pagination, busy/empty states, duplicate and
+expired clicks, requester movement, music takeover, failed joins and cleanup,
+and Spotibot continuing uninterrupted while nob visits.
 For paired mode, inspect both apps' guild and global command lists; verify
 one slash surface, Stop during join/login, moving rooms during lookup,
 expired menus, account removal outside voice and coordinator/worker restarts.
