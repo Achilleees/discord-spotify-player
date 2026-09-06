@@ -1,11 +1,17 @@
-//! Temporary nob voice visits. Music can replace a visit's lease; completion
-//! stops only this clip and never removes a replacement music connection.
+//! Nob clips mix into an existing same-room music connection, or make a
+//! temporary visit while idle. Overlay cleanup never owns music or voice.
 
 use super::{
     bot::{consume_deliberate_leave, CursorSource, Handler},
-    voice_owner::{VoiceLease, VoiceOwner},
+    voice_owner::{OverlayLease, VoiceLease, VoiceOwner},
 };
-use crate::{player::state::NowPlaying, runtime::Profile, soundboard::Catalogue};
+use crate::{
+    audio_bridge::{AudioBridge, OverlayError, OverlayHandle, OverlayStatus},
+    player::state::NowPlaying,
+    routing::VoiceActivity,
+    runtime::Profile,
+    soundboard::Catalogue,
+};
 use serenity::all::{ChannelId, ChannelType, Context, EditVoiceState, GuildId, UserId};
 use songbird::{
     events::EventData,
@@ -62,6 +68,40 @@ impl Handler {
         if !audience(ctx, self.guild_id, user, room) {
             return "Join a voice channel and refresh the soundboard.".into();
         }
+        if self.voice_owner.activity() == Some(VoiceActivity::Music) {
+            if self
+                .voice_channels(ctx, user)
+                .0
+                .map(|channel| channel.get())
+                != Some(room)
+            {
+                return "Join nob's voice room and refresh the soundboard to play over his music."
+                    .into();
+            }
+            let Some(lease) = self.voice_owner.claim_overlay(room, user.get(), generation) else {
+                return "nob is connecting, another sound is playing, or this menu is out of date. Refresh and try again.".into();
+            };
+            let overlay = MusicOverlay {
+                ctx: ctx.clone(),
+                guild: self.guild_id,
+                user,
+                owner: self.voice_owner.clone(),
+                lease,
+                bridge: self.bridge.clone(),
+                epoch: self.bridge.overlay_epoch(),
+                volume: self.config.soundboard_volume,
+                audio: None,
+            };
+            let catalogue = self.soundboard.clone();
+            let clip_id = clip_id.to_owned();
+            return match tokio::spawn(async move { overlay.run(catalogue, clip_id).await }).await {
+                Ok(reply) => reply,
+                Err(error) => {
+                    tracing::warn!(?error, "soundboard overlay task failed");
+                    "The sound couldn't finish.".into()
+                }
+            };
+        }
         let snapshot = self.player.query().await;
         if !matches!(snapshot.now, NowPlaying::Nothing)
             || self.voice_channels(ctx, user).0.is_some()
@@ -96,6 +136,105 @@ impl Handler {
                 "The soundboard visit couldn't finish.".into()
             }
         }
+    }
+}
+
+/// This guard owns only one overlay and its requester reservation. Dropping
+/// it after completion, failure or panic cannot stop music or leave voice.
+struct MusicOverlay {
+    ctx: Context,
+    guild: GuildId,
+    user: UserId,
+    owner: Arc<VoiceOwner>,
+    lease: OverlayLease,
+    bridge: Arc<AudioBridge>,
+    epoch: u64,
+    volume: f32,
+    audio: Option<OverlayHandle>,
+}
+
+impl MusicOverlay {
+    async fn run(mut self, catalogue: Arc<Catalogue>, clip_id: String) -> String {
+        let cancel = self.lease.cancelled.clone();
+        let result = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => Err("Sound cancelled: the voice room or session changed.".into()),
+            result = tokio::time::timeout(VISIT_LIMIT, self.play(&catalogue, &clip_id)) =>
+                result.unwrap_or_else(|_| Err("The sound timed out.".into())),
+        };
+        match result {
+            Ok(()) => "Sound played.".into(),
+            Err(message) => message,
+        }
+    }
+
+    async fn play(&mut self, catalogue: &Catalogue, clip_id: &str) -> Result<(), String> {
+        let bytes = catalogue.decode(clip_id).await?;
+        let duration = Duration::from_secs_f64(bytes.len() as f64 / (44_100.0 * 2.0 * 4.0));
+        let samples = bytes
+            .chunks_exact(4)
+            .map(|sample| f32::from_le_bytes(sample.try_into().expect("complete PCM sample")))
+            .collect();
+        let manager = songbird::get(&self.ctx)
+            .await
+            .ok_or("Voice is unavailable right now.")?;
+        let call = manager
+            .get(self.guild)
+            .ok_or("nob's voice session ended.")?;
+        let transition = self.owner.transitions.lock().await;
+        let connected_room = call
+            .lock()
+            .await
+            .current_channel()
+            .map(|channel| channel.0.get());
+        if !self.owner.overlay_current(&self.lease)
+            || !audience(&self.ctx, self.guild, self.user, self.lease.channel)
+            || connected_room != Some(self.lease.channel)
+        {
+            return Err(
+                "Your voice room or nob's connection changed. Refresh the soundboard.".into(),
+            );
+        }
+        let audio = self.owner.with_overlay_current(&self.lease, || {
+            self.bridge.start_overlay(self.epoch, samples, self.volume)
+        });
+        self.audio = Some(
+            audio
+                .ok_or("Sound cancelled: the voice room or session changed.")?
+                .map_err(|error| match error {
+                    OverlayError::Busy => "Another sound or DJ line is playing. Try again shortly.",
+                    OverlayError::Stale => {
+                        "Music changed while preparing the sound. Refresh and try again."
+                    }
+                    _ => "This sound couldn't be played. Try another clip.",
+                })?,
+        );
+        drop(transition);
+        // Completion is observed from actual bridge consumption. A timer is
+        // only a failure bound, never evidence that a clip was played.
+        tokio::time::timeout(duration + Duration::from_secs(5), async {
+            let mut tick = tokio::time::interval(Duration::from_millis(25));
+            loop {
+                match self.audio.as_ref().expect("installed overlay").status() {
+                    OverlayStatus::Drained => return Ok(()),
+                    OverlayStatus::Cancelled => {
+                        return Err("Sound cancelled because the music session changed.".into())
+                    }
+                    OverlayStatus::Playing => tick.tick().await,
+                };
+            }
+        })
+        .await
+        .map_err(|_| "The sound didn't finish in time.")?
+    }
+}
+
+impl Drop for MusicOverlay {
+    fn drop(&mut self) {
+        if let Some(audio) = self.audio.take() {
+            self.bridge.cancel_overlay(&audio);
+        }
+        self.owner.release_overlay(&self.lease);
     }
 }
 

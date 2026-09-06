@@ -119,7 +119,9 @@ Set `SOUNDBOARD_VOLUME_PERCENT` in `.env.nob`, or use the process override
 `NOB_SOUNDBOARD_VOLUME_PERCENT`. Unset or blank values default to `100`.
 Malformed, non-finite or out-of-range values fail configuration validation,
 including `--check-config`. Restart nob after changing the setting.
-This gain applies only to soundboard tracks; music volume is unchanged.
+This gain applies to soundboard clips both during temporary visits and in
+the shared music bridge. In an existing music room, the bridge temporarily
+ducks music under the clip; it restores the level when the clip ends.
 The default is about 6 dB louder than the previous fixed 50 percent gain.
 Master local audio with headroom so full source level remains comfortable.
 

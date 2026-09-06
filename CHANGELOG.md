@@ -10,20 +10,31 @@ git tag (release) in this repository.
 
 ## Unreleased
 
-**Nob can visit voice calls with a private soundboard.** `/soundboard` offers
+**Nob's private soundboard also works over music.** `/soundboard` offers
 ten local clips per page, owner-bound expiring buttons, refresh and close.
 Free nob joins the requester's room, plays one short sound and leaves;
 he pauses 1.5 seconds before the clip and two seconds after it finishes.
+If nob already serves that room, the clip uses the same audio bridge while
+music plays or stays paused, with no new join or leave. Music ducks smoothly
+under the clip and returns afterward; the queue stays unchanged. One clip
+plays at a time, sharing the bounded overlay lane with existing DJ speech.
+Pause, seek and normal track transitions preserve a playing clip; Stop,
+voice loss or moving either the requester or nob cancels it. Delayed decode
+and TTS results cannot restart audio after the session ends.
 Clip volume now defaults to full source level, about 6 dB above the previous
 50 percent gain. `SOUNDBOARD_VOLUME_PERCENT` accepts 0–100 percent, including
 decimals, with invalid values rejected by offline config checks. It changes
-only soundboard volume; music retains its existing level.
-Spotibot keeps playing independently. Active or paused music keeps nob busy,
-and music taking priority or voice-room changes cancel a visit. Separate
-track ownership prevents delayed clip cleanup from disconnecting music.
+soundboard gain; music ducking is temporary.
+Spotibot keeps playing independently. Music in another room keeps nob busy,
+and music taking priority or voice-room changes cancel an idle visit.
+Separate ownership prevents delayed clip cleanup from disconnecting music.
 The operator-managed catalogue uses ffmpeg, caps clips at 15 seconds and
 keeps paths and decoder output out of Discord. No random visits or voice
 reception are enabled. Live Discord acceptance and deployment remain pending.
+
+**Spotify sessions start at 70% volume instead of 80%.** This lowers the
+virtual device's initial feed level; the Spotify volume slider remains
+adjustable. Media files, YouTube and soundboard clip gain are unchanged.
 
 **One optional command menu controls both music bots.** Nob owns `/play`,
 `/music`, `/soundboard` and `/server`; Spotibot keeps its own playback buttons.

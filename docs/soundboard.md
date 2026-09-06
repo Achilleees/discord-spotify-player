@@ -1,8 +1,11 @@
 # Nob's soundboard
 
-`/soundboard` opens a private menu of local clips. Join a voice call, choose
-a sound, and an available nob joins, plays it and leaves. The command belongs
-to nob in both standalone and paired mode. Spotibot can keep playing music
+`/soundboard` opens a private menu of local clips. Join a voice call and choose
+a sound. If nob already has a music session in your room, the sound plays
+through that connection without joining or leaving. Music becomes quieter
+under the clip, then returns to its previous level. Otherwise, an available
+nob joins, plays the sound and leaves. The command belongs to nob in both
+standalone and paired mode. Spotibot can keep playing music independently
 while nob visits the same room or a different one.
 
 ## Using the menu
@@ -19,14 +22,15 @@ current room and revision. Refresh after moving rooms or after nob changes
 voice activity. Opening the menu outside voice is allowed, but playing a
 sound requires being in a voice channel other than the server's AFK channel.
 
-An empty catalogue shows that no sounds are available. If nob already owns
-a voice session, sound buttons are disabled with a refresh prompt. Active
-or paused music on nob keeps him busy, including music in the requester's
-room. A clip never interrupts that music. A music claim that takes priority,
-including incoming Spotify playback, cancels an active visit. Leaving or
-changing the requester's room, or an administrator moving nob, also cancels it.
+An empty catalogue shows that no sounds are available. Nob can play one clip
+at a time, including over active or paused music in your room. Paused music
+stays paused; a clip never changes the queue. Nob stays busy when serving
+another room or while a clip is already reserved. Refresh the picker after
+that activity ends. Leaving or changing the requester's room, or an
+administrator moving nob, cancels the clip. Music can take priority over an
+idle visit, including when incoming Spotify playback starts a music session.
 
-**Close** closes the picker. During a visit the panel shows progress and then
+**Close** closes the picker. During playback the panel shows progress and then
 the result with fresh controls. This feature does not receive voice audio,
 listen for reactions or schedule random visits.
 
@@ -90,16 +94,33 @@ exposing local paths or decoder output.
 
 ## Playback and recovery
 
-A visit reserves nob's voice ownership before decoding or joining. It uses
-its own Songbird track, without the normal music join greeting, queue
-insertion or bridge overlay. Playback success comes from the track's
-end event; errors and timeouts report failure. Decoding is bounded to ten
-seconds, joining to twelve seconds, and the visit to forty seconds overall.
+In an existing music room, a clip reserves an overlay lease before decoding.
+It enters the same audio bridge as music and the existing DJ announcer, with
+its own gain, identity and completion status. The bridge holds the complete
+clip in a separate bounded lane, so it cannot lose its tail to a smaller
+music buffer. Only one overlay plays at a time; a DJ announcement skips a
+busy lane. This shared lane permits up to 30 seconds, while soundboard clips
+retain the catalogue's 15-second limit.
+
+Music ducks smoothly under the overlay and recovers afterward. Music pause,
+seek and normal track transitions preserve a playing clip. Stop, voice loss,
+requester movement or an administrator moving nob cancels it. Pending decode
+and TTS results are bound to the session that requested them and cannot start
+after it ends. Overlay cleanup releases only that clip; it never disconnects
+the music session. Completion means the shared reader has consumed the clip;
+Discord can still have a small amount of audio buffered for delivery.
+
+An idle visit instead reserves nob's voice ownership before decoding or
+joining. It uses its own Songbird track, without the normal music join
+greeting or queue insertion. Playback success comes from the track's end
+event; errors and timeouts report failure. Decoding is bounded to ten
+seconds, joining to twelve seconds, and a request to forty seconds overall.
 After voice setup, nob waits 1.5 seconds before playing, then stays for two
 seconds after a successful clip finishes. These pauses release the voice
 transition lock and cancel immediately if the requester moves or music
 takes over. Failures skip the departure pause.
 Cleanup then attempts to leave only the connection the visit still owns.
+These arrival and departure pauses are unnecessary in an existing music room.
 
 Clip volume defaults to full source level. Set `SOUNDBOARD_VOLUME_PERCENT`
 in `.env.nob` to a value from `0` to `100`, including decimals, or use the
@@ -107,8 +128,8 @@ process override `NOB_SOUNDBOARD_VOLUME_PERCENT`. Unset or blank values use
 `100`; `0` is silent. Invalid, non-finite or out-of-range values fail startup
 and offline `--check-config` validation. Restart nob after changing it.
 The new default is about 6 dB above the previous fixed 50 percent gain;
-prepare local audio with headroom. This affects only the soundboard track,
-so existing music volume stays unchanged.
+prepare local audio with headroom. This controls the clip's level in either
+playback mode; music ducking is temporary and does not change its volume setting.
 
 Discord's native join/leave notification is separate from the clip. The
 [supported voice API](https://docs.discord.com/developers/events/gateway-events#update-voice-state)
@@ -124,6 +145,7 @@ cleanup attempts. Nob stays busy until removal or disconnect is confirmed,
 or music takes over; the response asks users to check the connection.
 
 Local tests cover catalogue bounds, decoding, private menu behavior and
-ownership decisions. Discord playback, cancellation and two-bot behavior
+ownership decisions, plus overlay completion, ducking and cancellation.
+Discord playback, cancellation and two-bot behavior
 still need live acceptance. Deployment remains a separate promotion of a
 green `dev` commit to `main`.

@@ -33,7 +33,8 @@ src/
 │                         player actor's output vocabulary for bot status
 ├── audio_bridge.rs         AudioBridge: the shared VecDeque<f32> ring buffer
 │                         (44.1kHz stereo) every audio producer pushes into
-│                         and Songbird pulls from; turn-gated clear
+│                         and Songbird pulls from; turn-gated music clear,
+│                         bounded owned overlay lane, ducking and pause gate
 ├── queue.rs                MediaSource (Spotify/YouTube/File) + QueueItem +
 │                         PriorityQueue: the one ordered queue across sources
 │
@@ -94,7 +95,7 @@ src/
 │   ├── mod.rs                join-sound generation
 │   └── dj.rs                  DJAnnouncer: Kokoro TTS client (Unix socket)
 │                             + pre-recorded clips, template selection,
-│                             FNV-hash cache, fixed-gain bridge overlay
+│                             FNV-hash cache; actor submits to shared overlay lane
 │
 ├── youtube/
 │   ├── mod.rs                yt-dlp/ffmpeg availability checks, tmp-dir/
@@ -121,11 +122,12 @@ src/
     ├── front.rs                 nob's compact slash surface, private performer menus
     ├── routing.rs               performer execution, guarded actions, local OAuth pairings
     ├── voice_owner.rs           room leases, revision fences, serialized voice transitions
-    │                          and music priority over temporary visits
+    │                          music priority over visits, same-room overlay leases
     ├── soundboard.rs            nob-only private clip picker: pagination, expiry,
     │                          single-use owner/guild/room/revision-bound menus
-    ├── visits.rs                temporary clip track, audience checks, cancellation,
-    │                          end/error/deadline handling and fenced leave/retry
+    ├── visits.rs                idle clip tracks / same-room bridge overlays,
+    │                          audience checks, cancellation, completion/deadlines
+    │                          and fenced cleanup; only idle visits leave voice
     ├── search.rs                Add music modal, private result rendering,
     │                          bounded owner/guild/expiry-checked single-use menus
     ├── admin.rs                  nob-only slowmode/purge: invocation permissions,
@@ -166,14 +168,17 @@ src/
   `youtube::feeder` (YouTube/SoundCloud/files) both push PCM into the one
   `AudioBridge`; `discord::voice::SimpleBridgeReader` pulls from it as
   Songbird's audio source. Only the player actor clears the bridge.
-- **Soundboard → temporary visit.** `discord::soundboard` validates private
-  selections; `discord::visits` reserves an idle `VoiceOwner` lease and asks
-  `soundboard::Catalogue` to decode one local clip. It uses a separate
-  Songbird track at `Config.soundboard_volume` gain, configured with
-  `SOUNDBOARD_VOLUME_PERCENT` (0–100, default 100). Completion or cancellation
-  stops only that track
-  and removes only its still-owned connection; music can preempt the visit.
-  It never inserts a queue item, overlays the music bridge or receives voice.
+- **Soundboard → audio.** `discord::soundboard` validates private selections;
+  `discord::visits` reserves a `VoiceOwner` lease and asks
+  `soundboard::Catalogue` to decode one local clip. An idle visit uses a
+  separate Songbird track, and music may preempt its temporary connection.
+  In an existing music room, an overlay lease preserves the music connection
+  and feeds `AudioBridge`'s bounded clip lane, shared with existing DJ speech.
+  Music ducks temporarily; pause, seek and ordinary track transitions preserve
+  the clip. Both paths use `Config.soundboard_volume`, configured with
+  `SOUNDBOARD_VOLUME_PERCENT` (0–100, default 100). Cleanup stops only the owned
+  clip, and only a still-owned idle visit may leave voice. Neither path inserts
+  a queue item or receives voice audio.
 - **Credentials.** `discord::account` reads/writes through `users::UserStore`,
   which encrypts token blobs via `users::crypto::TokenCipher`. Neither the
   player nor the Spotify session touches SQLite directly.
@@ -194,7 +199,8 @@ of the suite:
   bounded decoding and malformed/oversized audio rejection.
 - `src/discord/soundboard.rs`, `src/discord/voice_owner.rs`,
   `src/discord/visits.rs` — private menu/page bounds, requester and revision
-  checks, visit/music priority, stale cleanup and departure bookkeeping.
+  checks, visit/music priority, overlay ownership, stale cleanup and departure
+  bookkeeping.
 - `src/config.rs` — env parsing (snowflake validation, numeric clamping,
   text-channel fallback, strict finite soundboard volume bounds).
 - `src/users/mod.rs`, `src/users/crypto.rs` — credential store CRUD,
@@ -202,7 +208,7 @@ of the suite:
 - `src/youtube/metadata.rs` — yt-dlp JSON mapping, duration cap, live-stream/
   age-limit handling.
 - `src/audio_bridge.rs`, `src/discord/voice.rs` — buffer push/pull framing,
-  prebuffer timing.
+  prebuffer timing, bounded complete overlays, ducking, pause and cancellation.
 - `src/queue_store.rs` — round-trip persistence, replace-not-append, one
   unreadable row skipped rather than losing the rest.
 - `src/history/mod.rs` — newest-first ordering, context retention, and the

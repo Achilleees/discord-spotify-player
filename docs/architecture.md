@@ -47,7 +47,11 @@ by generation, ignoring late success/failure after Stop or a replacement.
 Guarded player requests recheck current voice membership and routing revision
 at mailbox consumption. Account joins also reserve against their original
 revision, and delayed device activation passes through the same actor guard.
-Future soundboard visits must extend this owner with activity-specific rules.
+Soundboard visits reserve temporary voice leases; music may preempt them.
+Inside the connected music room, a separate overlay lease reserves one clip
+without changing the music lease or routing revision. Requester departure,
+an admin move, Stop or voice loss cancels the overlay. Generation checks
+prevent stale clip cleanup from releasing a replacement or leaving music.
 
 ## Audio pipeline
 
@@ -55,7 +59,7 @@ Future soundboard visits must extend this owner with activity-specific rules.
 Spotify (librespot decode) ─┐
 YouTube/SoundCloud (yt-dlp) ─┼─> AudioBridge ─> SimpleBridgeReader ─> Songbird ─> Discord voice
 uploaded files ─────────────┘         ▲
-DJ TTS overlay ────────────────────────┘ (mixes on top at a fixed gain)
+soundboard / DJ TTS overlay ───────────┘ (per-clip gain, smooth music ducking)
 ```
 
 `AudioBridge` (`src/audio_bridge.rs`) is a lock-based `VecDeque<f32>` ring
@@ -67,6 +71,17 @@ audio out from under whoever currently holds the turn. On the Spotify side,
 `src/spotify/sink.rs` (`DiscordSink`, librespot's audio backend) checks
 `bridge.spotify_muted()` before pushing decoded audio in at all — the player
 actor toggles that flag as part of taking or releasing the turn.
+
+The bridge's separate overlay lane holds one complete clip, up to 30 seconds,
+with its own identity, gain and completion status. The soundboard catalogue
+retains its stricter 15-second cap. Music ducks smoothly while the overlay
+is audible, then returns to its prior level. Pausing music keeps the consumer
+running for clips while preserving buffered music; seeks and ordinary track
+transitions clear only music samples. Stop and voice loss invalidate pending
+decode/TTS work and active overlays, so a late result cannot enter a replacement
+session. The existing DJ announcer shares this lane and skips a busy overlay
+instead of mixing a second voice over the current clip. Idle soundboard visits
+use a separate Songbird track and do not require a music bridge reader.
 
 `SimpleBridgeReader` (`src/discord/voice.rs`) is Songbird's `Read + Seek +
 MediaSource` over the bridge. On its first read only, it blocks until
@@ -85,10 +100,11 @@ nothing reconciles them:
 
 The mixer is the larger and less obvious half. `ConnectConfig.initial_volume`
 reads like a display value, but `Spirc::new` hands it to the soft mixer, and
-the default `VolumeCtrl::Log(60 dB)` maps our 80% (`52428`) to an amplitude
-of 0.2512 — **exactly -12 dB**, applied to every Spotify sample. `PREAMP_DB`
-then applies on top (`-5 dB` on the current test host, so -17 dB total there,
-partly masked by a `+7 dB` shelf at 80 Hz that puts low-end energy back).
+the default `VolumeCtrl::Log(60 dB)` maps our initial 70% (`45875`) to an
+amplitude of about 0.1259 — **about -18 dB**, applied to every Spotify sample.
+This is about 6 dB below the previous 80% initial setting. `PREAMP_DB` and
+the configured equalizer then apply on top. The Spotify slider still controls
+the mixer after startup; this changes its initial level, not a fixed ceiling.
 
 That is why YouTube and SoundCloud are audibly hotter than Spotify. A fixed
 counter-attenuation on the media path would only match at one slider

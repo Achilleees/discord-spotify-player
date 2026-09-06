@@ -41,8 +41,11 @@ Opt-in paired routing now makes nob the slash frontend (`/play`, `/music`,
 `/soundboard`, `/server`) while Spotibot retains its own card buttons. Each
 performer still owns its audio and account lifecycle; typed authenticated local requests
 link behavior without sharing state. The [soundboard](soundboard.md) uses
-that voice owner for bounded local-clip visits, with music taking priority.
-Its private menu is available in standalone mode too. Local implementation
+that voice owner for bounded local-clip visits when idle, with music taking
+priority over visits. In nob's existing music room, clips mix through the
+shared bridge alongside playing or paused music, with temporary ducking
+and no extra join or leave. Overlay cleanup preserves the music connection
+and queue. Its private menu is available in standalone mode too. Local implementation
 does not complete live acceptance or authorize deployment; random visits and
 voice reception remain outside this feature.
 

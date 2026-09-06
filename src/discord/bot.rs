@@ -93,6 +93,8 @@ pub(super) struct Handler {
     /// (a no-op when a call already exists), for the session-switch path.
     pub(super) join_voice: JoinVoiceFn,
     pub(super) voice_owner: Arc<VoiceOwner>,
+    /// Shared output mixer; soundboard overlays never take the music turn.
+    pub(super) bridge: Arc<AudioBridge>,
     pub(super) soundboard: Arc<crate::soundboard::Catalogue>,
     pub(super) soundboard_menus: Mutex<super::soundboard::Menus>,
     pub(super) boot: String,
@@ -810,7 +812,7 @@ impl DiscordBot {
         let (transport_tx, transport_rx) = mpsc::unbounded_channel::<TransportEvent>();
         let supervisor = SessionSupervisor::new(
             config.clone(),
-            bridge,
+            bridge.clone(),
             oauth.clone(),
             user_store.clone(),
             transport_tx,
@@ -842,6 +844,7 @@ impl DiscordBot {
             player,
             join_voice,
             voice_owner,
+            bridge,
             soundboard: Arc::new(soundboard),
             soundboard_menus: Mutex::new(super::soundboard::Menus::default()),
             boot: uuid::Uuid::new_v4().to_string(),

@@ -15,11 +15,24 @@ pub(super) struct VoiceLease {
     pub cancelled: CancellationToken,
 }
 
+/// Temporary audio inside a music connection. Its identity is independent of
+/// the voice revision, so completion cannot retire or invalidate music.
+#[derive(Clone)]
+pub(super) struct OverlayLease {
+    pub generation: u64,
+    pub channel: u64,
+    pub requester: u64,
+    pub cancelled: CancellationToken,
+    music_generation: u64,
+}
+
 #[derive(Default)]
 struct State {
     generation: u64,
     lease: Option<VoiceLease>,
     connected: bool,
+    overlay_generation: u64,
+    overlay: Option<OverlayLease>,
 }
 
 #[derive(Default)]
@@ -63,6 +76,9 @@ impl VoiceOwner {
                     lease.cancelled.cancel();
                 }
                 state.generation += 1;
+                if let Some(overlay) = &state.overlay {
+                    overlay.cancelled.cancel();
+                }
             }
         }
     }
@@ -78,6 +94,7 @@ impl VoiceOwner {
             }
             lease.cancelled.cancel();
         }
+        Self::clear_overlay_locked(state);
         state.generation += 1;
         let lease = VoiceLease {
             generation: state.generation,
@@ -89,6 +106,87 @@ impl VoiceOwner {
         state.lease = Some(lease.clone());
         state.connected = false;
         Some(lease)
+    }
+
+    /// Reserve one clip within the already-connected music room. Neither the
+    /// music lease nor its revision changes while an overlay starts or ends.
+    pub fn claim_overlay(&self, channel: u64, user: u64, expected: u64) -> Option<OverlayLease> {
+        let mut state = self.state.lock();
+        if state.generation != expected || !state.connected || state.overlay.is_some() {
+            return None;
+        }
+        let music_generation = state
+            .lease
+            .as_ref()
+            .filter(|lease| {
+                lease.activity == VoiceActivity::Music
+                    && lease.channel == channel
+                    && !lease.cancelled.is_cancelled()
+            })?
+            .generation;
+        state.overlay_generation += 1;
+        let lease = OverlayLease {
+            generation: state.overlay_generation,
+            channel,
+            requester: user,
+            cancelled: CancellationToken::new(),
+            music_generation,
+        };
+        state.overlay = Some(lease.clone());
+        Some(lease)
+    }
+
+    /// A cancelled clip remains reserved until its own cleanup releases it.
+    pub fn overlay_busy(&self) -> bool {
+        self.state.lock().overlay.is_some()
+    }
+
+    pub fn overlay_current(&self, lease: &OverlayLease) -> bool {
+        self.with_overlay_current(lease, || ()).is_some()
+    }
+
+    /// Run a synchronous effect while overlay cancellation and music retirement
+    /// are excluded. Never await or perform blocking I/O inside the callback.
+    pub fn with_overlay_current<T>(
+        &self,
+        lease: &OverlayLease,
+        effect: impl FnOnce() -> T,
+    ) -> Option<T> {
+        let state = self.state.lock();
+        if !state.connected {
+            return None;
+        }
+        state.overlay.as_ref().filter(|active| {
+            active.generation == lease.generation && !active.cancelled.is_cancelled()
+        })?;
+        state.lease.as_ref().filter(|music| {
+            music.activity == VoiceActivity::Music
+                && music.generation == lease.music_generation
+                && music.channel == lease.channel
+                && !music.cancelled.is_cancelled()
+        })?;
+        Some(effect())
+    }
+
+    /// Remove this clip's reservation without touching the connection or any
+    /// replacement overlay installed after it was cancelled.
+    pub fn release_overlay(&self, lease: &OverlayLease) -> bool {
+        let mut state = self.state.lock();
+        if state
+            .overlay
+            .as_ref()
+            .is_none_or(|active| active.generation != lease.generation)
+        {
+            return false;
+        }
+        Self::clear_overlay_locked(&mut state);
+        true
+    }
+
+    fn clear_overlay_locked(state: &mut State) {
+        if let Some(overlay) = state.overlay.take() {
+            overlay.cancelled.cancel();
+        }
     }
 
     pub fn claim_visit(&self, channel: u64, user: u64, expected: u64) -> Option<VoiceLease> {
@@ -123,27 +221,37 @@ impl VoiceOwner {
     }
 
     pub fn cancel_visit(&self) {
-        if let Some(lease) = self
-            .state
-            .lock()
+        let state = self.state.lock();
+        if let Some(lease) = state
             .lease
             .as_ref()
             .filter(|lease| lease.activity == VoiceActivity::Soundboard)
         {
             lease.cancelled.cancel();
         }
+        if let Some(overlay) = &state.overlay {
+            overlay.cancelled.cancel();
+        }
     }
 
     pub fn requester_moved(&self, user: u64, channel: Option<u64>) {
-        if let Some(lease) = self
-            .state
-            .lock()
+        let state = self.state.lock();
+        if let Some(lease) = state
             .lease
             .as_ref()
             .filter(|lease| lease.requester == Some(user))
         {
             if channel != Some(lease.channel) {
                 lease.cancelled.cancel();
+            }
+        }
+        if let Some(overlay) = state
+            .overlay
+            .as_ref()
+            .filter(|lease| lease.requester == user)
+        {
+            if channel != Some(overlay.channel) {
+                overlay.cancelled.cancel();
             }
         }
     }
@@ -214,6 +322,7 @@ impl VoiceOwner {
     }
 
     fn retire_locked(state: &mut State) -> u64 {
+        Self::clear_overlay_locked(state);
         if let Some(lease) = state.lease.take() {
             lease.cancelled.cancel();
         }
@@ -260,6 +369,7 @@ impl VoiceOwner {
         {
             lease.cancelled.cancel();
             state.lease = None;
+            Self::clear_overlay_locked(&mut state);
             state.generation += 1;
         }
     }
@@ -491,5 +601,167 @@ mod tests {
         let (new, _) = owner.claim_for(20, None).unwrap();
         assert!(owner.retire_music_if(revision).is_none());
         assert!(owner.current(&new));
+    }
+
+    #[test]
+    fn overlay_requires_connected_music_in_the_requested_room_and_current_revision() {
+        let owner = VoiceOwner::default();
+        let idle_revision = owner.snapshot().0;
+        assert!(owner.claim_overlay(10, 100, idle_revision).is_none());
+        let music = owner.claim(10).unwrap();
+        let revision = owner.snapshot().0;
+        assert!(owner.claim_overlay(10, 100, revision).is_none());
+        assert!(owner.mark_connected(&music));
+        assert!(owner.claim_overlay(20, 100, revision).is_none());
+        assert!(owner.claim_overlay(10, 100, idle_revision).is_none());
+        assert!(owner.claim_overlay(10, 100, revision).is_some());
+
+        let visiting = VoiceOwner::default();
+        let visit = visiting.claim_visit(10, 100, 0).unwrap();
+        assert!(visiting.mark_connected(&visit));
+        assert!(visiting
+            .claim_overlay(10, 100, visiting.snapshot().0)
+            .is_none());
+    }
+
+    #[test]
+    fn overlay_completion_preserves_music_connection_and_panel_revision() {
+        let owner = VoiceOwner::default();
+        let music = owner.claim(10).unwrap();
+        assert!(owner.mark_connected(&music));
+        let initial_status = owner.status();
+        let overlay = owner.claim_overlay(10, 100, initial_status.0).unwrap();
+        assert!(owner.overlay_busy());
+        assert_eq!(owner.status(), initial_status);
+        assert_eq!(
+            owner.with_overlay_current(&overlay, || "attached"),
+            Some("attached")
+        );
+        // Resuming or reusing music in the same room preserves the overlay.
+        assert_eq!(
+            owner.claim_for(10, None).unwrap().0.generation,
+            music.generation
+        );
+        assert!(owner.overlay_current(&overlay));
+        assert!(owner.release_overlay(&overlay));
+        assert!(!owner.overlay_current(&overlay));
+        assert!(!owner.overlay_busy());
+        assert_eq!(owner.status(), initial_status);
+        assert!(owner.current(&music));
+        assert!(owner.connected(&music));
+        assert!(!music.cancelled.is_cancelled());
+    }
+
+    #[test]
+    fn overlay_blocks_duplicates_and_cancelled_setup_until_its_own_release() {
+        let owner = VoiceOwner::default();
+        let music = owner.claim(10).unwrap();
+        assert!(owner.mark_connected(&music));
+        let revision = owner.snapshot().0;
+        let overlay = owner.claim_overlay(10, 100, revision).unwrap();
+        assert!(owner.claim_overlay(10, 100, revision).is_none());
+        assert!(owner.claim_overlay(10, 200, revision).is_none());
+        owner.cancel_visit();
+        assert!(overlay.cancelled.is_cancelled());
+        assert!(owner.overlay_busy());
+        assert!(owner.claim_overlay(10, 200, revision).is_none());
+        assert!(owner
+            .with_overlay_current(&overlay, || panic!("cancelled overlay attached"))
+            .is_none());
+        assert!(owner.current(&music));
+        assert!(owner.release_overlay(&overlay));
+        let replacement = owner.claim_overlay(10, 200, revision).unwrap();
+        assert_ne!(overlay.generation, replacement.generation);
+        assert!(!owner.release_overlay(&overlay));
+        assert!(owner.overlay_current(&replacement));
+        assert!(!replacement.cancelled.is_cancelled());
+    }
+
+    #[test]
+    fn requester_departure_cancels_only_the_overlay_without_reviving_on_reentry() {
+        for destination in [None, Some(20)] {
+            let owner = VoiceOwner::default();
+            let music = owner.claim(10).unwrap();
+            assert!(owner.mark_connected(&music));
+            let overlay = owner.claim_overlay(10, 100, owner.snapshot().0).unwrap();
+            owner.requester_moved(200, destination);
+            owner.requester_moved(100, Some(10));
+            assert!(owner.overlay_current(&overlay));
+            owner.requester_moved(100, destination);
+            assert!(overlay.cancelled.is_cancelled());
+            assert!(!owner.overlay_current(&overlay));
+            assert!(owner.overlay_busy());
+            owner.requester_moved(100, Some(10));
+            assert!(!owner.overlay_current(&overlay));
+            assert!(owner.current(&music));
+            assert!(owner.connected(&music));
+        }
+    }
+
+    #[test]
+    fn admin_move_cancels_overlay_and_keeps_music_alive_in_the_new_room() {
+        let owner = VoiceOwner::default();
+        let music = owner.claim(10).unwrap();
+        assert!(owner.mark_connected(&music));
+        let revision = owner.snapshot().0;
+        let overlay = owner.claim_overlay(10, 100, revision).unwrap();
+        owner.observe_channel(10);
+        assert!(owner.overlay_current(&overlay));
+        owner.observe_channel(20);
+        assert!(overlay.cancelled.is_cancelled());
+        assert!(!owner.overlay_current(&overlay));
+        assert!(owner.current(&music));
+        assert!(owner.connected(&music));
+        assert_eq!(owner.music_room(), Some(20));
+        assert!(owner.release_overlay(&overlay));
+        assert!(owner.claim_overlay(20, 100, revision).is_none());
+        let moved_overlay = owner.claim_overlay(20, 200, owner.snapshot().0).unwrap();
+        assert!(!owner.release_overlay(&overlay));
+        assert!(owner.overlay_current(&moved_overlay));
+    }
+
+    #[test]
+    fn retired_music_cancels_overlay_and_stale_cleanup_cannot_touch_replacements() {
+        let owner = VoiceOwner::default();
+        let music = owner.claim(10).unwrap();
+        assert!(owner.mark_connected(&music));
+        let overlay = owner.claim_overlay(10, 100, owner.snapshot().0).unwrap();
+        owner.retire_music().unwrap();
+        assert!(overlay.cancelled.is_cancelled());
+        assert!(!owner.overlay_busy());
+        assert!(!owner.overlay_current(&overlay));
+
+        let replacement_music = owner.claim(10).unwrap();
+        assert!(owner.mark_connected(&replacement_music));
+        let replacement_overlay = owner.claim_overlay(10, 200, owner.snapshot().0).unwrap();
+        owner.failed(&music);
+        assert!(!owner.retire_if(&music));
+        assert!(!owner.release_overlay(&overlay));
+        assert!(owner
+            .with_overlay_current(&overlay, || panic!("retired overlay attached"))
+            .is_none());
+        assert!(owner.current(&replacement_music));
+        assert!(owner.connected(&replacement_music));
+        assert!(owner.overlay_current(&replacement_overlay));
+    }
+
+    #[test]
+    fn failed_or_conditionally_retired_music_releases_its_overlay() {
+        for fail in [false, true] {
+            let owner = VoiceOwner::default();
+            let music = owner.claim(10).unwrap();
+            assert!(owner.mark_connected(&music));
+            let overlay = owner.claim_overlay(10, 100, owner.snapshot().0).unwrap();
+            if fail {
+                owner.failed(&music);
+            } else {
+                assert!(owner.retire_if(&music));
+            }
+            assert!(overlay.cancelled.is_cancelled());
+            assert!(!owner.overlay_busy());
+            assert!(!owner.overlay_current(&overlay));
+            assert!(!owner.release_overlay(&overlay));
+            assert_eq!(owner.activity(), None);
+        }
     }
 }

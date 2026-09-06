@@ -38,8 +38,9 @@ impl SongbirdEventHandler for TrackErrorHandler {
 /// Wraps in a RawAdapter which adds the SbirdRaw header that Songbird expects.
 ///
 /// On the first read, blocks until `prebuffer_samples` have accumulated (or
-/// `prebuffer_wait` elapses), so playback starts on a filled buffer instead of
-/// stuttering through the initial silence.
+/// `prebuffer_wait` elapses), so music starts on a filled buffer instead of
+/// stuttering through the initial silence. An overlay bypasses that music
+/// prebuffer, including when music is paused or a clip is very short.
 pub struct SimpleBridgeReader {
     bridge: Arc<AudioBridge>,
     pos: u64,
@@ -99,7 +100,8 @@ impl Read for SimpleBridgeReader {
         // filled buffer instead of stuttering through the opening silence.
         if !self.prebuffer_done {
             let start = std::time::Instant::now();
-            while self.bridge.len() < self.prebuffer_samples
+            while self.bridge.buffered_audio_len() < self.prebuffer_samples
+                && !self.bridge.has_overlay_audio()
                 && start.elapsed() < self.prebuffer_wait
             {
                 std::thread::sleep(std::time::Duration::from_millis(10));
@@ -143,8 +145,9 @@ impl Read for SimpleBridgeReader {
             chunk.copy_from_slice(&sample.to_le_bytes());
         }
 
-        // Starvation backoff only — real-time pacing lives with the producers
-        // (DiscordSink::write / the feeder), never in this reader.
+        // Starvation backoff only, when neither lane supplied audio. Music
+        // producers own their pacing; Songbird consumes overlays on the same
+        // output clock without an extra sleep while music is quiet.
         if samples_read == 0 {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
@@ -266,5 +269,21 @@ mod tests {
             t.elapsed() < Duration::from_secs(1),
             "a filled bridge must not wait out the full window"
         );
+    }
+
+    #[test]
+    fn short_overlay_bypasses_prebuffer_without_consuming_paused_music() {
+        let bridge = AudioBridge::new(1);
+        bridge.push_samples(&[0.75, 0.75]);
+        bridge.set_music_paused(true);
+        bridge.start_overlay(bridge.overlay_epoch(), vec![0.25, -0.25], 1.0).unwrap();
+        let mut r = SimpleBridgeReader::new(bridge.clone(), 4, Duration::from_secs(5));
+        let mut buf = [0u8; 8];
+        let t = Instant::now();
+        assert_eq!(r.read(&mut buf).unwrap(), 8);
+        assert!(t.elapsed() < Duration::from_secs(1), "short overlay bypasses music prebuffer");
+        assert_eq!(f32::from_le_bytes(buf[..4].try_into().unwrap()), 0.25);
+        assert_eq!(f32::from_le_bytes(buf[4..].try_into().unwrap()), -0.25);
+        assert_eq!(bridge.len(), 2, "paused music waits for its own resume");
     }
 }

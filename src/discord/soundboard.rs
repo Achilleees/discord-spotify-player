@@ -2,7 +2,7 @@
 //! paging keeps its original room/revision, while Refresh explicitly renews it.
 
 use super::{bot::Handler, ui::clipped};
-use crate::runtime::Profile;
+use crate::{routing::VoiceActivity, runtime::Profile};
 use serenity::all::*;
 use std::{
     collections::HashMap,
@@ -15,6 +15,25 @@ const PREFIX: &str = "sboard:";
 const TTL: Duration = Duration::from_secs(300);
 const MAX_MENUS: usize = 64;
 const PAGE_SIZE: usize = 10;
+
+fn unavailable(
+    owned_room: Option<u64>,
+    activity: Option<VoiceActivity>,
+    bot_room: Option<u64>,
+    user_room: Option<u64>,
+    clip_busy: bool,
+) -> bool {
+    if clip_busy {
+        return true;
+    }
+    match (owned_room, activity, bot_room) {
+        (None, None, None) => false,
+        (Some(room), Some(VoiceActivity::Music), Some(bot_room)) => {
+            user_room != Some(room) || bot_room != room
+        }
+        _ => true,
+    }
+}
 
 #[derive(Clone)]
 struct Choice {
@@ -70,7 +89,9 @@ impl Menu {
             return Err("nob's voice activity changed. Press Refresh before choosing a sound.");
         }
         if self.busy {
-            return Err("nob is busy in voice. Press Refresh when he's free.");
+            return Err(
+                "Join nob's room and wait for any current sound to finish, then press Refresh.",
+            );
         }
         let choice = self.choices[self.bounds()]
             .get(slot)
@@ -116,7 +137,7 @@ impl Menus {
 
 pub(super) fn register_commands() -> Vec<CreateCommand> {
     vec![CreateCommand::new("soundboard")
-        .description("Open your private soundboard and invite nob to play a sound")]
+        .description("Play a sound over nob's music or invite him for a quick visit")]
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -184,14 +205,16 @@ fn panel(id: &str, menu: &Menu, notice: &str) -> EditInteractionResponse {
         "**nob's soundboard**\nNo sounds are available yet.".into()
     } else {
         format!(
-            "**nob's soundboard** · Page {} / {}\nChoose a sound. When nob is free, he'll visit, play it and leave.",
+            "**nob's soundboard** · Page {} / {}\nPlay a sound over nob's music in your room. When he's free, he'll visit, play it and leave.",
             page + 1,
             menu.pages(),
         )
     };
     let availability = match (menu.choices.is_empty(), menu.busy, menu.room) {
         (true, _, _) => String::new(),
-        (false, true, _) => "\nnob is busy in voice. Press Refresh when he's free.".into(),
+        (false, true, _) => {
+            "\nJoin nob's room and wait for any current sound to finish, then press Refresh.".into()
+        }
         (false, false, Some(room)) => format!("\nYour voice room: <#{room}>."),
         (false, false, None) => "\nJoin a voice call, then press Refresh to choose a sound.".into(),
     };
@@ -246,14 +269,20 @@ impl Response<'_> {
 
 impl Handler {
     fn soundboard_menu(&self, ctx: &Context, user: UserId) -> Menu {
-        let (generation, owned_room) = self.voice_owner.snapshot();
+        let (generation, owned_room, activity) = self.voice_owner.status();
         let (bot_room, user_room) = self.voice_channels(ctx, user);
         Menu {
             user: user.get(),
             guild: self.guild_id.get(),
             room: user_room.map(|channel| channel.get()),
             generation,
-            busy: owned_room.is_some() || bot_room.is_some(),
+            busy: unavailable(
+                owned_room,
+                activity,
+                bot_room.map(|room| room.get()),
+                user_room.map(|room| room.get()),
+                self.voice_owner.overlay_busy() || self.bridge.has_overlay_audio(),
+            ),
             expires: Instant::now() + TTL,
             page: 0,
             choices: self
@@ -270,11 +299,17 @@ impl Handler {
     }
 
     fn refresh_soundboard_menu(&self, ctx: &Context, menu: &mut Menu) {
-        let (generation, owned_room) = self.voice_owner.snapshot();
+        let (generation, owned_room, activity) = self.voice_owner.status();
         let (bot_room, user_room) = self.voice_channels(ctx, UserId::new(menu.user));
         menu.room = user_room.map(|channel| channel.get());
         menu.generation = generation;
-        menu.busy = owned_room.is_some() || bot_room.is_some();
+        menu.busy = unavailable(
+            owned_room,
+            activity,
+            bot_room.map(|room| room.get()),
+            menu.room,
+            self.voice_owner.overlay_busy() || self.bridge.has_overlay_audio(),
+        );
     }
 
     async fn render_soundboard(
@@ -400,6 +435,54 @@ impl Handler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn same_room_music_accepts_sounds_but_other_rooms_and_clips_do_not() {
+        assert!(!unavailable(None, None, None, Some(10), false));
+        assert!(!unavailable(None, None, None, None, false));
+        assert!(!unavailable(
+            Some(10),
+            Some(VoiceActivity::Music),
+            Some(10),
+            Some(10),
+            false
+        ));
+        for (owned, activity, bot, user, busy) in [
+            (
+                Some(10),
+                Some(VoiceActivity::Music),
+                Some(10),
+                Some(20),
+                false,
+            ),
+            (Some(10), Some(VoiceActivity::Music), Some(10), None, false),
+            (Some(10), Some(VoiceActivity::Music), None, Some(10), false),
+            (
+                Some(10),
+                Some(VoiceActivity::Music),
+                Some(20),
+                Some(10),
+                false,
+            ),
+            (
+                Some(10),
+                Some(VoiceActivity::Music),
+                Some(10),
+                Some(10),
+                true,
+            ),
+            (
+                Some(10),
+                Some(VoiceActivity::Soundboard),
+                Some(10),
+                Some(10),
+                false,
+            ),
+            (None, None, Some(10), Some(10), false),
+        ] {
+            assert!(unavailable(owned, activity, bot, user, busy));
+        }
+    }
 
     fn menu(count: usize) -> Menu {
         Menu {
@@ -561,7 +644,7 @@ mod tests {
     #[test]
     fn busy_and_out_of_voice_panels_keep_refresh_while_disabling_sounds() {
         for (busy, room, expected) in [
-            (true, Some(3), "nob is busy in voice"),
+            (true, Some(3), "wait for any current sound to finish"),
             (false, None, "Join a voice call"),
         ] {
             let mut menu = menu(1);

@@ -22,9 +22,8 @@
 //! in this one.
 //!
 //! Two things are shell state rather than core state, because the core
-//! deliberately doesn't model them: the bridge-reader `TrackHandle` follows
-//! raw transport telemetry (Spotify playing resumes it, Spotify going quiet
-//! pauses it — unless a media item holds the turn and needs it live), and
+//! deliberately doesn't model them: the bridge's music drain follows raw
+//! transport telemetry while its reader stays live for overlays, and
 //! the status line's view of a running media item (`PresenceState` is
 //! Spotify-only, so `StartMedia`/`TrackHandle` effects feed the media
 //! title/pause state to the presence loop directly).
@@ -41,7 +40,7 @@ use tokio::sync::{mpsc, oneshot, Notify};
 use tokio_util::sync::CancellationToken;
 
 use crate::audio::dj::DJAnnouncer;
-use crate::audio_bridge::AudioBridge;
+use crate::audio_bridge::{AudioBridge, OverlayHandle};
 use crate::player::state::{
     step, Active, AnnounceKind, Effect, EnqueuePos, Input, MediaOutcome, NowPlaying,
     PlayerSnapshot, PlayerState, PresenceState, PreviousTrack, SpDevice, SpircCmd, StartGate,
@@ -61,6 +60,9 @@ const NO_ACTOR_REPLY: &str = "⚠️ The player didn't respond — try again.";
 /// How long a gated media runner waits for the Spotify pause ack before
 /// starting anyway (mirrors the old fixed post-`Pause` sleep).
 const PAUSE_ACK_FALLBACK_MS: u64 = 500;
+
+/// Keep the existing DJ level separate from the soundboard's configured gain.
+const DJ_OVERLAY_GAIN: f32 = 0.18;
 
 /// Discord-side UI requests the actor and its media runners emit; the bot
 /// layer maps them onto the UI task's own message type (which is private to
@@ -404,10 +406,11 @@ impl Actor {
             else {
                 continue;
             };
+            reset_audio_for_input(&self.deps.bridge, &input);
             // Shell-side handling that reads raw inputs rather than core
             // decisions, run on receipt before the step.
             match &input {
-                Input::Transport { ev, .. } => {
+                Input::Transport { gen, ev } if *gen == self.state.link_gen => {
                     if let TransportEvent::Paused { .. } = ev {
                         if let Some(gate) = self.pending_gate.take() {
                             gate.notify_one();
@@ -495,24 +498,24 @@ impl Actor {
         }
     }
 
-    /// Drive the shared bridge-reader track from raw Spotify telemetry: a
-    /// playing device is pushing audio, so the reader must run; a quiet one
-    /// freezes the buffered tail in place — unless a media item holds the
-    /// turn and needs the reader live. Also mirrors the baseline's pause
-    /// state onto the card's ⏯ button (only while the baseline owns the
+    /// Gate music drainage from raw Spotify telemetry. The shared reader
+    /// stays live so overlays remain audible while music is paused; a media
+    /// item's own pause state takes precedence over Spotify telemetry.
+    /// Also mirrors the baseline's pause state onto the card's ⏯ button
+    /// (only while the baseline owns the
     /// card — a pause echo under a media item must not repaint its button).
     fn drive_reader(&mut self, ev: &TransportEvent) {
         let media_turn = matches!(self.state.active, Active::Media { .. });
+        if let Some(paused) = music_pause_for_transport(&self.state.active, ev) {
+            self.deps.bridge.set_music_paused(paused);
+        }
         match ev {
             TransportEvent::Playing { .. } => {
-                // A `Playing` under a user-paused media item is an
-                // interloper the core pauses right back; resuming the
-                // reader for it would audibly unfreeze the media item.
-                if !matches!(self.state.active, Active::Media { paused: true, .. }) {
-                    let handle = { self.deps.track_handle.lock().clone() };
-                    if let Some(handle) = handle {
-                        let _ = handle.play();
-                    }
+                // The music gate above still protects a paused media item
+                // when Spotify reports an interloping play.
+                let handle = { self.deps.track_handle.lock().clone() };
+                if let Some(handle) = handle {
+                    let _ = handle.play();
                 }
                 if !media_turn && self.buttons_paused {
                     self.buttons_paused = false;
@@ -525,10 +528,6 @@ impl Actor {
             | TransportEvent::Unavailable { .. } => {
                 if media_turn {
                     return;
-                }
-                let handle = { self.deps.track_handle.lock().clone() };
-                if let Some(handle) = handle {
-                    let _ = handle.pause();
                 }
                 if matches!(ev, TransportEvent::Paused { .. }) && !self.buttons_paused {
                     self.buttons_paused = true;
@@ -552,6 +551,7 @@ impl Actor {
                 let token = CancellationToken::new();
                 self.feeder_cancel = Some(token.clone());
                 self.feeder_paused.store(false, Ordering::Relaxed);
+                self.deps.bridge.set_music_paused(false);
 
                 let gate_notify = match gate {
                     StartGate::Immediate => None,
@@ -580,7 +580,6 @@ impl Actor {
 
                 let ctx = RunnerCtx {
                     bridge: self.deps.bridge.clone(),
-                    track_handle: self.deps.track_handle.clone(),
                     feeder_paused: self.feeder_paused.clone(),
                     dj: self.deps.dj.clone(),
                     announce_enabled: self.deps.announce_enabled.clone(),
@@ -597,7 +596,10 @@ impl Actor {
                 }
             }
 
-            Effect::ClearBridge => self.deps.bridge.clear(),
+            // Music transitions fence delayed DJ synthesis, but a soundboard
+            // clip already mixing into this call keeps playing. Explicit
+            // stop/voice loss clears both lanes before the core runs.
+            Effect::ClearBridge => self.deps.bridge.clear_music(),
 
             Effect::RecordAired(aired) => {
                 // Handed to the serialized writer, never written here: the
@@ -662,13 +664,14 @@ impl Actor {
 
             Effect::TrackHandle(cmd) => {
                 let paused = matches!(cmd, TrackHandleCmd::Pause);
-                // Pause the feeder too: the songbird pause freezes output
-                // instantly, and the flag stops the download side from
-                // racing ahead more than the bridge can hold.
+                // Freeze only music: the shared Songbird track stays live
+                // for soundboard/DJ overlays, and the feeder stops advancing
+                // beyond the music already buffered.
                 self.feeder_paused.store(paused, Ordering::Relaxed);
+                self.deps.bridge.set_music_paused(paused);
                 let handle = { self.deps.track_handle.lock().clone() };
                 if let Some(handle) = handle {
-                    let _ = if paused { handle.pause() } else { handle.play() };
+                    let _ = handle.play();
                 }
                 self.buttons_paused = paused;
                 (self.deps.ui_send)(UiEvent::Buttons { paused });
@@ -722,14 +725,16 @@ impl Actor {
                 if self.deps.announce_enabled.load(Ordering::Relaxed) {
                     let dj = self.deps.dj.clone();
                     let bridge = self.deps.bridge.clone();
+                    let overlay_epoch = bridge.overlay_epoch();
                     tokio::spawn(async move {
                         match dj.track_announce_clip(&title, &artist, "").await {
                             Some(clip) => {
-                                tracing::info!(title = %title, artist = %artist, samples = clip.len(), "DJ overlay pushed");
-                                bridge.push_overlay(&clip);
+                                if let Err(error) = bridge.start_overlay(overlay_epoch, clip, DJ_OVERLAY_GAIN) {
+                                    tracing::debug!(?error, "dj overlay skipped");
+                                }
                             }
                             None => {
-                                tracing::warn!(title = %title, artist = %artist, "DJ clip failed");
+                                tracing::warn!(title = %title, artist = %artist, "dj clip failed");
                             }
                         }
                     });
@@ -786,10 +791,31 @@ impl Actor {
     }
 }
 
+fn reset_audio_for_input(bridge: &AudioBridge, input: &Input) {
+    if matches!(input, Input::Stop { .. } | Input::VoiceLost) {
+        bridge.clear();
+    }
+}
+
+/// Spotify echoes may not release a media item's human pause. All other
+/// transport pause decisions affect only music; overlay consumption is live.
+fn music_pause_for_transport(active: &Active, ev: &TransportEvent) -> Option<bool> {
+    if let Active::Media { paused, .. } = active {
+        return matches!(ev, TransportEvent::Playing { .. }).then_some(*paused);
+    }
+    match ev {
+        TransportEvent::Playing { .. } => Some(false),
+        TransportEvent::Paused { .. }
+        | TransportEvent::Stopped
+        | TransportEvent::EndOfTrack
+        | TransportEvent::Unavailable { .. } => Some(true),
+        _ => None,
+    }
+}
+
 /// Everything one media runner needs, cloned out of the actor's deps.
 struct RunnerCtx {
     bridge: Arc<AudioBridge>,
-    track_handle: Arc<Mutex<Option<TrackHandle>>>,
     feeder_paused: Arc<AtomicBool>,
     dj: Arc<DJAnnouncer>,
     announce_enabled: Arc<AtomicBool>,
@@ -798,9 +824,25 @@ struct RunnerCtx {
     input_tx: mpsc::UnboundedSender<Input>,
 }
 
-/// One queue item's playback, start to finish: await the start gate, resume
-/// the shared bridge-reader track, run the pre-feed DJ announce, feed the
-/// item into the bridge, then report `MediaEnded` with this start's epoch.
+/// A cancelled runner can clean up only its own announcement, including
+/// cancellation racing between synthesis completion and overlay admission.
+struct RunnerOverlay {
+    bridge: Arc<AudioBridge>,
+    handle: OverlayHandle,
+    token: CancellationToken,
+}
+
+impl Drop for RunnerOverlay {
+    fn drop(&mut self) {
+        if self.token.is_cancelled() {
+            self.bridge.cancel_overlay(&self.handle);
+        }
+    }
+}
+
+/// One queue item's playback, start to finish: await the start gate, run
+/// the pre-feed DJ announce, feed the item into the bridge, then report
+/// `MediaEnded` with this start's epoch.
 /// The runner owns nothing beyond its own feed — cancellation arrives
 /// through the token the actor registered before spawning it.
 async fn media_runner(
@@ -810,33 +852,98 @@ async fn media_runner(
     token: CancellationToken,
     gate: Option<Arc<Notify>>,
 ) {
+    complete_media_runner(
+        &ctx.input_tx,
+        epoch,
+        run_media(&ctx, &item, token, gate),
+    ).await;
+}
+
+/// Every normal exit, including cancellation before feeding starts, must
+/// reach the actor: Skip waits for this epoch's completion to advance.
+async fn complete_media_runner(
+    input_tx: &mpsc::UnboundedSender<Input>,
+    epoch: u64,
+    run: impl Future<Output = MediaOutcome>,
+) {
+    let outcome = run.await;
+    let _ = input_tx.send(Input::MediaEnded { epoch, outcome });
+}
+
+/// Own all asynchronous setup before feeding. The announcement future is
+/// lazy, so neither synthesis nor overlay admission starts before the gate.
+async fn prepare_media_runner(
+    bridge: &Arc<AudioBridge>,
+    token: &CancellationToken,
+    gate: Option<Arc<Notify>>,
+    announcement: impl Future<Output = Option<Vec<f32>>>,
+) -> Result<Option<RunnerOverlay>, MediaOutcome> {
     if let Some(gate) = gate {
         // The fallback mirrors the old fixed post-Pause sleep; the actor
         // pre-fires the gate when the baseline was already paused.
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_millis(PAUSE_ACK_FALLBACK_MS),
-            gate.notified(),
-        )
-        .await;
-    }
-
-    // The bridge-reader track may be paused (the baseline was paused or
-    // idle before this item); resume it so the feed is heard.
-    {
-        let handle = { ctx.track_handle.lock().clone() };
-        if let Some(handle) = handle {
-            let _ = handle.play();
+        tokio::select! {
+            biased;
+            _ = token.cancelled() => return Err(MediaOutcome::Cancelled),
+            _ = tokio::time::timeout(
+                std::time::Duration::from_millis(PAUSE_ACK_FALLBACK_MS),
+                gate.notified(),
+            ) => {}
         }
     }
 
+    // The actor owns the music pause gate. A delayed runner must never
+    // reopen it after a user pause, skip, stop, or replacement start.
+    if token.is_cancelled() {
+        return Err(MediaOutcome::Cancelled);
+    }
+
+    let overlay_epoch = bridge.overlay_epoch();
+    let clip = tokio::select! {
+        biased;
+        _ = token.cancelled() => return Err(MediaOutcome::Cancelled),
+        clip = announcement => clip,
+    };
+    let owned = if let Some(clip) = clip {
+        match bridge.start_overlay(overlay_epoch, clip, DJ_OVERLAY_GAIN) {
+            Ok(handle) => Some(RunnerOverlay {
+                bridge: bridge.clone(),
+                handle,
+                token: token.clone(),
+            }),
+            Err(error) => {
+                tracing::debug!(?error, "dj overlay skipped");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    if token.is_cancelled() {
+        return Err(MediaOutcome::Cancelled);
+    }
+    Ok(owned)
+}
+
+async fn run_media(
+    ctx: &RunnerCtx,
+    item: &QueueItem,
+    token: CancellationToken,
+    gate: Option<Arc<Notify>>,
+) -> MediaOutcome {
     // DJ announcement before the track (honors the /announce toggle).
-    if ctx.announce_enabled.load(Ordering::Relaxed) && ctx.dj.is_enabled() {
-        let title = item.source.display_title().to_string();
-        let subtitle = item.source.display_subtitle();
-        if let Some(clip) = ctx.dj.track_announce_clip(&title, &subtitle, &item.queued_by).await {
-            ctx.bridge.push_overlay(&clip);
+    let announcement = async {
+        if ctx.announce_enabled.load(Ordering::Relaxed) && ctx.dj.is_enabled() {
+            let title = item.source.display_title().to_string();
+            let subtitle = item.source.display_subtitle();
+            ctx.dj.track_announce_clip(&title, &subtitle, &item.queued_by).await
+        } else {
+            None
         }
-    }
+    };
+    let _announcement = match prepare_media_runner(&ctx.bridge, &token, gate, announcement).await {
+        Ok(owned) => owned,
+        Err(outcome) => return outcome,
+    };
 
     let feed_result = match &item.source {
         MediaSource::YouTube { url, .. } => {
@@ -861,7 +968,7 @@ async fn media_runner(
         }
     };
 
-    let outcome = match feed_result {
+    match feed_result {
         Ok(()) => {
             tracing::info!("priority item finished: {}", item.source.display_title());
             (ctx.ui_send)(UiEvent::HistoryMedia { item: item.clone() });
@@ -884,9 +991,7 @@ async fn media_runner(
             (ctx.ui_send)(UiEvent::IdleCard);
             MediaOutcome::Finished
         }
-    };
-
-    let _ = ctx.input_tx.send(Input::MediaEnded { epoch, outcome });
+    }
 }
 
 fn authorize_input(
@@ -923,8 +1028,210 @@ fn reject_guarded(input: Input) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio_bridge::{OverlayError, OverlayStatus};
     use crate::history::HistoryStore;
     use crate::player::state::{AiredSource, AiredTrack};
+
+    async fn cancelled_preparation(
+        bridge: &Arc<AudioBridge>,
+        token: &CancellationToken,
+        gate: Option<Arc<Notify>>,
+        announcement: impl Future<Output = Option<Vec<f32>>>,
+    ) -> MediaOutcome {
+        match prepare_media_runner(bridge, token, gate, announcement).await {
+            Err(outcome) => outcome,
+            Ok(_) => panic!("cancelled preparation must not reach the feeder"),
+        }
+    }
+
+    fn assert_cancelled_completion(rx: &mut mpsc::UnboundedReceiver<Input>, epoch: u64) {
+        let completion = rx.try_recv().expect("the actor must receive the cancellation");
+        assert!(matches!(
+            &completion,
+            Input::MediaEnded { epoch: received, outcome: MediaOutcome::Cancelled } if *received == epoch
+        ));
+        assert!(rx.try_recv().is_err(), "one completion per runner");
+
+        // The real consumer depends on this report: Skip cancels the runner
+        // first and starts the next queued item only after MediaEnded arrives.
+        let item = |name: &str| QueueItem::new(
+            MediaSource::File {
+                filename: name.into(),
+                attachment_url: "https://example.invalid/test.wav".into(),
+            },
+            "test".into(),
+            1,
+        );
+        let mut state = PlayerState::new();
+        state.active = Active::Media { item: item("first.wav"), paused: false, epoch };
+        state.media_epoch = epoch;
+        assert!(state.queue.push(item("next.wav")));
+        let (reply, _) = oneshot::channel();
+        let now = Instant::now();
+        let skip = step(&mut state, Input::Skip { reply }, now);
+        assert!(skip.iter().any(|effect| matches!(effect, Effect::CancelMedia)));
+        let completed = step(&mut state, completion, now);
+        assert!(completed.iter().any(|effect| matches!(
+            effect,
+            Effect::StartMedia { item, .. } if item.source.display_title() == "next.wav"
+        )), "cancellation completion releases the next queued item");
+    }
+
+    #[tokio::test]
+    async fn cancellation_before_feeding_reports_completion_with_or_without_a_start_gate() {
+        for wait_for_gate in [false, true] {
+            let bridge = AudioBridge::new(1);
+            let token = CancellationToken::new();
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let gate = wait_for_gate.then(|| Arc::new(Notify::new()));
+            let runner = complete_media_runner(&tx, 42, cancelled_preparation(
+                &bridge,
+                &token,
+                gate,
+                async { panic!("a cancelled start must never begin synthesis") },
+            ));
+            tokio::pin!(runner);
+            if wait_for_gate {
+                // Poll once to place the real preparation future inside its
+                // pending pause-ack wait, without a wall-clock sleep.
+                let pending = std::future::poll_fn(|cx| {
+                    std::task::Poll::Ready(runner.as_mut().poll(cx).is_pending())
+                }).await;
+                assert!(pending);
+            }
+            token.cancel();
+            runner.await;
+            assert_cancelled_completion(&mut rx, 42);
+            assert!(!bridge.has_overlay_audio());
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_synthesis_reaches_the_actor_mailbox() {
+        let bridge = AudioBridge::new(1);
+        let token = CancellationToken::new();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (started, synthesis_started) = oneshot::channel();
+        let announcement = async {
+            let _ = started.send(());
+            std::future::pending::<Option<Vec<f32>>>().await
+        };
+        tokio::join!(
+            complete_media_runner(&tx, 73, cancelled_preparation(&bridge, &token, None, announcement)),
+            async {
+                synthesis_started.await.unwrap();
+                token.cancel();
+            },
+        );
+        assert_cancelled_completion(&mut rx, 73);
+        assert!(!bridge.has_overlay_audio());
+    }
+
+    #[tokio::test]
+    async fn cancellation_racing_synthesis_completion_reports_and_removes_its_overlay() {
+        let bridge = AudioBridge::new(1);
+        let token = CancellationToken::new();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let announcement = async {
+            // The cancellation branch was polled first while still live;
+            // synthesis then completes at the same instant as the cancel.
+            token.cancel();
+            Some(vec![0.25, 0.25])
+        };
+        complete_media_runner(&tx, 91, cancelled_preparation(&bridge, &token, None, announcement)).await;
+        assert_cancelled_completion(&mut rx, 91);
+        assert!(!bridge.has_overlay_audio(), "cancelled setup owns no audible clip");
+    }
+
+    #[test]
+    fn spotify_telemetry_cannot_unpause_media_or_silence_its_overlay() {
+        let bridge = AudioBridge::new(1);
+        bridge.push_samples(&[0.75, 0.75]);
+        let item = QueueItem::new(
+            MediaSource::File {
+                filename: "test.wav".into(),
+                attachment_url: "https://example.invalid/test.wav".into(),
+            },
+            "test".into(),
+            1,
+        );
+        let active = Active::Media { item, paused: true, epoch: 1 };
+        let uri = SpotifyUri::from_uri("spotify:track:0000000000000000000001").unwrap();
+        let playing = TransportEvent::Playing { uri: uri.clone(), meta: None };
+        bridge.set_music_paused(music_pause_for_transport(&active, &playing).unwrap());
+        assert_eq!(music_pause_for_transport(&active, &TransportEvent::Paused { uri }), None);
+        bridge.start_overlay(bridge.overlay_epoch(), vec![0.25, 0.25], 1.0).unwrap();
+        let mut output = [0.0; 2];
+        assert_eq!(bridge.pull_samples(&mut output), 2);
+        assert_eq!(output, [0.25, 0.25]);
+        assert_eq!(bridge.len(), 2, "media samples stay frozen for resume");
+        bridge.set_music_paused(false);
+        assert_eq!(bridge.pull_samples(&mut output), 2);
+        assert!(output[0] > 0.0 && output[0] <= 0.75);
+        assert_eq!(output[0], output[1]);
+        assert_eq!(bridge.len(), 0, "resume consumes the retained frame");
+        bridge.pull_samples(&mut vec![0.0; crate::audio_bridge::SAMPLE_RATE * 2]);
+        bridge.push_samples(&[0.75, 0.75]);
+        bridge.pull_samples(&mut output);
+        assert_eq!(output, [0.75, 0.75], "music returns to unity after the duck release");
+    }
+
+    #[test]
+    fn stop_and_voice_loss_cancel_audio_and_reject_delayed_dj_synthesis() {
+        let (reply, _) = oneshot::channel();
+        for input in [Input::Stop { reply, leave_voice: true }, Input::VoiceLost] {
+            let bridge = AudioBridge::new(1);
+            bridge.push_samples(&[0.5, 0.5]);
+            let clip = bridge.start_overlay(bridge.overlay_epoch(), vec![0.25, 0.25], 1.0).unwrap();
+            let synthesis_epoch = bridge.overlay_epoch();
+            reset_audio_for_input(&bridge, &input);
+            assert_eq!(bridge.len(), 0);
+            assert_eq!(clip.status(), OverlayStatus::Cancelled);
+            assert!(matches!(
+                bridge.start_overlay(synthesis_epoch, vec![0.25, 0.25], DJ_OVERLAY_GAIN),
+                Err(OverlayError::Stale)
+            ));
+        }
+    }
+
+    #[test]
+    fn cancelled_runner_cleans_its_announcement_without_touching_a_replacement() {
+        for replace in [false, true] {
+            let bridge = AudioBridge::new(1);
+            let token = CancellationToken::new();
+            let first = bridge.start_overlay(bridge.overlay_epoch(), vec![0.25, 0.25], DJ_OVERLAY_GAIN).unwrap();
+            let owned = RunnerOverlay { bridge: bridge.clone(), handle: first.clone(), token: token.clone() };
+            let replacement = if replace {
+                bridge.clear();
+                Some(bridge.start_overlay(bridge.overlay_epoch(), vec![0.5, 0.5], 1.0).unwrap())
+            } else {
+                None
+            };
+            token.cancel();
+            drop(owned);
+            assert_eq!(first.status(), OverlayStatus::Cancelled);
+            if let Some(replacement) = replacement {
+                assert_eq!(replacement.status(), OverlayStatus::Playing);
+            }
+        }
+    }
+
+    #[test]
+    fn spotify_pause_leaves_a_running_soundboard_clip_alive() {
+        let bridge = AudioBridge::new(1);
+        bridge.push_samples(&[0.5, 0.5]);
+        let clip = bridge.start_overlay(bridge.overlay_epoch(), vec![0.25, 0.25], 1.0).unwrap();
+        let ev = TransportEvent::Paused {
+            uri: SpotifyUri::from_uri("spotify:track:0000000000000000000001").unwrap(),
+        };
+        bridge.set_music_paused(music_pause_for_transport(&Active::Spotify { track: None }, &ev).unwrap());
+        reset_audio_for_input(&bridge, &Input::Transport { gen: 1, ev });
+        bridge.clear_music();
+        assert_eq!(clip.status(), OverlayStatus::Playing);
+        let mut output = [0.0; 2];
+        assert_eq!(bridge.pull_samples(&mut output), 2);
+        assert_eq!(output, [0.25, 0.25]);
+    }
 
     #[test]
     fn queued_command_rechecks_membership_when_the_actor_receives_it() {
