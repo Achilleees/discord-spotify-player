@@ -2,9 +2,11 @@
 
 A Discord music bot: per-user Spotify (via librespot + OAuth device
 authorization), plus YouTube/SoundCloud/files, streamed into one voice
-channel. This repo is the hardened reference for nob's music stack — see
-`docs/PORT.md` before large changes. Public docs: `docs/`; file map:
-`CODEMAP.md`; release notes: `CHANGELOG.md`. Working files (audits, plans)
+channel. This repo is the continuing foundation for Spotibot and nob: one
+workspace, shared music code, two separate bot processes. Nob features are
+being brought here; the eventual project name is `never-off-beat`. See
+`docs/PORT.md` for the accepted direction before large changes. Public docs:
+`docs/`; file map: `CODEMAP.md`; release notes: `CHANGELOG.md`. Working files (audits, plans)
 go in the gitignored `.local/`, not `docs/`.
 
 ## Safety and secrets
@@ -36,12 +38,19 @@ go in the gitignored `.local/`, not `docs/`.
 
 ## Build and run
 - `cargo build --release`; binary is `target\release\discord-spotify-player.exe`.
-- `cargo check` for fast feedback; `cargo test`; `cargo clippy --all-targets -- -D warnings` (what CI runs).
+- `cargo check --workspace --locked` for fast feedback; CI runs
+  `cargo test --workspace --locked`,
+  `cargo clippy --workspace --all-targets --locked -- -D warnings`, and
+  `cargo build --workspace --release --locked`.
 - Stop a running bot before `cargo build --release` — it locks the exe.
 - First-run setup: `--setup` writes `.env`. OAuth needs no config.
 - `.cargo/config.toml` (tracked) carries the cmake fix; MSVC toolchain on Windows.
 
 ## Architecture (see `docs/architecture.md`, `CODEMAP.md`)
+- The root package is the initial workspace member. `src/main.rs` creates
+  Tokio and calls the library's `run()` in `src/lib.rs`; existing runtime
+  modules remain private there. Each future bot host runs as its own process
+  with separate configuration, database, cache and Spotify device identity.
 - Two audio producers push PCM f32 into `AudioBridge`; `SimpleBridgeReader`
   pulls it out for Songbird. One player actor (`player/actor.rs`, pure
   decision core in `player/state.rs`) owns the queue, the armed Spotify

@@ -1,11 +1,48 @@
-# PORT.md — transplanting spotibot v0.5 into nob (Phase 1c)
+# PORT.md — shared Spotibot and nob continuity
 
-This repo is the hardened reference implementation of the music stack. Its job
-is to be transplanted into `never-off-beat` (nob) as Phase 1c, then retired.
-This file is the transfer dossier: what maps where, what was paid for in blood,
-what NOT to bring across.
+## Current direction (accepted 2026-09-06)
 
-## The 12 decisions (locked 2026-07-10)
+Continue this repository and Spotibot's Git history as the foundation for
+both bots. Evolve the existing package into a Cargo workspace and adapt nob's
+useful menus and server modules around the hardened playback implementation.
+The eventual project name is `never-off-beat`.
+
+- **Two Discord identities, two processes, shared source.** Spotibot remains
+  the music specialist; nob adds server utilities, soundboard and companion
+  features. Music features overlap through the same implementation.
+- **Keep the existing owners.** The player actor/pure core owns playback,
+  the session supervisor owns Spotify, and one UI task owns the card. Import
+  nob's presentation and actions through these boundaries.
+- **Isolate runtime state.** Each process needs its own configuration,
+  database, caches and Spotify device identity. Existing queue and active-user
+  tables are not safe for concurrent bot instances. Shared catalogues can be
+  designed explicitly later.
+- **Preserve behavior during extraction.** Retain current queue ordering,
+  Spotify lifecycle, audio framing/pacing, setup and credential storage. Add
+  menus and new playback capabilities incrementally with the relevant tests.
+- **Continue the dev/CI workflow.** `dev` is the integration branch; `main`
+  remains deployment-only. Local extraction does not require a prior live
+  cutover. Deployment still requires green checks and explicit intent.
+- **Retire the duplicate repository after migration.** Preserve nob's history
+  and pending work, import the required features, then coordinate renaming
+  this project and archiving the old nob repository under a legacy name.
+  Both bot identities survive.
+
+The initial workspace member is the existing `discord-spotify-player`
+package. `src/main.rs` calls the library entry point in `src/lib.rs`; runtime
+modules stay in place and the executable path is retained. Nob's separate
+host and imported menus are subsequent work, tracked on the existing
+`discord-spotify-player` board.
+
+## Historical transfer dossier — superseded migration plan
+
+The sections below record the earlier one-way transplant into the old nob
+repository. Their freeze/retirement instructions, destination module map,
+storage rewrite and wizard-removal recommendations are historical, not the
+current implementation plan. Keep the technical lessons as context; check
+current source and the accepted direction above before applying them.
+
+## Earlier decisions (2026-07-10 onward)
 
 1. **Strategy** — harden spotibot fully first, prove it live, then port.
 2. **YouTube branch** — merged into v0.5 (yt-dlp/ffmpeg, mixed queue, DJ TTS).

@@ -3,11 +3,21 @@
 Technical file map. For behavior and rationale, see `docs/architecture.md`,
 `docs/commands.md`, and `docs/PORT.md`.
 
+## Workspace
+
+`Cargo.toml` defines a workspace whose initial/default member is the existing
+`discord-spotify-player` package. It builds a library and the same named
+binary; root build/run commands and the deployment artifact path are retained.
+CI checks all workspace members with the committed lockfile.
+
 ## `src/`
 
 ```
 src/
-├── main.rs              entry point: logging, config load, YouTube/ffmpeg
+├── main.rs              executable entry point: Tokio runtime, calls the
+│                         library's discord_spotify_player::run()
+├── lib.rs               library entry point and private module tree:
+│                         logging, config load, YouTube/ffmpeg
 │                         checks, OAuth client, credential store, AudioBridge,
 │                         Discord bot startup, then parks
 ├── config.rs             .env → Config: required Discord ids, audio tuning,
@@ -135,7 +145,8 @@ src/
 ## Tests
 
 No separate `tests/` directory — every test is an inline `#[cfg(test)] mod
-tests` in the file it covers (`cargo test` runs them all). The pure core
+tests` in the file it covers (`cargo test --workspace --locked` runs them all
+through the library target). The pure core
 carries most of the suite:
 
 - `src/player/state.rs` — the bulk of the crate's tests: `step()` behavior

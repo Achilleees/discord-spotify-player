@@ -21,7 +21,14 @@ cargo build --release
 The binary lands at `target/release/discord-spotify-player.exe` (Windows) or
 `target/release/discord-spotify-player` (Linux).
 
-Fast feedback while developing: `cargo check`, `cargo test`, `cargo clippy`.
+Fast feedback while developing: `cargo check --workspace --locked`.
+Run the CI checks across all workspace members with:
+
+```
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked
+cargo build --workspace --release --locked
+```
 
 ## First run
 

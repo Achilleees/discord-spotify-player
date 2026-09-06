@@ -6,8 +6,12 @@ YouTube, SoundCloud and uploaded files — all in one shared queue that plays in
 strict order, like a radio. Control from any Spotify client or from slash
 commands and now-playing buttons in Discord.
 
-This repo is also the hardened reference for the music stack of
-[never-off-beat](../never-off-beat) (nob); see [docs/PORT.md](docs/PORT.md).
+This repo is becoming the shared home for **Spotibot and nob**, continuing
+Spotibot's Git history. The first step establishes a Cargo workspace and a
+library behind the existing binary. Nob's richer menus and server features
+will be adapted into this foundation; the two bots will run as separate
+processes. The eventual project name is `never-off-beat`; see the accepted
+direction in [docs/PORT.md](docs/PORT.md).
 
 ## Quick start
 

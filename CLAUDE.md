@@ -10,10 +10,12 @@ streamed into one Discord voice channel. Control happens from Spotify clients,
 from Discord slash commands (`/login`, `/play`, `/queue`, `/skip`, `/stop`,
 `/who`, `/np`, `/announce`, `/logout`, `/forget`), and from now-playing buttons.
 
-This repo is the hardened reference for the music stack of `never-off-beat`
-(nob). **Read `docs/PORT.md`** before large changes — it maps modules to nob
-and records the design decisions. Public docs live in `docs/`, the file map
-in `CODEMAP.md`; release notes go in `CHANGELOG.md` (prose per release, one
+This repo is the continuing foundation for Spotibot and nob: one workspace,
+shared music code, two separately configured bot processes. Nob's useful
+features are being brought here; the eventual project name is `never-off-beat`.
+**Read `docs/PORT.md`** before large changes — it records the accepted direction
+and clearly separates the superseded transfer dossier. Public docs live in
+`docs/`, the file map in `CODEMAP.md`; release notes go in `CHANGELOG.md` (prose per release, one
 bold headline per user-visible change). Working files (audits, plans) go in
 the gitignored `.local/`, never in `docs/`.
 
@@ -34,7 +36,10 @@ target/release/discord-spotify-player.exe          # normal
 target/release/discord-spotify-player.exe --setup  # first-run wizard
 ```
 
-`cargo check` for fast feedback, `cargo test`, `cargo clippy`. Stop the
+`cargo check --workspace --locked` for fast feedback. CI runs
+`cargo test --workspace --locked`,
+`cargo clippy --workspace --all-targets --locked -- -D warnings`, and
+`cargo build --workspace --release --locked`. Stop the
 running bot before `cargo build --release` — it locks the exe.
 
 ### Prerequisites
@@ -53,6 +58,12 @@ against Spotify's desktop client id.
 `EnvFilter`. Default `warn`.
 
 ## Architecture
+
+The root package is the first Cargo workspace member. `src/main.rs` owns the
+Tokio runtime and calls `discord_spotify_player::run()` in `src/lib.rs`, which
+owns startup and the private runtime modules. This is the first extraction;
+nob's separate host and imported menus are subsequent work. Run each identity
+in its own process with independent configuration, database and caches.
 
 ### Audio pipeline
 ```

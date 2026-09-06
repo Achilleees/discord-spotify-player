@@ -1,3 +1,8 @@
+[workspace]
+members = ["."]
+default-members = ["."]
+resolver = "2"
+
 [package]
 name = "discord-spotify-player"
 version = "0.5.0-rc2"

@@ -10,6 +10,12 @@ git tag (release) in this repository.
 
 ## Unreleased
 
+**Spotibot and nob now have a shared development foundation.** The repository
+is a Cargo workspace, with the existing music runtime behind a library entry
+point and the same executable and setup flow. CI checks the whole workspace
+using the lockfile. This prepares the code for nob's menus and a second bot
+host; those features will arrive in later changes.
+
 **Rapid Back taps no longer break the history walk.** Earlier track arrivals
 from double or triple taps no longer trigger a false playlist warning or
 reset the latest position. Unconfirmed jumps time out instead of leaving

@@ -9,7 +9,7 @@ Public documentation for spotibot. Start with `getting-started.md`.
 | `configuration.md` | every environment variable, logging presets, state on disk |
 | `architecture.md` | how it works — audio pipeline, player actor, session/account lifecycles |
 | `troubleshooting.md` | symptoms → causes → fixes |
-| `PORT.md` | the transfer dossier for porting the music stack into never-off-beat (nob) |
+| `PORT.md` | accepted shared Spotibot/nob direction and the historical transfer dossier |
 
 The technical file map is `../CODEMAP.md`; release notes are `../CHANGELOG.md`.
 
