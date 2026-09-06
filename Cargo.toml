@@ -3,9 +3,12 @@ members = [".", "crates/nob"]
 default-members = ["."]
 resolver = "2"
 
+[workspace.package]
+version = "0.6.0"
+
 [package]
 name = "discord-spotify-player"
-version = "0.5.0-rc2"
+version.workspace = true
 edition = "2021"
 
 [dependencies]

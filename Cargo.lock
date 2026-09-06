@@ -796,7 +796,7 @@ dependencies = [
 
 [[package]]
 name = "discord-spotify-player"
-version = "0.5.0-rc2"
+version = "0.6.0"
 dependencies = [
  "chacha20poly1305",
  "dialoguer",
@@ -2543,7 +2543,7 @@ checksum = "43794a0ace135be66a25d3ae77d41b91615fb68ae937f904090203e81f755b65"
 
 [[package]]
 name = "nob"
-version = "0.5.0-rc2"
+version = "0.6.0"
 dependencies = [
  "discord-spotify-player",
  "tokio",

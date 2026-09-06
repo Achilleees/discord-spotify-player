@@ -10,6 +10,8 @@ Technical file map. For behavior and rationale, see `docs/architecture.md`,
 binary; `cargo build --workspace --release --locked` builds both executables.
 CI checks all members. `tests/host_cli.rs` and `crates/nob/tests/cli.rs` exercise
 offline configuration through both real entry points using synthetic fixtures.
+Both hosts inherit their version from `[workspace.package]` in `Cargo.toml`;
+the release policy and upcoming version are recorded in `CHANGELOG.md`.
 
 ## `src/`
 

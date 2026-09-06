@@ -1,14 +1,27 @@
 # Changelog
 
-This is a Discord music bot that mirrors a Spotify Connect session into a
-voice channel and can also pull in tracks from YouTube, SoundCloud, and
-uploaded files, all controlled from Spotify itself, from Discord slash
-commands, and from now-playing buttons. Each entry below corresponds to a
-git tag (release) in this repository.
+Spotibot and nob share a music engine for Spotify Connect, YouTube,
+SoundCloud and uploaded files, controlled through Discord menus and
+now-playing buttons. Nob also provides server tools and a private soundboard.
+
+Both hosts inherit one version from `[workspace.package]` in `Cargo.toml`.
+The `0.x` line is initial development: feature batches advance the minor
+version (`0.6.0`, `0.7.0`), and fixes advance the patch (`0.6.1`). We mark
+published `0.x` GitHub releases as prereleases until `1.0.0`. This is a release
+channel choice; a plain `0.6.0` is not a SemVer prerelease version. Reserve
+suffixes such as `-rc.1` for candidates of a specific upcoming version. See
+[SemVer](https://semver.org/) and
+[GitHub release settings](https://docs.github.com/en/repositories/releasing-projects-on-github/managing-releases-in-a-repository).
+
+The next release is `v0.6.0`; the existing `v0.5.0-rc1` and `v0.5.0-rc2`
+tags remain historical milestones, with no final `v0.5.0` release to backfill.
+Keep the next entry marked Unreleased until publication, then date it and
+create its matching immutable tag and GitHub release from the validated
+commit. Version preparation does not itself deploy the bots.
 
 ---
 
-## Unreleased
+## Unreleased — v0.6.0
 
 **Nob's private soundboard also works over music.** `/soundboard` offers
 ten local clips per page, owner-bound expiring buttons, refresh and close.
@@ -30,7 +43,9 @@ and music taking priority or voice-room changes cancel an idle visit.
 Separate ownership prevents delayed clip cleanup from disconnecting music.
 The operator-managed catalogue uses ffmpeg, caps clips at 15 seconds and
 keeps paths and decoder output out of Discord. No random visits or voice
-reception are enabled. Live Discord acceptance and deployment remain pending.
+reception are enabled. Basic visits and overlays over playing and paused
+music have passed live Discord checks; broader failure/concurrency and paired
+acceptance remain pending, as does deployment.
 
 **Spotify sessions start at 70% volume instead of 80%.** This lowers the
 virtual device's initial feed level; the Spotify volume slider remains
@@ -61,11 +76,10 @@ controls, keeps pause state through account changes and recovers if deleted.
 Idle search works without a Spotify login. Lookups are bounded, result menus
 expire and voice membership is rechecked before a track is added.
 
-**Spotibot and nob now have a shared development foundation.** The repository
-is a Cargo workspace, with the existing music runtime behind a library entry
-point and the same executable and setup flow. CI checks the whole workspace
-using the lockfile. This prepares the code for nob's menus and a second bot
-host; those features will arrive in later changes.
+**Spotibot and nob share one workspace and version.** The music runtime is a
+library used by both executables; Spotibot retains its existing setup flow.
+CI checks and builds both hosts using the lockfile. Both inherit the same
+package version, starting at `0.6.0` for this combined feature batch.
 
 **Rapid Back taps no longer break the history walk.** Earlier track arrivals
 from double or triple taps no longer trigger a false playlist warning or
@@ -97,7 +111,7 @@ the wrong track. Older Spotify tracks also remain reachable after more than
 
 **Playback logic was rebuilt around a single, predictable decision-maker.** All commands, button presses, timers, and the Spotify session itself now funnel through one internal component that decides what plays next, rather than several parts of the bot independently reaching for control of playback. The practical effect is fewer of the glitches this design change specifically targeted: tracks that silently failed to advance, queued items that got dropped at a track boundary, skips that didn't register, and audio that got cut or cleared out from under a session that still owned it.
 
-**The bot no longer hijacks your phone's Spotify playback when a session starts.** Previously every session start silently made the bot the active Spotify device, cutting off whatever you were listening to. Now the bot becomes the playing device only when you ask — on `/login`, by pressing ▶ in Discord, or by picking it in Spotify's device list — and it reports its volume as 80% when it first appears instead of 50%.
+**The bot no longer hijacks your phone's Spotify playback when a session starts.** Previously every session start silently made the bot the active Spotify device, cutting off whatever you were listening to. Now activating an account does not itself start playback: the bot becomes the playing device when playback is requested or it is selected in Spotify's device list. Its initial volume is 70%.
 
 **Pressing play on your phone while a queued YouTube/SoundCloud track is airing no longer glitches the audio.** Spotify is paused right back as before, but its first few samples never reach the voice channel and the queued track's buffer is left untouched. A missed Spotify handoff (the bot's queued track not landing after a skip) no longer wedges the queue: the bot notices and re-queues it, so the next skip works. The now-playing card also follows a skip made while paused, so it shows the track that is cued up rather than the one that just ended.
 

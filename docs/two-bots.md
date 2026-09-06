@@ -86,9 +86,11 @@ Pause, Skip and Stop target an existing connection and cannot summon a spare.
 `/server` opens nob's permission-checked tools for the current text channel.
 
 `/soundboard` opens nob's private clip picker. It can invite free nob alongside
-Spotibot or into another room, without changing either music queue. Active or
-paused music on nob makes him unavailable for clips. Music taking ownership
-of a visit, or the requester moving rooms, cancels the visit. See
+Spotibot or into another room, without changing either music queue. When nob
+already serves the requester's room, clips mix through the existing music
+bridge with temporary ducking and no extra join or leave; paused music stays
+paused. Music in another room keeps nob unavailable. Music taking ownership
+of an idle visit, or the requester moving rooms, cancels that visit. See
 [soundboard.md](soundboard.md) for local clip setup, bounded playback and
 private menu controls; companion listening and random visits are not enabled.
 

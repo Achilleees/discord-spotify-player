@@ -4,7 +4,7 @@ Guidance for Claude Code when working in this repository.
 
 ## What This Is
 
-A Rust Discord music bot (v0.5). It runs a per-user Spotify Connect session
+A Rust Discord music bot. It runs a per-user Spotify Connect session
 (librespot + OAuth device authorization) and also plays YouTube/SoundCloud/uploaded files, all
 streamed into one Discord voice channel. Control happens from Spotify clients,
 from Discord slash commands (`/login`, `/play`, `/queue`, `/skip`, `/stop`,
