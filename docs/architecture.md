@@ -17,6 +17,38 @@ Startup initializes process-global logging once. `--check-config` exits before
 state creation, dependency probes or network connections. See
 [two-bots.md](two-bots.md) and [configuration.md](configuration.md).
 
+## Routing and voice ownership
+
+`routing/` defines typed actions and a loopback TCP transport. Nob's
+`discord/front.rs` retains the Discord interaction and sends a request to
+one performer; `discord/routing.rs` resolves it using that host's actor,
+Discord cache and account owner. No raw interactions, bot tokens, Spotify
+tokens or database handles cross the connection. Private menus bind user,
+guild, room and process/session revision, expire after five minutes and
+consume their token on each action.
+
+Frames use the existing XChaCha20-Poly1305 dependency and a shared random key.
+A fresh server challenge and direction-bound associated data prevent replay
+across connections and request/response reflection. The transport caps frames
+at 64 KiB, concurrent connections at 16, and the per-process request journal
+at 512 entries retained for 15 minutes. New requests expire within a minute.
+Accepted actions continue if a response waiter disappears; duplicates reuse
+the recorded result, and conflicting payloads with the same ID fail. Normal
+actions time out after a minute; device-pairing completion has an 11-minute
+cap and four login slots. Restart loses the journal and changes the boot ID;
+unknown outcomes never trigger automatic redispatch or performer fallback.
+
+`discord/voice_owner.rs` reserves a room before spawning a join. Stop retires
+that lease immediately; a serialized transition lock and lease checks keep
+an old join greeting, bridge attachment or departure from touching a newer
+connection. An admin move updates the routing revision while retaining the
+connection's audio lease. The player core separately correlates join results
+by generation, ignoring late success/failure after Stop or a replacement.
+Guarded player requests recheck current voice membership and routing revision
+at mailbox consumption. Account joins also reserve against their original
+revision, and delayed device activation passes through the same actor guard.
+Future soundboard visits must extend this owner with activity-specific rules.
+
 ## Audio pipeline
 
 ```

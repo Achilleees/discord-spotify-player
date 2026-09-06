@@ -46,7 +46,7 @@ use crate::player::state::{
     step, Active, AnnounceKind, Effect, EnqueuePos, Input, MediaOutcome, NowPlaying,
     PlayerSnapshot, PlayerState, PresenceState, PreviousTrack, SpDevice, SpircCmd, StartGate,
     TrackHandleCmd,
-    TrackMeta, TransportEvent, UiMsg as CoreUiMsg,
+    TrackMeta, TransportEvent, VoiceGuard, UiMsg as CoreUiMsg,
 };
 use crate::presence::PresenceUpdate;
 use crate::queue::{MediaSource, QueueItem};
@@ -85,10 +85,13 @@ pub type UiSendFn = Arc<dyn Fn(UiEvent) + Send + Sync>;
 
 /// Voice-join dispatch built by the bot layer: ensures the bot is in a
 /// voice call (following the given user when it has to join fresh) and
-/// resolves `true` once the call exists. The actor only ever runs it inside
-/// a spawned task.
-pub type JoinVoiceFn =
-    Arc<dyn Fn(Option<u64>) -> Pin<Box<dyn Future<Output = bool> + Send>> + Send + Sync>;
+/// reserves synchronously, then resolves the routing revision once connected.
+/// A guarded account join must still match its original panel revision.
+pub type JoinVoiceFn = Arc<
+    dyn Fn(Option<u64>, Option<VoiceGuard>) -> Pin<Box<dyn Future<Output = Option<u64>> + Send>>
+        + Send
+        + Sync,
+>;
 
 /// Leaves the voice call. Deliberate departures only (`/stop`) — an empty
 /// channel is torn down by the Discord layer. Run inside a spawned task.
@@ -108,6 +111,7 @@ pub struct PlayerDeps {
     pub presence_tx: mpsc::UnboundedSender<PresenceUpdate>,
     pub join_voice: JoinVoiceFn,
     pub leave_voice: LeaveVoiceFn,
+    pub authorize_voice: Arc<dyn Fn(&VoiceGuard) -> bool + Send + Sync>,
     /// The live session's command channel; `None` between sessions. The
     /// session supervisor (re)publishes the sender on switch/stop.
     pub spirc_cmd_tx: Arc<Mutex<Option<mpsc::UnboundedSender<SpircCommand>>>>,
@@ -129,6 +133,7 @@ pub struct PlayerDeps {
 /// `Input`, send it, and await the oneshot reply.
 #[derive(Clone)]
 pub struct PlayerHandle {
+    guard: Option<VoiceGuard>,
     tx: mpsc::UnboundedSender<Input>,
     /// The same spirc cell the actor holds, so `lookup_spotify` runs in the
     /// caller's task without a
@@ -138,6 +143,13 @@ pub struct PlayerHandle {
 }
 
 impl PlayerHandle {
+    pub fn guarded(&self, guard: VoiceGuard) -> Self {
+        Self {
+            guard: Some(guard),
+            ..self.clone()
+        }
+    }
+
     /// Send a reply-less input (transport events, media/voice reports,
     /// timer ticks). Dropped silently if the actor is gone.
     pub fn send(&self, input: Input) {
@@ -146,7 +158,15 @@ impl PlayerHandle {
 
     async fn request(&self, make: impl FnOnce(oneshot::Sender<String>) -> Input) -> String {
         let (tx, rx) = oneshot::channel();
-        if self.tx.send(make(tx)).is_err() {
+        let input = make(tx);
+        let input = match &self.guard {
+            Some(guard) => Input::Guarded {
+                guard: guard.clone(),
+                input: Box::new(input),
+            },
+            None => input,
+        };
+        if self.tx.send(input).is_err() {
             return NO_ACTOR_REPLY.to_string();
         }
         rx.await.unwrap_or_else(|_| NO_ACTOR_REPLY.to_string())
@@ -328,7 +348,11 @@ fn run_store_worker(
 /// is built; the actor lives for the process (lifecycle A).
 pub fn spawn(deps: PlayerDeps) -> PlayerHandle {
     let (tx, rx) = mpsc::unbounded_channel();
-    let handle = PlayerHandle { tx: tx.clone(), spirc: deps.spirc_cmd_tx.clone() };
+    let handle = PlayerHandle {
+        guard: None,
+        tx: tx.clone(),
+        spirc: deps.spirc_cmd_tx.clone(),
+    };
     let store_tx = spawn_store_worker(deps.history.clone(), deps.queue_store.clone());
     let actor = Actor {
         deps,
@@ -376,6 +400,10 @@ struct Actor {
 impl Actor {
     async fn run(mut self, mut rx: mpsc::UnboundedReceiver<Input>) {
         while let Some(input) = rx.recv().await {
+            let Some((input, requester)) = authorize_input(input, &*self.deps.authorize_voice)
+            else {
+                continue;
+            };
             // Shell-side handling that reads raw inputs rather than core
             // decisions, run on receipt before the step.
             match &input {
@@ -450,7 +478,7 @@ impl Actor {
             }
 
             for effect in effects {
-                self.run_effect(effect, join_hint);
+                self.run_effect(effect, requester.or(join_hint));
             }
 
             // The media turn can end without a core presence effect (an
@@ -622,23 +650,12 @@ impl Actor {
                 tokio::spawn(leave);
             }
 
-            Effect::JoinVoice => {
-                let join = (self.deps.join_voice)(join_hint);
+            Effect::JoinVoice { generation } => {
+                let join = (self.deps.join_voice)(join_hint, None);
                 let tx = self.tx.clone();
-                let notice_tx = self.deps.notice_tx.clone();
                 tokio::spawn(async move {
-                    if join.await {
-                        let _ = tx.send(Input::VoiceReady);
-                    } else {
-                        let _ = notice_tx.send(
-                            "⚠️ Couldn't join a voice channel, so nothing would be heard. \
-                             Try again from a voice channel."
-                                .to_string(),
-                        );
-                        // VoiceLost makes the core cancel the start it just
-                        // issued instead of feeding a dead call.
-                        let _ = tx.send(Input::VoiceLost);
-                    }
+                    let ready = join.await.is_some();
+                    let _ = tx.send(Input::VoiceJoinFinished { generation, ready });
                 });
             }
 
@@ -872,11 +889,96 @@ async fn media_runner(
     let _ = ctx.input_tx.send(Input::MediaEnded { epoch, outcome });
 }
 
+fn authorize_input(
+    input: Input,
+    authorize: &dyn Fn(&VoiceGuard) -> bool,
+) -> Option<(Input, Option<u64>)> {
+    match input {
+        Input::Guarded { guard, input } => {
+            if !authorize(&guard) {
+                reject_guarded(*input);
+                return None;
+            }
+            Some((*input, Some(guard.user)))
+        }
+        input => Some((input, None)),
+    }
+}
+
+/// Guard failure releases the waiting command without ever touching playback.
+fn reject_guarded(input: Input) {
+    let reply = match input {
+        Input::Enqueue { reply, .. }
+        | Input::Play { reply }
+        | Input::Skip { reply }
+        | Input::Stop { reply, .. }
+        | Input::TogglePause { reply }
+        | Input::Previous { reply }
+        | Input::ClearQueue { reply } => reply,
+        _ => return,
+    };
+    let _ = reply.send("Your voice room or this music session changed. Open a fresh menu.".into());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::history::HistoryStore;
     use crate::player::state::{AiredSource, AiredTrack};
+
+    #[test]
+    fn queued_command_rechecks_membership_when_the_actor_receives_it() {
+        let (reply, mut received) = oneshot::channel();
+        let guard = VoiceGuard {
+            generation: 3,
+            room: 10,
+            user: 1,
+            may_join: true,
+        };
+        let input = Input::Guarded {
+            guard,
+            input: Box::new(Input::Stop {
+                reply,
+                leave_voice: true,
+            }),
+        };
+        // The caller was in room 10 when it sent the message, but has left
+        // by the time the actor consumes it. No playback input may emerge.
+        assert!(authorize_input(input, &|guard| guard.allows(3, Some(10), None)).is_none());
+        assert!(received.try_recv().unwrap().contains("voice room"));
+    }
+
+    #[test]
+    fn another_room_claiming_voice_invalidates_a_queued_idle_request() {
+        let (reply, mut received) = oneshot::channel();
+        let guard = VoiceGuard {
+            generation: 1,
+            room: 10,
+            user: 1,
+            may_join: true,
+        };
+        let input = Input::Guarded {
+            guard,
+            input: Box::new(Input::Play { reply }),
+        };
+        assert!(authorize_input(input, &|guard| guard.allows(2, Some(20), Some(10))).is_none());
+        assert!(received.try_recv().is_ok());
+    }
+
+    #[test]
+    fn late_account_activation_cannot_undo_stop() {
+        let guard = VoiceGuard {
+            generation: 3,
+            room: 10,
+            user: 1,
+            may_join: false,
+        };
+        let input = Input::Guarded {
+            guard,
+            input: Box::new(Input::ActivateDevice),
+        };
+        assert!(authorize_input(input, &|guard| guard.allows(4, None, Some(10))).is_none());
+    }
 
     fn aired(n: u64) -> AiredTrack {
         AiredTrack {

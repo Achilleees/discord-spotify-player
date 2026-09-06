@@ -48,6 +48,15 @@ go in the gitignored `.local/`, not `docs/`.
 - Nob-only server commands enforce caller and bot permissions at invocation.
 - `.cargo/config.toml` (tracked) carries the cmake fix; MSVC toolchain on Windows.
 
+## Paired command mode
+- Explicit `COMMAND_MODE=coordinator` (nob) / `worker` (Spotibot) enables the
+  compact nob slash frontend. Default `standalone` preserves existing commands.
+- Each performer owns authorization, queue and account state. Keep requests
+  typed, authenticated and revision-bound; never redispatch unknown outcomes.
+- `discord/voice_owner.rs` owns pending joins and departures. Use its leases
+  for delayed setup; future soundboard activities must extend this owner.
+- See `docs/two-bots.md` and `routing/` before changing cross-bot behavior.
+
 ## Architecture (see `docs/architecture.md`, `CODEMAP.md`)
 - The root package remains the default workspace member and Spotibot host;
   `crates/nob` calls `run_nob()` in the same library as a separate process.

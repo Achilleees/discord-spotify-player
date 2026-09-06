@@ -12,7 +12,7 @@
 use super::bot::Handler;
 use super::ui::UiMsg;
 use crate::oauth::DeviceAuthorization;
-use crate::player::state::Input as PlayerInput;
+use crate::player::state::{Input as PlayerInput, VoiceGuard};
 use crate::spotify::EnsureOutcome;
 use crate::users::UserCredentials;
 use serenity::all::UserId;
@@ -64,6 +64,7 @@ impl Handler {
         // it. Voice is handled below, never by the actor: its `LeaveVoice`
         // would arm the deliberate-leave guard, and after a force disconnect
         // no gateway echo ever comes to consume it.
+        let retirement = self.voice_owner.retire();
         self.player.send(PlayerInput::VoiceLost);
         let _ = self.player.stop_without_leaving().await;
 
@@ -82,11 +83,19 @@ impl Handler {
         }
 
         if leave_voice {
-            if let Some(manager) = songbird::get(ctx).await {
+            let _transition = self.voice_owner.transitions.lock().await;
+            if let Some(manager) = songbird::get(ctx)
+                .await
+                .filter(|_| self.voice_owner.retirement_current(retirement))
+            {
                 // `remove`, not `leave`: leave keeps the Call registered and
                 // every later presence check would read it as "still in a
                 // call".
-                let _ = manager.remove(self.guild_id).await;
+                self.leaving_voice
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if manager.remove(self.guild_id).await.is_err() {
+                    super::bot::consume_deliberate_leave(&self.leaving_voice);
+                }
                 tracing::info!("bot left voice channel");
             }
         }
@@ -102,16 +111,12 @@ impl Handler {
     /// session switch never replays the join sound or re-hooks the bridge
     /// reader over a call that's already up (which would cut whatever media
     /// item is currently feeding it).
-    async fn ensure_voice_for_user(&self, discord_user_id: Option<u64>) -> bool {
-        let ctx = { self.ctx.lock().clone() };
-        if let Some(ctx) = &ctx {
-            if let Some(manager) = songbird::get(ctx).await {
-                if super::bot::bot_in_voice(&manager, self.guild_id).await {
-                    return true;
-                }
-            }
-        }
-        (self.join_voice)(discord_user_id).await
+    async fn ensure_voice_for_user(
+        &self,
+        discord_user_id: Option<u64>,
+        guard: Option<VoiceGuard>,
+    ) -> Option<u64> {
+        (self.join_voice)(discord_user_id, guard).await
     }
 
     /// Restart the stored active user's Spotify session on boot, through the
@@ -144,7 +149,8 @@ impl Handler {
 
         match self.supervisor.ensure_session(&self.oauth, &self.user_store).await {
             EnsureOutcome::Ready(_gen) => {
-                self.finish_account_switch(discord_user_id, user.discord_name).await;
+                self.finish_account_switch(discord_user_id, user.discord_name, None)
+                    .await;
             }
             EnsureOutcome::NoAccount => {
                 // Unreachable in practice: `user` above already found this
@@ -187,11 +193,25 @@ impl Handler {
         access_token: String,
         refresh_token: String,
         expires_in: u64,
+        voice_guard: Option<VoiceGuard>,
     ) {
         self.supervisor
             .switch(discord_user_id, discord_name.clone(), access_token, refresh_token, expires_in)
             .await;
-        self.finish_account_switch(discord_user_id, discord_name).await;
+        let revision = self
+            .finish_account_switch(discord_user_id, discord_name, voice_guard.clone())
+            .await;
+        let guard = match voice_guard {
+            Some(mut guard) => {
+                let Some(revision) = revision else {
+                    return;
+                };
+                guard.generation = revision;
+                guard.may_join = false;
+                Some(guard)
+            }
+            None => None,
+        };
         // `/login` is a human claim on the device: activate it, so the
         // bot shows as the playing device right away. Only this explicit
         // path does — boot auto-start and on-demand sessions never
@@ -212,7 +232,13 @@ impl Handler {
             if matches!(wait.await, Ok(true)) {
                 // The mailbox is FIFO and the session sends `LinkUp` before
                 // it flips the watch, so this lands after it.
-                player.send(PlayerInput::ActivateDevice);
+                player.send(match guard {
+                    Some(guard) => PlayerInput::Guarded {
+                        guard,
+                        input: Box::new(PlayerInput::ActivateDevice),
+                    },
+                    None => PlayerInput::ActivateDevice,
+                });
             }
         });
     }
@@ -225,7 +251,12 @@ impl Handler {
     /// `switch_active_session` so `auto_start_stored_session` can run it
     /// after `ensure_session`'s own `supervisor.switch` without a second,
     /// redundant one.
-    async fn finish_account_switch(&self, discord_user_id: u64, discord_name: String) {
+    async fn finish_account_switch(
+        &self,
+        discord_user_id: u64,
+        discord_name: String,
+        guard: Option<VoiceGuard>,
+    ) -> Option<u64> {
         // Exactly one user stays active:true, so auto-start can't resurrect a
         // displaced user after a restart.
         if let Err(e) = self.user_store.set_active_exclusive(&discord_user_id.to_string()) {
@@ -237,12 +268,15 @@ impl Handler {
             *lock = Some(ActiveSession { discord_user_id, discord_name: discord_name.clone() });
         }
 
-        let _ = self.ensure_voice_for_user(Some(discord_user_id)).await;
+        let revision = self
+            .ensure_voice_for_user(Some(discord_user_id), guard)
+            .await;
 
         let tx = { self.ui_tx.lock().clone() };
         if let Some(tx) = tx {
             let _ = tx.send(UiMsg::AccountChanged(Some(discord_name)));
         }
+        revision
     }
 
     pub(super) async fn handle_login(
@@ -251,6 +285,7 @@ impl Handler {
         user_id_u64: u64,
         discord_username: &str,
         in_voice: bool,
+        voice_guard: Option<crate::player::state::VoiceGuard>,
     ) -> LoginOutcome {
         // Taking over an active session owned by someone else requires being in
         // the bot's voice channel — you can't evict the current DJ from outside.
@@ -263,8 +298,14 @@ impl Handler {
         // Stored creds exist: quick re-login by refreshing, no new pairing needed.
         if let Some(existing) = self.user_store.load(user_id) {
             return LoginOutcome::Reply(
-                self.reactivate_login(user_id, user_id_u64, discord_username, existing)
-                    .await,
+                self.reactivate_login(
+                    user_id,
+                    user_id_u64,
+                    discord_username,
+                    existing,
+                    voice_guard,
+                )
+                .await,
             );
         }
 
@@ -283,12 +324,16 @@ impl Handler {
         user_id_u64: u64,
         discord_username: &str,
         existing: UserCredentials,
+        voice_guard: Option<crate::player::state::VoiceGuard>,
     ) -> String {
         match self.oauth.refresh_access_token(&existing.refresh_token).await {
             Ok(new_token) => {
                 let expires_in = new_token.expires_in;
                 let mut creds = existing.clone();
-                creds.active = true;
+                let activate = voice_guard
+                    .as_ref()
+                    .is_none_or(|guard| self.voice_guard_current(guard));
+                creds.active = activate || existing.active;
                 creds.access_token = new_token.access_token.clone();
                 if let Some(rt) = new_token.refresh_token {
                     creds.refresh_token = rt;
@@ -297,12 +342,16 @@ impl Handler {
                     tracing::error!(error = %e, "failed to save reactivated session");
                     return "Failed to save session. Please try again.".to_string();
                 }
+                if !activate {
+                    return "Saved your login. Join voice and open a fresh music panel to activate it.".into();
+                }
                 self.switch_active_session(
                     user_id_u64,
                     discord_username.to_string(),
                     new_token.access_token,
                     creds.refresh_token.clone(),
                     expires_in,
+                    voice_guard,
                 )
                 .await;
                 tracing::info!(user = %user_id, name = %discord_username, "session reactivated");
@@ -361,6 +410,7 @@ impl Handler {
     /// cancellably: a newer `/login` or a `/logout`/`/forget` for this user
     /// notifies the stashed `Notify`, which aborts this poll in place of the
     /// old one.
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn finish_device_login(
         &self,
         user_id: &str,
@@ -368,6 +418,7 @@ impl Handler {
         discord_username: &str,
         ctx: &Context,
         auth: DeviceAuthorization,
+        voice_guard: Option<crate::player::state::VoiceGuard>,
     ) -> String {
         let cancel = Arc::new(Notify::new());
         {
@@ -413,6 +464,15 @@ impl Handler {
         // outside. Re-checked here since the poll can take minutes. The
         // tokens are stored inactive so the retry is a quick re-login and the
         // current DJ's row stays the only active one.
+        if voice_guard
+            .as_ref()
+            .is_some_and(|guard| !self.voice_guard_current(guard))
+        {
+            return match self.save_device_creds(user_id, discord_username, &token, false).await {
+                Ok(_) => "Saved your login. Your voice room or music session changed; open a fresh music panel to activate it.".into(),
+                Err(message) => message,
+            };
+        }
         if let Some(owner) = self.active_owner() {
             if owner != user_id_u64 && !self.user_in_bot_voice_channel(ctx, UserId::new(user_id_u64)) {
                 return match self.save_device_creds(user_id, discord_username, &token, false).await {
@@ -434,6 +494,7 @@ impl Handler {
             token.access_token,
             refresh_token,
             token.expires_in,
+            voice_guard,
         )
         .await;
         format!(

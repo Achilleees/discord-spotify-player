@@ -60,6 +60,15 @@ Both hosts support `--env-file PATH` and offline `--check-config`.
 `RUST_LOG`: a preset (`trace|debug|info|warn|error`, app-centric) or a raw
 `EnvFilter`. Default `warn`.
 
+## Paired command mode
+- Explicit `COMMAND_MODE=coordinator` (nob) / `worker` (Spotibot) enables the
+  compact nob slash frontend. Default `standalone` preserves existing commands.
+- Each performer owns authorization, queue and account state. Keep requests
+  typed, authenticated and revision-bound; never redispatch unknown outcomes.
+- `discord/voice_owner.rs` owns pending joins and departures. Use its leases
+  for delayed setup; future soundboard activities must extend this owner.
+- See `docs/two-bots.md` and `routing/` before changing cross-bot behavior.
+
 ## Architecture
 
 The root package remains the default workspace member. Its binary calls

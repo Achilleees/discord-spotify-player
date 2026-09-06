@@ -36,6 +36,12 @@ databases, caches and generated Spotify device identities are isolated; see
 [two-bots.md](two-bots.md). Remaining server modules, soundboard, companion
 behavior and live two-room acceptance are tracked on the existing board.
 
+Opt-in paired routing now makes nob the slash frontend (`/play`, `/music`,
+`/server`) while Spotibot retains its own card buttons. Each performer still
+owns its audio and account lifecycle; typed authenticated local requests
+link behavior without sharing state. The soundboard will add its command
+and activity rules using the voice owner already introduced for routing.
+
 ## Historical transfer dossier — superseded migration plan
 
 The sections below record the earlier one-way transplant into the old nob

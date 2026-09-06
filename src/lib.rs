@@ -14,6 +14,7 @@ mod presence;
 mod queue;
 mod queue_store;
 mod runtime;
+mod routing;
 mod setup;
 mod spotify;
 mod users;

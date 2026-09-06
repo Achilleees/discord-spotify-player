@@ -14,6 +14,20 @@ does not authenticate credentials or test filesystem access. `--help` needs
 no configuration. Only Spotibot's default launch offers the `.env` setup
 wizard; nob and explicit-file/check launches fail on invalid configuration.
 
+## Command routing
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `COMMAND_MODE` | `standalone` | Original commands on each host; `coordinator` is nob only, `worker` is Spotibot only. |
+| `ROUTING_LISTEN` | unset | Required in paired mode: loopback IP and nonzero TCP port for this host. |
+| `ROUTING_PEER` | unset | Required for coordinator: Spotibot's loopback address, different from its own listener. |
+| `ROUTING_KEY` | unset | Required in paired mode: shared random 32-byte key as 64 hex characters; never reuse a token-encryption key. |
+
+Nob's process overrides use `NOB_COMMAND_MODE`, `NOB_ROUTING_KEY`, etc.;
+env-file keys remain unprefixed. These settings are validated offline and
+never echoed with their values on failure. See [two-bots.md](two-bots.md)
+for coordinated configuration and command registration cutover.
+
 ## Instance paths
 
 | Setting | Spotibot default | Nob default |

@@ -1,7 +1,24 @@
 # Commands and controls
 
-Both bots share the music commands and controls below. Choose the intended
-bot in Discord's slash-command picker or use its own playback card.
+Both bots share the music controls. Their slash surface depends on
+`COMMAND_MODE`; see [paired setup](two-bots.md#one-slash-menu-for-both-bots).
+
+## Paired commands
+
+| Nob command | Opens or does |
+|---|---|
+| `/play query:… file:… next:…` | Plays a link, attachment or song search in your voice room; omit input to start/resume. |
+| `/music` | Private performer picker and playback, queue/history, account and announcement controls. |
+| `/server` | Private slowmode and message-cleanup tools for this channel. |
+
+Spotibot has no slash entries in worker mode, but its card buttons continue
+working. `/soundboard` is planned and will appear with the clip implementation.
+The private panel names its performer; both bots retain independent queues
+and Spotify accounts. An expired panel or changed voice session requires a
+fresh `/music`. Clear queue and Forget login have confirmation buttons.
+
+The individual slash commands documented below remain available in explicit
+standalone mode. In paired mode use the matching action in `/music` or `/server`.
 
 ## Nob server utilities
 
@@ -10,7 +27,7 @@ bot in Discord's slash-command picker or use its own playback card.
 | `/slowmode seconds` | Manage Channels | Sets text/voice channel slowmode from 0 to 21600 seconds; 0 disables it. Threads are not supported yet. |
 | `/purge count` | Manage Messages, View Channel, Read Message History | Inspects 1-100 recent messages and deletes eligible ones. Preserves pins, bot messages, and messages within two minutes of Discord's 14-day bulk-delete limit or older. |
 
-These commands exist only on nob, are limited to its configured guild and
+These tools exist only on nob (in `/server` when paired), are limited to its configured guild and
 reply privately. They use server permissions independently of voice membership.
 Cleanup preserves all bot/webhook messages because Discord may omit their
 [button data](https://docs.discord.com/developers/resources/message#message-object)

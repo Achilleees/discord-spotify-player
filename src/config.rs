@@ -3,6 +3,7 @@ use crate::runtime::{Profile, Settings};
 #[derive(Clone)]
 pub struct Config {
     pub profile: Profile,
+    pub routing: crate::routing::RoutingConfig,
     pub discord_token: String,
     pub discord_guild_id: u64,
     pub discord_channel_id: u64,
@@ -115,6 +116,7 @@ impl Config {
             .trim()
             .to_string();
         Ok(Config {
+            routing: crate::routing::RoutingConfig::load(settings)?,
             profile: settings.profile,
             discord_token,
             discord_guild_id,

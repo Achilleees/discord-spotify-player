@@ -45,6 +45,10 @@ src/
 │                          whole on every change; its own wire format, so
 │                          queue.rs stays free of serde
 │
+├── routing/
+│   ├── mod.rs             paired config, typed requests/replies, room selection
+│   └── transport.rs        authenticated loopback frames, bounded request journal
+│
 ├── player/
 │   ├── mod.rs             module doc: how state.rs and actor.rs divide work
 │   ├── state.rs            pure decision core: PlayerState, Active (the
@@ -109,6 +113,9 @@ src/
     │                          voice-gate checks, /play /queue /skip /stop
     │                          /np /announce, button routing, shared track
     │                          resolution/enqueue with post-lookup voice check
+    ├── front.rs                 nob's compact slash surface, private performer menus
+    ├── routing.rs               performer execution, guarded actions, local OAuth pairings
+    ├── voice_owner.rs           room leases, revision fences, serialized voice transitions
     ├── search.rs                Add music modal, private result rendering,
     │                          bounded owner/guild/expiry-checked single-use menus
     ├── admin.rs                  nob-only slowmode/purge: invocation permissions,

@@ -133,11 +133,28 @@ async fn execute(
     cmd: &CommandInteraction,
     guild: GuildId,
 ) -> Result<String, Box<serenity::Error>> {
-    if cmd.data.name == "slowmode" {
-        let Some(seconds) = integer_option(cmd, "seconds", 0, 21600) else {
+    let name = cmd.data.name.as_str();
+    let value = if name == "slowmode" {
+        integer_option(cmd, "seconds", 0, 21600)
+    } else {
+        integer_option(cmd, "count", 1, 100)
+    };
+    execute_value(ctx, guild, cmd.channel_id, cmd.user.id, name, value).await
+}
+
+async fn execute_value(
+    ctx: &Context,
+    guild: GuildId,
+    channel_id: ChannelId,
+    user: UserId,
+    name: &str,
+    value: Option<i64>,
+) -> Result<String, Box<serenity::Error>> {
+    if name == "slowmode" {
+        let Some(seconds) = value.filter(|n| (0..=21600).contains(n)) else {
             return Ok("Choose a slowmode interval from 0 to 21600 seconds.".into());
         };
-        let channel = cmd.channel_id.to_channel(&ctx.http).await?;
+        let channel = channel_id.to_channel(&ctx.http).await?;
         let Channel::Guild(channel) = channel else {
             return Ok("Use this in a server text or voice channel.".into());
         };
@@ -152,12 +169,12 @@ async fn execute(
                     .into(),
             );
         }
-        cmd.channel_id
+        channel_id
             .edit(
                 &ctx.http,
                 EditChannel::new()
                     .rate_limit_per_user(seconds as u16)
-                    .audit_log_reason(&format!("slowmode requested by {}", cmd.user.id)),
+                    .audit_log_reason(&format!("slowmode requested by {}", user)),
             )
             .await?;
         Ok(if seconds == 0 {
@@ -166,11 +183,10 @@ async fn execute(
             format!("Slowmode set to {seconds} seconds.")
         })
     } else {
-        let Some(count) = integer_option(cmd, "count", 1, 100) else {
+        let Some(count) = value.filter(|n| (1..=100).contains(n)) else {
             return Ok("Choose between 1 and 100 recent messages to inspect.".into());
         };
-        let messages = cmd
-            .channel_id
+        let messages = channel_id
             .messages(&ctx.http, GetMessages::new().limit(count as u8))
             .await?;
         let now = Timestamp::now().unix_timestamp();
@@ -188,14 +204,149 @@ async fn execute(
             .collect();
         if !ids.is_empty() {
             // Serenity uses the single-delete endpoint when exactly one remains.
-            cmd.channel_id.delete_messages(&ctx.http, &ids).await?;
+            channel_id.delete_messages(&ctx.http, &ids).await?;
         }
-        tracing::info!(actor = %cmd.user.id, channel = %cmd.channel_id, deleted = ids.len(), "channel cleanup completed");
+        tracing::info!(actor = %user, channel = %channel_id, deleted = ids.len(), "channel cleanup completed");
         Ok(format!(
             "Deleted {} message(s). Kept {} pinned, older or bot/webhook message(s).",
             ids.len(),
             messages.len() - ids.len()
         ))
+    }
+}
+
+pub(super) async fn handle_panel(
+    ctx: &Context,
+    interaction: &Interaction,
+    profile: Profile,
+    guild: GuildId,
+) -> bool {
+    match interaction {
+        Interaction::Command(cmd) if cmd.data.name == "server" && cmd.guild_id == Some(guild) => {
+            let buttons = ["slowmode", "purge"]
+                .into_iter()
+                .map(|name| {
+                    let allowed = authorized(
+                        profile,
+                        guild,
+                        cmd.guild_id,
+                        cmd.member.as_ref().and_then(|m| m.permissions),
+                        cmd.app_permissions,
+                        permission_for(name).unwrap(),
+                    );
+                    CreateButton::new(format!("server:{}:{name}", cmd.user.id))
+                        .label(if name == "purge" {
+                            "Clean messages"
+                        } else {
+                            "Slowmode"
+                        })
+                        .disabled(!allowed)
+                })
+                .collect();
+            let _=cmd.create_response(ctx,CreateInteractionResponse::Message(CreateInteractionResponseMessage::new()
+                .content("Server tools for this channel. Buttons require the appropriate permissions for both you and nob.")
+                .components(vec![CreateActionRow::Buttons(buttons)]).ephemeral(true))).await;
+            true
+        }
+        Interaction::Component(component) if component.data.custom_id.starts_with("server:") => {
+            let parts: Vec<_> = component.data.custom_id.split(':').collect();
+            let action = parts.get(2).copied().unwrap_or("");
+            let allowed = parts.len() == 3
+                && parts[1] == component.user.id.to_string()
+                && permission_for(action).is_some_and(|required| {
+                    authorized(
+                        profile,
+                        guild,
+                        component.guild_id,
+                        component.member.as_ref().and_then(|m| m.permissions),
+                        component.app_permissions,
+                        required,
+                    )
+                });
+            if !allowed {
+                let _ = component
+                    .create_response(
+                        ctx,
+                        CreateInteractionResponse::Message(
+                            CreateInteractionResponseMessage::new()
+                                .content("You or nob no longer have permission for this action.")
+                                .ephemeral(true),
+                        ),
+                    )
+                    .await;
+                return true;
+            }
+            let label = if action == "purge" {
+                "Recent messages to inspect (1-100)"
+            } else {
+                "Seconds between messages (0-21600)"
+            };
+            let modal = CreateModal::new(
+                format!("server:{}:{action}", component.user.id),
+                if action == "purge" {
+                    "Clean messages"
+                } else {
+                    "Set slowmode"
+                },
+            )
+            .components(vec![CreateActionRow::InputText(
+                CreateInputText::new(InputTextStyle::Short, label, "value")
+                    .required(true)
+                    .max_length(5),
+            )]);
+            let _ = component
+                .create_response(ctx, CreateInteractionResponse::Modal(modal))
+                .await;
+            true
+        }
+        Interaction::Modal(modal) if modal.data.custom_id.starts_with("server:") => {
+            let parts: Vec<_> = modal.data.custom_id.split(':').collect();
+            let action = parts.get(2).copied().unwrap_or("");
+            let allowed = parts.len() == 3
+                && parts[1] == modal.user.id.to_string()
+                && permission_for(action).is_some_and(|required| {
+                    authorized(
+                        profile,
+                        guild,
+                        modal.guild_id,
+                        modal.member.as_ref().and_then(|m| m.permissions),
+                        modal.app_permissions,
+                        required,
+                    )
+                });
+            if modal.defer_ephemeral(ctx).await.is_err() {
+                return true;
+            }
+            let text = if !allowed {
+                "You or nob no longer have permission for this action.".into()
+            } else {
+                let value = modal
+                    .data
+                    .components
+                    .iter()
+                    .flat_map(|row| &row.components)
+                    .find_map(|c| match c {
+                        ActionRowComponent::InputText(input) if input.custom_id == "value" => {
+                            input.value.as_ref().and_then(|v| v.trim().parse().ok())
+                        }
+                        _ => None,
+                    });
+                match tokio::time::timeout(std::time::Duration::from_secs(20),execute_value(ctx,guild,modal.channel_id,modal.user.id,action,value)).await {
+                    Ok(Ok(text))=>text,
+                    _=>"Couldn't confirm the change. Check this channel and nob's permissions before retrying.".into(),
+                }
+            };
+            let _ = modal
+                .edit_response(
+                    ctx,
+                    EditInteractionResponse::new()
+                        .content(text)
+                        .allowed_mentions(CreateAllowedMentions::new()),
+                )
+                .await;
+            true
+        }
+        _ => false,
     }
 }
 

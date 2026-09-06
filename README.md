@@ -30,7 +30,9 @@ DJ; `yt-dlp` + `ffmpeg` on `PATH` for non-Spotify sources (optional).
 To build both bots, use `cargo build --workspace --release --locked`.
 Configure nob from `.env.nob.example`, then run `target/release/nob`
 (`nob.exe` on Windows). See [running both bots](docs/two-bots.md) for identity,
-state paths and offline configuration checks.
+state paths and offline configuration checks. Opt-in paired mode puts
+`/play`, `/music` and `/server` on nob, routes music to the appropriate bot,
+and leaves both playback cards usable independently.
 
 ## Documentation
 

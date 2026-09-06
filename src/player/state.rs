@@ -201,6 +201,8 @@ pub struct PlayerState {
     /// commands gate on this. Activation is explicit — never on connect.
     pub device_active: bool,
     pub voice: VoiceStatus,
+    /// Correlates asynchronous join completions with the current attempt.
+    pub voice_generation: u64,
     /// Session generation; `Transport`/`LinkDown` inputs carrying another
     /// gen are stale and ignored.
     pub link_gen: u64,
@@ -274,6 +276,7 @@ impl PlayerState {
             inflight: InflightRing::default(),
             device_active: false,
             voice: VoiceStatus::Down,
+            voice_generation: 0,
             link_gen: 0,
             media_epoch: 0,
             last_heard_track: None,
@@ -460,12 +463,32 @@ pub struct PlayerSnapshot {
 /// How many queue entries [`PlayerSnapshot::preview`] carries.
 pub const QUEUE_PREVIEW: usize = 5;
 
-/// Everything that can happen to the player. Command inputs carry their own
-/// reply channel (so `Input` is not `Clone`); `step` answers them via
-/// `Effect::Reply` (`Effect::ReplySnapshot` for `Query`) — the actor never
-/// formats a reply itself.
+/// Voice membership and connection generation captured by a requester.
+/// The actor compares them with current Discord state before applying a command.
+#[derive(Clone, Debug)]
+pub struct VoiceGuard {
+    pub generation: u64,
+    pub room: u64,
+    pub user: u64,
+    pub may_join: bool,
+}
+
+impl VoiceGuard {
+    pub fn allows(&self, generation: u64, bot_room: Option<u64>, user_room: Option<u64>) -> bool {
+        self.room != 0
+            && generation == self.generation
+            && user_room == Some(self.room)
+            && (bot_room == Some(self.room) || (self.may_join && bot_room.is_none()))
+    }
+}
+
 #[derive(Debug)]
 pub enum Input {
+    /// The actor validates this guard immediately before deciding the command.
+    Guarded {
+        guard: VoiceGuard,
+        input: Box<Input>,
+    },
     Enqueue {
         item: QueueItem,
         pos: EnqueuePos,
@@ -497,8 +520,13 @@ pub enum Input {
     LinkDown { gen: u64 },
     /// Fast reconnect in progress — informational, never an armed-clearing
     /// event.
-    LinkReconnecting { gen: u64 },
-    VoiceReady,
+    LinkReconnecting {
+        gen: u64,
+    },
+    VoiceJoinFinished {
+        generation: u64,
+        ready: bool,
+    },
     VoiceLost,
     /// Bare `/play`: the ▶ half of ⏯, refused while something is audible.
     Play { reply: oneshot::Sender<String> },
@@ -608,7 +636,9 @@ pub enum Effect {
     StartMedia { item: QueueItem, epoch: u64, gate: StartGate },
     CancelMedia,
     ClearBridge,
-    JoinVoice,
+    JoinVoice {
+        generation: u64,
+    },
     /// A track just became audible: append it to the play history. Emitted
     /// once per airing, alongside the card that announces it.
     RecordAired(AiredTrack),
@@ -644,7 +674,13 @@ pub fn step(state: &mut PlayerState, input: Input, now: Instant) -> Vec<Effect> 
     // indefinitely. Old timers revalidate against the newest jump's timestamp.
     state.expire_jumps(now, &mut fx);
     match input {
-        Input::Enqueue { item, pos, start_if_idle, reply: tx } => {
+        Input::Guarded { input, .. } => return step(state, *input, now),
+        Input::Enqueue {
+            item,
+            pos,
+            start_if_idle,
+            reply: tx,
+        } => {
             let queued_title = item.source.display_title().to_string();
             let accepted = match pos {
                 EnqueuePos::Tail => state.queue.push(item),
@@ -877,6 +913,7 @@ pub fn step(state: &mut PlayerState, input: Input, now: Instant) -> Vec<Effect> 
             // latch the guard and make the NEXT force disconnect read as
             // deliberate — no teardown, librespot feeding a dead call.
             if leave_voice {
+                state.voice_generation += 1;
                 fx.push(Effect::LeaveVoice);
             }
             // The runner's `MediaEnded{Cancelled}` still lands after this;
@@ -1242,8 +1279,18 @@ pub fn step(state: &mut PlayerState, input: Input, now: Instant) -> Vec<Effect> 
             }
         }
 
-        Input::VoiceReady => {
-            state.voice = VoiceStatus::Ready;
+        Input::VoiceJoinFinished { generation, ready } => {
+            if generation != state.voice_generation || state.voice != VoiceStatus::Joining {
+                return fx;
+            }
+            if ready {
+                state.voice = VoiceStatus::Ready;
+            } else {
+                fx.extend(step(state, Input::VoiceLost, now));
+                fx.push(Effect::Ui(UiMsg::Notice(
+                    "⚠️ Couldn't join a voice channel. Try again from a voice channel.".into(),
+                )));
+            }
         }
 
         Input::ClearQueue { reply: tx } => {
@@ -1301,6 +1348,7 @@ pub fn step(state: &mut PlayerState, input: Input, now: Instant) -> Vec<Effect> 
         }
 
         Input::VoiceLost => {
+            state.voice_generation += 1;
             state.voice = VoiceStatus::Down;
             if matches!(state.active, Active::Media { .. }) {
                 fx.push(Effect::CancelMedia);
@@ -1983,7 +2031,10 @@ fn ensure_voice(state: &mut PlayerState, fx: &mut Vec<Effect>) {
         return;
     }
     if matches!(state.voice, VoiceStatus::Down) {
-        fx.push(Effect::JoinVoice);
+        state.voice_generation += 1;
+        fx.push(Effect::JoinVoice {
+            generation: state.voice_generation,
+        });
     }
     state.voice = VoiceStatus::Joining;
 }
@@ -2314,7 +2365,7 @@ mod tests {
     }
 
     fn has_join(fx: &[Effect]) -> bool {
-        fx.iter().any(|e| matches!(e, Effect::JoinVoice))
+        fx.iter().any(|e| matches!(e, Effect::JoinVoice { .. }))
     }
 
     fn has_clear(fx: &[Effect]) -> bool {
@@ -2366,6 +2417,65 @@ mod tests {
     }
 
     // --- arming at enqueue (old enqueue_* table rows) ---------------------
+
+    #[test]
+    fn delayed_voice_join_cannot_revive_stopped_player() {
+        let mut sim = Sim::new();
+        let mut fx = Vec::new();
+        ensure_voice(&mut sim.s, &mut fx);
+        let generation = sim.s.voice_generation;
+        sim.stop();
+        for ready in [true, false] {
+            assert!(sim
+                .step(Input::VoiceJoinFinished { generation, ready })
+                .is_empty());
+            assert_eq!(sim.s.voice, VoiceStatus::Down);
+        }
+    }
+
+    #[test]
+    fn old_join_failure_cannot_cancel_a_new_voice_attempt() {
+        let mut sim = Sim::new();
+        let mut fx = Vec::new();
+        ensure_voice(&mut sim.s, &mut fx);
+        let old = sim.s.voice_generation;
+        sim.step(Input::VoiceLost);
+        ensure_voice(&mut sim.s, &mut fx);
+        let current = sim.s.voice_generation;
+        assert_ne!(old, current);
+        assert!(sim
+            .step(Input::VoiceJoinFinished {
+                generation: old,
+                ready: false
+            })
+            .is_empty());
+        assert_eq!(sim.s.voice, VoiceStatus::Joining);
+        sim.step(Input::VoiceJoinFinished {
+            generation: current,
+            ready: true,
+        });
+        assert_eq!(sim.s.voice, VoiceStatus::Ready);
+    }
+
+    #[test]
+    fn matching_join_failure_cancels_media_and_duplicate_completion_is_ignored() {
+        let mut sim = Sim::media_over_paused_baseline();
+        sim.s.voice = VoiceStatus::Down;
+        ensure_voice(&mut sim.s, &mut Vec::new());
+        let generation = sim.s.voice_generation;
+        let fx = sim.step(Input::VoiceJoinFinished {
+            generation,
+            ready: false,
+        });
+        assert!(fx.iter().any(|e| matches!(e, Effect::CancelMedia)));
+        assert_eq!(sim.s.voice, VoiceStatus::Down);
+        assert!(sim
+            .step(Input::VoiceJoinFinished {
+                generation,
+                ready: true
+            })
+            .is_empty());
+    }
 
     #[test]
     fn enqueue_arms_first_spotify_anywhere_while_playing() {
@@ -4313,7 +4423,9 @@ mod tests {
         let mut sim = Sim::idle_device();
         sim.s.voice = VoiceStatus::Down;
         let fx = sim.enqueue_start(spotify_item(1, "s1"));
-        let join = fx.iter().position(|e| matches!(e, Effect::JoinVoice));
+        let join = fx
+            .iter()
+            .position(|e| matches!(e, Effect::JoinVoice { .. }));
         let load = fx
             .iter()
             .position(|e| matches!(e, Effect::Spirc(SpircCmd::Load(_))));
@@ -4419,8 +4531,12 @@ mod tests {
         sim.s.voice = VoiceStatus::Down;
         sim.s.queue.push(media_item("m"));
         let fx = sim.toggle();
-        let join = fx.iter().position(|e| matches!(e, Effect::JoinVoice));
-        let start = fx.iter().position(|e| matches!(e, Effect::StartMedia { .. }));
+        let join = fx
+            .iter()
+            .position(|e| matches!(e, Effect::JoinVoice { .. }));
+        let start = fx
+            .iter()
+            .position(|e| matches!(e, Effect::StartMedia { .. }));
         assert!(join.is_some() && start.is_some());
         assert!(join < start, "the join is requested before the start");
         assert_eq!(sim.s.voice, VoiceStatus::Joining);

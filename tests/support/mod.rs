@@ -50,6 +50,44 @@ pub fn check_host(binary: &str, nob: bool) {
         .success());
     assert!(!root.join("custom-state-must-not-exist").exists());
 
+    // Both real entrypoints validate paired routing without binding sockets or
+    // authenticating either Discord identity. All values here are synthetic.
+    let base = "DISCORD_TOKEN=test-only-never-connect\nDISCORD_GUILD_ID=1\nDISCORD_CHANNEL_ID=2\nSTATE_DIR=paired-state-must-not-exist\n";
+    let mode = if nob { "coordinator" } else { "worker" };
+    let key = "01".repeat(32);
+    let paired = format!("{base}COMMAND_MODE={mode}\nROUTING_LISTEN=127.0.0.1:19211\nROUTING_PEER=127.0.0.1:19212\nROUTING_KEY={key}\n");
+    fs::write(root.join(file), &paired).unwrap();
+    assert!(command()
+        .arg("--check-config")
+        .output()
+        .unwrap()
+        .status
+        .success());
+    assert!(!root.join("paired-state-must-not-exist").exists());
+    for (from, to) in [
+        ("127.0.0.1:19211", "0.0.0.0:19211"),
+        ("127.0.0.1:19211", "127.0.0.1:0"),
+        (key.as_str(), "invalid-routing-key-must-not-be-printed"),
+        (mode, "unknown-role"),
+        (mode, if nob { "worker" } else { "coordinator" }),
+        ("ROUTING_KEY=", "UNUSED_KEY="),
+    ] {
+        fs::write(root.join(file), paired.replace(from, to)).unwrap();
+        let result = command().arg("--check-config").output().unwrap();
+        assert!(!result.status.success());
+        assert!(!String::from_utf8_lossy(&result.stderr)
+            .contains("invalid-routing-key-must-not-be-printed"));
+    }
+    if nob {
+        fs::write(root.join(file), paired.replace("19212", "19211")).unwrap();
+        assert!(!command()
+            .arg("--check-config")
+            .output()
+            .unwrap()
+            .status
+            .success());
+    }
+
     if nob {
         fs::remove_file(root.join(file)).unwrap();
         let output = command()

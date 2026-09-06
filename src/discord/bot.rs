@@ -1,5 +1,6 @@
 use super::account::ActiveSession;
 use super::commands;
+use super::voice_owner::{VoiceLease, VoiceOwner};
 use super::presence::run_presence_loop;
 use super::ui::{self, CardView, HistoryView, UiMsg};
 use super::voice::{SimpleBridgeReader, TrackErrorHandler, CHANNELS, SAMPLE_RATE};
@@ -91,6 +92,11 @@ pub(super) struct Handler {
     /// The same ensure-voice dispatch the actor's `JoinVoice` effect runs
     /// (a no-op when a call already exists), for the session-switch path.
     pub(super) join_voice: JoinVoiceFn,
+    pub(super) voice_owner: Arc<VoiceOwner>,
+    pub(super) boot: String,
+    pub(super) pairings: Mutex<super::routing::Pairings>,
+    pub(super) front_menus: Mutex<super::front::Menus>,
+    pub(super) pairing_slots: Arc<tokio::sync::Semaphore>,
     pub(super) ytdlp_available: bool,
     pub(super) announce_enabled: Arc<AtomicBool>,
     /// Last /play per user, for the metadata-probe cooldown.
@@ -123,7 +129,10 @@ impl songbird::input::core::io::MediaSource for CursorSource {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn play_join_sound_then_bridge(
+    owner: Arc<VoiceOwner>,
+    lease: VoiceLease,
     call_lock: Arc<tokio::sync::Mutex<songbird::Call>>,
     bridge: Arc<AudioBridge>,
     prebuffer_samples: usize,
@@ -151,20 +160,30 @@ async fn play_join_sound_then_bridge(
         let boop_source = CursorSource(std::io::Cursor::new(bytes));
         let raw = RawAdapter::new(boop_source, SAMPLE_RATE, CHANNELS);
         let input: Input = raw.into();
-        let _boop_handle = call.play_only(input.into());
+        if owner
+            .with_current(&lease, || call.play_only(input.into()))
+            .is_none()
+        {
+            return;
+        }
     }
 
-    tokio::time::sleep(std::time::Duration::from_secs_f64(duration_secs + 0.1)).await;
+    tokio::select! {
+        _ = lease.cancelled.cancelled() => return,
+        _ = tokio::time::sleep(std::time::Duration::from_secs_f64(duration_secs + 0.1)) => {}
+    }
 
     let reader = SimpleBridgeReader::new(bridge, prebuffer_samples, prebuffer_wait);
     let input = reader.into_input();
     let mut call = call_lock.lock().await;
-    let track_handle = call.play_only(input.into());
+    let Some(track_handle) = owner.with_current(&lease, || call.play_only(input.into())) else {
+        return;
+    };
     let _ = track_handle.add_event(Event::Track(TrackEvent::Error), TrackErrorHandler);
     let _ = track_handle.add_event(Event::Track(TrackEvent::End), TrackErrorHandler);
     tracing::info!(track_uuid = ?track_handle.uuid(), "bridge reader connected after join sound");
     let mut lock = track_handle_store.lock();
-    *lock = Some(track_handle);
+    owner.with_current(&lease, || *lock = Some(track_handle));
 }
 
 // --- Player-actor wiring: transport shim, notices, voice join ---
@@ -201,7 +220,7 @@ async fn transport_shim(
 /// once, so a second `/stop` racing the first one's gateway echo can no
 /// longer clear the first one's arming and turn that echo into a phantom
 /// force disconnect.
-fn consume_deliberate_leave(guard: &AtomicUsize) -> bool {
+pub(super) fn consume_deliberate_leave(guard: &AtomicUsize) -> bool {
     guard
         .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
         .is_ok()
@@ -227,17 +246,6 @@ fn spawn_notice_task(
     tx
 }
 
-/// Whether the bot is actually connected to a voice channel. `Songbird::get`
-/// alone is not that test: `leave()` keeps the `Call` registered, so it
-/// answers "yes" forever after the first empty-channel teardown and every
-/// later `/login` would skip the re-join.
-pub(super) async fn bot_in_voice(manager: &songbird::Songbird, guild_id: GuildId) -> bool {
-    match manager.get(guild_id) {
-        Some(call) => call.lock().await.current_channel().is_some(),
-        None => false,
-    }
-}
-
 /// Join the given user's voice channel (falling back to the configured
 /// channel), self-deafen, unsuppress on stage channels, and start the
 /// join-sound + bridge hookup. Returns whether the join succeeded. Free
@@ -245,46 +253,53 @@ pub(super) async fn bot_in_voice(manager: &songbird::Songbird, guild_id: GuildId
 /// one implementation.
 #[allow(clippy::too_many_arguments)]
 async fn join_voice_inner(
+    owner: Arc<VoiceOwner>,
+    lease: VoiceLease,
     ctx_store: Arc<Mutex<Option<Context>>>,
     guild_id: GuildId,
-    fallback_channel: ChannelId,
     bridge: Arc<AudioBridge>,
     prebuffer_samples: usize,
     prebuffer_wait: std::time::Duration,
     track_handle_store: Arc<Mutex<Option<TrackHandle>>>,
     dj: Arc<DJAnnouncer>,
-    discord_user_id: Option<u64>,
 ) -> bool {
     let ctx = {
         let lock = ctx_store.lock();
         match lock.clone() {
             Some(c) => c,
-            None => { tracing::warn!("no ctx available for voice join"); return false; }
+            None => {
+                owner.failed(&lease);
+                tracing::warn!("no ctx available for voice join");
+                return false;
+            }
         }
     };
 
-    // Follow the user in — unless they're parked in the guild's AFK channel,
-    // which is nobody's listening room.
-    let user_channel = discord_user_id.and_then(|id| {
-        guild_id.to_guild_cached(&ctx).and_then(|guild| {
-            let afk = guild.afk_metadata.as_ref().map(|a| a.afk_channel_id);
-            guild
-                .voice_states
-                .get(&UserId::new(id))
-                .and_then(|vs| vs.channel_id)
-                .filter(|ch| Some(*ch) != afk)
-        })
-    });
-
-    let target_channel = user_channel.unwrap_or(fallback_channel);
-
+    let _transition = owner.transitions.lock().await;
+    if !owner.current(&lease) {
+        return false;
+    }
+    let target_channel = ChannelId::new(lease.channel);
     let manager = match songbird::get(&ctx).await {
         Some(m) => m,
-        None => { tracing::error!("songbird not registered"); return false; }
+        None => {
+            owner.failed(&lease);
+            return false;
+        }
     };
+    if owner.connected(&lease) {
+        if let Some(call) = manager.get(guild_id) {
+            if call.lock().await.current_channel().map(|ch| ch.0.get()) == Some(lease.channel) {
+                return owner.current(&lease);
+            }
+        }
+    }
 
     match manager.join(guild_id, target_channel).await {
         Ok(call) => {
+            if !owner.mark_connected(&lease) {
+                return false;
+            }
             tracing::info!(channel = %target_channel, "joined voice channel");
             // Self-deafen so users know we're not listening
             let bot_id = ctx.cache.current_user().id;
@@ -303,10 +318,20 @@ async fn join_voice_inner(
                     }
                 }
             }
-            tokio::spawn(play_join_sound_then_bridge(call, bridge, prebuffer_samples, prebuffer_wait, track_handle_store, dj));
-            true
+            tokio::spawn(play_join_sound_then_bridge(
+                owner.clone(),
+                lease.clone(),
+                call,
+                bridge,
+                prebuffer_samples,
+                prebuffer_wait,
+                track_handle_store,
+                dj,
+            ));
+            owner.current(&lease)
         }
         Err(e) => {
+            owner.failed(&lease);
             tracing::warn!(error = ?e, "failed to join voice channel");
             false
         }
@@ -318,13 +343,35 @@ impl EventHandler for Handler {
     async fn ready(&self, ctx: Context, ready: Ready) {
         tracing::info!(user = %ready.user.name, "discord bot connected");
 
-        let mut registered = commands::register_commands(self.ytdlp_available);
-        registered.extend(super::admin::register_commands(self.config.profile));
+        let registered = match self.config.routing.mode {
+            crate::routing::CommandMode::Standalone => {
+                let mut commands = commands::register_commands(self.ytdlp_available);
+                commands.extend(super::admin::register_commands(self.config.profile));
+                commands
+            }
+            crate::routing::CommandMode::Coordinator => super::front::register_commands(),
+            crate::routing::CommandMode::Worker => Vec::new(),
+        };
         match self.guild_id.set_commands(&ctx, registered).await {
             Ok(cmds) => tracing::info!("registered {} slash commands", cmds.len()),
             Err(e) => tracing::warn!(error = ?e, "failed to register slash commands"),
         }
 
+        if self.config.routing.mode != crate::routing::CommandMode::Standalone {
+            // Guild registration does not replace global commands. Remove only
+            // this application's known legacy slash commands during cutover.
+            match serenity::all::Command::get_global_commands(&ctx.http).await {
+                Err(error) => tracing::warn!(?error, "could not inspect legacy global commands"),
+                Ok(commands) => for command in commands {
+                    if command.kind == serenity::all::CommandType::ChatInput && matches!(command.name.as_str(),
+                        "login"|"logout"|"forget"|"who"|"queue"|"skip"|"stop"|"clear"|"np"|"history"|"announce"|"play"|"slowmode"|"purge"|"music"|"server") {
+                        if let Err(error) = serenity::all::Command::delete_global_command(&ctx.http, command.id).await {
+                            tracing::warn!(?error, "could not remove a legacy global command");
+                        }
+                    }
+                }
+            }
+        }
         {
             let mut ctx_store = self.ctx.lock();
             *ctx_store = Some(ctx.clone());
@@ -375,7 +422,9 @@ impl EventHandler for Handler {
         // tear the session down, or an admin force-disconnect leaves
         // librespot and the feeder pushing into a dead call forever.
         if new.user_id == ctx.cache.current_user().id {
-            if new.channel_id.is_none() {
+            if let Some(channel) = new.channel_id {
+                self.voice_owner.observe_channel(channel.get());
+            } else {
                 // Our own `/stop` leave: expected, and it must not touch the
                 // session or the account.
                 if consume_deliberate_leave(&self.leaving_voice) {
@@ -403,6 +452,7 @@ impl EventHandler for Handler {
                     self.teardown_playback_session(&ctx, false).await;
                 } else {
                     tracing::info!("bot disconnected from voice with nothing playing");
+                    self.voice_owner.retire();
                     self.player.send(PlayerInput::VoiceLost);
                 }
             }
@@ -436,7 +486,9 @@ impl EventHandler for Handler {
         // a Spotify session exists. Gating this on a session used to let
         // YouTube/file-only playback (started via /play with no /login) keep
         // playing to an empty channel forever.
-        if humans_in_bot_channel == 0 {
+        if humans_in_bot_channel == 0
+            && self.voice_owner.snapshot().1 == bot_channel.map(|channel| channel.get())
+        {
             tracing::info!("voice channel empty — tearing down playback");
             self.teardown_playback_session(&ctx, true).await;
         }
@@ -491,6 +543,7 @@ impl DiscordBot {
         let prebuffer_wait =
             std::time::Duration::from_secs_f32((config.prebuffer_seconds + 0.5).clamp(0.0, 5.0));
 
+        let voice_owner = Arc::new(VoiceOwner::default());
         let active_session = Arc::new(Mutex::new(None::<ActiveSession>));
         let track_handle: Arc<Mutex<Option<TrackHandle>>> = Arc::new(Mutex::new(None));
 
@@ -567,33 +620,62 @@ impl DiscordBot {
             let bridge = bridge.clone();
             let track_handle = track_handle.clone();
             let dj = dj.clone();
+            let owner = voice_owner.clone();
             Arc::new(
-                move |discord_user_id: Option<u64>| -> Pin<Box<dyn Future<Output = bool> + Send>> {
+                move |discord_user_id, guard: Option<crate::player::state::VoiceGuard>| {
+                    // Claim synchronously when the actor emits the effect, before
+                    // its spawned task can race a later Stop or another room.
+                    let target = owner
+                        .snapshot()
+                        .1
+                        .or_else(|| {
+                            let ctx = ctx_store.lock().clone()?;
+                            let guild = guild_id.to_guild_cached(&ctx)?;
+                            let afk = guild.afk_metadata.as_ref().map(|a| a.afk_channel_id);
+                            discord_user_id
+                                .and_then(|id| guild.voice_states.get(&UserId::new(id)))
+                                .and_then(|vs| vs.channel_id)
+                                .filter(|ch| Some(*ch) != afk)
+                                .map(|ch| ch.get())
+                        })
+                        .unwrap_or(channel_id.get());
+                    let user_still_here = guard.as_ref().is_none_or(|guard| {
+                        let Some(ctx) = ctx_store.lock().clone() else {
+                            return false;
+                        };
+                        let Some(guild) = guild_id.to_guild_cached(&ctx) else {
+                            return false;
+                        };
+                        let room = guild
+                            .voice_states
+                            .get(&UserId::new(guard.user))
+                            .and_then(|vs| vs.channel_id)
+                            .map(|ch| ch.get());
+                        room == Some(guard.room) && target == guard.room
+                    });
+                    let lease = user_still_here
+                        .then(|| owner.claim_for(target, guard.as_ref().map(|g| g.generation)))
+                        .flatten();
+                    let owner = owner.clone();
                     let ctx_store = ctx_store.clone();
                     let bridge = bridge.clone();
                     let track_handle = track_handle.clone();
                     let dj = dj.clone();
                     Box::pin(async move {
-                        let ctx = { ctx_store.lock().clone() };
-                        if let Some(ctx) = &ctx {
-                            if let Some(manager) = songbird::get(ctx).await {
-                                if bot_in_voice(&manager, guild_id).await {
-                                    return true;
-                                }
-                            }
-                        }
+                        let (lease, revision) = lease?;
                         join_voice_inner(
+                            owner,
+                            lease,
                             ctx_store,
                             guild_id,
-                            channel_id,
                             bridge,
                             prebuffer_samples,
                             prebuffer_wait,
                             track_handle,
                             dj,
-                            discord_user_id,
                         )
                         .await
+                        .then_some(revision)
                     })
                 },
             )
@@ -605,12 +687,17 @@ impl DiscordBot {
         // later presence check would read it as "still in a call".
         let leaving_voice = Arc::new(AtomicUsize::new(0));
         let leave_voice: player_actor::LeaveVoiceFn = {
+            let owner = voice_owner.clone();
             let ctx_store = ctx_store.clone();
             let leaving_voice = leaving_voice.clone();
             Arc::new(move || -> Pin<Box<dyn Future<Output = ()> + Send>> {
+                let retirement = owner.retire();
+                let owner = owner.clone();
                 let ctx_store = ctx_store.clone();
                 let leaving_voice = leaving_voice.clone();
                 Box::pin(async move {
+                    let _transition = owner.transitions.lock().await;
+                    if !owner.retirement_current(retirement) { return; }
                     let Some(ctx) = ({ ctx_store.lock().clone() }) else { return };
                     let Some(manager) = songbird::get(&ctx).await else { return };
                     leaving_voice.fetch_add(1, Ordering::SeqCst);
@@ -639,7 +726,32 @@ impl DiscordBot {
 
         let notice_tx = spawn_notice_task(ctx_store.clone(), text_channel_id);
 
+        let authorize_voice = {
+            let owner = voice_owner.clone();
+            let ctx_store = ctx_store.clone();
+            Arc::new(move |guard: &crate::player::state::VoiceGuard| {
+                let Some(ctx) = ctx_store.lock().clone() else {
+                    return false;
+                };
+                let Some(guild) = guild_id.to_guild_cached(&ctx) else {
+                    return false;
+                };
+                let user_room = guild
+                    .voice_states
+                    .get(&UserId::new(guard.user))
+                    .and_then(|vs| vs.channel_id)
+                    .map(|ch| ch.get());
+                let (generation, claimed) = owner.snapshot();
+                let bot_room = claimed.or_else(|| guild.voice_states.get(&ctx.cache.current_user().id).and_then(|vs| vs.channel_id).map(|ch| ch.get()));
+                // Fresh joins must follow a listening room. The join helper
+                // excludes AFK; do not let a human request fall back elsewhere.
+                let afk = guild.afk_metadata.as_ref().map(|a| a.afk_channel_id.get());
+                let user_room = user_room.filter(|room| Some(*room) != afk || bot_room == Some(*room));
+                guard.allows(generation, bot_room, user_room)
+            })
+        };
         let player = player_actor::spawn(PlayerDeps {
+            authorize_voice,
             bridge: bridge.clone(),
             ui_send,
             notice_tx,
@@ -704,6 +816,11 @@ impl DiscordBot {
             ui_tx: ui_tx_store,
             player,
             join_voice,
+            voice_owner,
+            boot: uuid::Uuid::new_v4().to_string(),
+            pairings: Mutex::new(super::routing::Pairings::default()),
+            front_menus: Mutex::new(super::front::Menus::default()),
+            pairing_slots: Arc::new(tokio::sync::Semaphore::new(4)),
             ytdlp_available,
             announce_enabled,
             play_cooldowns: Arc::new(Mutex::new(HashMap::new())),
@@ -711,9 +828,25 @@ impl DiscordBot {
             auto_start_attempted: AtomicBool::new(false),
         };
 
+        let handler = Arc::new(handler);
+        if config.routing.mode != crate::routing::CommandMode::Standalone {
+            let executor: crate::routing::transport::Executor = {
+                let handler = handler.clone();
+                Arc::new(move |request| {
+                    let handler = handler.clone();
+                    Box::pin(async move { handler.execute_routed(request).await })
+                })
+            };
+            crate::routing::transport::listen(
+                config.routing.listen.unwrap(),
+                config.routing.key.unwrap(),
+                executor,
+            )
+            .await?;
+        }
         let token = config.discord_token.clone();
         let client = Client::builder(&token, intents)
-            .event_handler(handler)
+            .event_handler_arc(handler)
             .register_songbird()
             .await?;
 
@@ -731,4 +864,3 @@ impl DiscordBot {
         Ok(self.ready_rx)
     }
 }
-

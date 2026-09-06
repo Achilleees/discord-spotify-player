@@ -29,11 +29,11 @@ use std::time::Instant;
 pub(super) const PLAY_VOICE_REQUIRED: &str =
     "Join a voice channel first (or the bot's channel if it's already in one) to add music.";
 
-struct TrackRequest {
-    url: Option<String>,
-    attachment: Option<serenity::all::Attachment>,
-    next: bool,
-    start_if_idle: bool,
+pub(super) struct TrackRequest {
+    pub(super) url: Option<String>,
+    pub(super) attachment: Option<crate::routing::Attachment>,
+    pub(super) next: bool,
+    pub(super) start_if_idle: bool,
 }
 
 pub(super) fn register_commands(ytdlp_available: bool) -> Vec<CreateCommand> {
@@ -137,7 +137,7 @@ fn is_valid_track_id(id: &str) -> bool {
 
 /// Result of sorting a `/play` or `/queue` link argument into the Spotify
 /// fast path or the generic YouTube/SoundCloud/attachment path.
-enum LinkKind {
+pub(super) enum LinkKind {
     Spotify(librespot_core::SpotifyUri),
     Other,
 }
@@ -146,7 +146,7 @@ enum LinkKind {
 /// straight to a `SpotifyUri`; anything else (including a malformed Spotify
 /// link) falls through to the YouTube/SoundCloud/attachment path, which
 /// reports its own "unsupported URL" error for garbage input.
-fn classify_link(input: &str) -> LinkKind {
+pub(super) fn classify_link(input: &str) -> LinkKind {
     let track_id = match parse_track_id_from_url(input) {
         Some(id) => id,
         None => return LinkKind::Other,
@@ -290,7 +290,7 @@ fn button_mutates_queue(custom_id: &str) -> bool {
 /// listing's status line. Follows the reply house style documented on
 /// `player::state`'s `reply`: `▶`/`⏸` for the transport state, track and
 /// user names in bold, one phrasing per state.
-fn render_now_playing(now: &NowPlaying) -> String {
+pub(super) fn render_now_playing(now: &NowPlaying) -> String {
     match now {
         NowPlaying::Nothing => "Nothing is playing right now.".to_string(),
         NowPlaying::Media { title, subtitle, queued_by, paused } => {
@@ -307,6 +307,26 @@ fn render_now_playing(now: &NowPlaying) -> String {
 
 impl Handler {
     pub(super) async fn dispatch_interaction(&self, ctx: Context, interaction: Interaction) {
+        if self.dispatch_front(&ctx, &interaction).await {
+            return;
+        }
+        if self.config.routing.mode != crate::routing::CommandMode::Standalone {
+            if let Interaction::Command(cmd) = &interaction {
+                if cmd.guild_id == Some(self.guild_id) {
+                    let _ = cmd
+                        .create_response(
+                            &ctx,
+                            CreateInteractionResponse::Message(
+                                CreateInteractionResponseMessage::new()
+                                    .content("Open nob's /music or /server menu.")
+                                    .ephemeral(true),
+                            ),
+                        )
+                        .await;
+                }
+                return;
+            }
+        }
         if let Interaction::Modal(modal) = &interaction {
             self.handle_music_modal(&ctx, modal).await;
             return;
@@ -386,16 +406,17 @@ impl Handler {
                 _ => {}
             }
 
+            let player = self.voice_player(&ctx, component.user.id, custom_id == "ctrl_play");
             let reply_content: String = match custom_id {
-                "ctrl_play" => self.player.play().await,
-                "ctrl_prev" => self.player.previous().await,
+                "ctrl_play" => player.play().await,
+                "ctrl_prev" => player.previous().await,
                 // Same semantics as /skip: the actor cancels the current
                 // media item or advances whatever the queue head says.
-                "ctrl_next" => self.player.skip().await,
-                "ctrl_stop" => self.player.stop().await,
+                "ctrl_next" => player.skip().await,
+                "ctrl_stop" => player.stop().await,
                 // ⏯: the actor pauses/resumes the active media item, pauses
                 // a playing baseline, or starts/resumes whatever is next.
-                "ctrl_pause_toggle" => self.player.toggle_pause().await,
+                "ctrl_pause_toggle" => player.toggle_pause().await,
                 _ => "Unknown button".to_string(),
             };
 
@@ -450,7 +471,10 @@ impl Handler {
         // Defer login immediately — OAuth + session startup takes >3s
         if cmd.data.name.as_str() == "login" {
             let _ = cmd.defer_ephemeral(&ctx).await;
-            match self.handle_login(&user_id, user_id_u64, &username, in_voice).await {
+            match self
+                .handle_login(&user_id, user_id_u64, &username, in_voice, None)
+                .await
+            {
                 LoginOutcome::Reply(s) => {
                     let _ = cmd.edit_response(&ctx, serenity::builder::EditInteractionResponse::new().content(s)).await;
                 }
@@ -466,8 +490,15 @@ impl Handler {
                     // Serenity dispatches each interaction in its own task, so
                     // this long await (up to DEVICE_LOGIN_MAX_WAIT) doesn't
                     // block other events.
-                    let reply = self.finish_device_login(&user_id, user_id_u64, &username, &ctx, auth).await;
-                    let _ = cmd.edit_response(&ctx, serenity::builder::EditInteractionResponse::new().content(reply)).await;
+                    let reply = self
+                        .finish_device_login(&user_id, user_id_u64, &username, &ctx, auth, None)
+                        .await;
+                    let _ = cmd
+                        .edit_response(
+                            &ctx,
+                            serenity::builder::EditInteractionResponse::new().content(reply),
+                        )
+                        .await;
                 }
             }
             return;
@@ -525,8 +556,8 @@ impl Handler {
             "logout" => self.handle_logout(&user_id, user_id_u64).await,
             "forget" => self.handle_forget(&user_id, user_id_u64).await,
             "who" => self.handle_who().await,
-            "skip" => self.player.skip().await,
-            "stop" => self.player.stop().await,
+            "skip" => self.voice_player(&ctx, cmd.user.id, false).skip().await,
+            "stop" => self.voice_player(&ctx, cmd.user.id, false).stop().await,
             "np" => render_now_playing(&self.player.query().await.now),
             "history" => {
                 let count = cmd
@@ -553,12 +584,23 @@ impl Handler {
     }
 
     /// The bot's and the given user's current voice channels, from the cache.
-    fn voice_channels(&self, ctx: &Context, user_id: UserId) -> (Option<ChannelId>, Option<ChannelId>) {
+    pub(super) fn voice_channels(
+        &self,
+        ctx: &Context,
+        user_id: UserId,
+    ) -> (Option<ChannelId>, Option<ChannelId>) {
         let bot_id = ctx.cache.current_user().id;
         match self.guild_id.to_guild_cached(ctx) {
             Some(guild) => (
-                guild.voice_states.get(&bot_id).and_then(|vs| vs.channel_id),
-                guild.voice_states.get(&user_id).and_then(|vs| vs.channel_id),
+                guild
+                    .voice_states
+                    .get(&bot_id)
+                    .and_then(|vs| vs.channel_id)
+                    .or_else(|| self.voice_owner.snapshot().1.map(ChannelId::new)),
+                guild
+                    .voice_states
+                    .get(&user_id)
+                    .and_then(|vs| vs.channel_id),
             ),
             None => (None, None),
         }
@@ -584,7 +626,7 @@ impl Handler {
     /// `/queue` with no arguments, rendered from the actor's
     /// `PlayerSnapshot`: how to add tracks, what's audible right now, and
     /// the first few queued items (with a `+N more` line for the rest).
-    async fn format_queue_listing(&self) -> String {
+    pub(super) async fn format_queue_listing(&self) -> String {
         let snap = self.player.query().await;
         let mut lines = vec![];
         if snap.link_up {
@@ -628,16 +670,34 @@ impl Handler {
         voice_gate(bot_ch, user_ch, true)
     }
 
+    fn voice_player(
+        &self,
+        ctx: &Context,
+        user: UserId,
+        may_join: bool,
+    ) -> crate::player::actor::PlayerHandle {
+        self.player.guarded(crate::player::state::VoiceGuard {
+            generation: self.voice_owner.snapshot().0,
+            room: self
+                .voice_channels(ctx, user)
+                .1
+                .map(|channel| channel.get())
+                .unwrap_or(0),
+            user: user.get(),
+            may_join,
+        })
+    }
+
     /// Extracts `url`/`file`/`next` from a `/play` or `/queue` interaction's
     /// options. `next` is always `false` for commands without that option
     /// (only `/play` registers it).
     fn parse_play_queue_options(
         cmd: &serenity::model::application::CommandInteraction,
-    ) -> (Option<String>, Option<serenity::model::channel::Attachment>, bool) {
+    ) -> (Option<String>, Option<crate::routing::Attachment>, bool) {
         let url_arg: Option<String> = cmd.data.options.iter()
             .find(|o| o.name == "url")
             .and_then(|o| if let serenity::model::application::CommandDataOptionValue::String(s) = &o.value { Some(s.clone()) } else { None });
-        let attachment_arg = cmd.data.resolved.attachments.values().next().cloned();
+        let attachment_arg = cmd.data.resolved.attachments.values().next().map(|a| crate::routing::Attachment { filename: a.filename.clone(), url: a.url.clone(), size: a.size as u64 });
         let next: bool = cmd.data.options.iter()
             .find(|o| o.name == "next")
             .and_then(|o| if let serenity::model::application::CommandDataOptionValue::Boolean(b) = &o.value { Some(*b) } else { None })
@@ -651,7 +711,7 @@ impl Handler {
     /// session (`PlayerHandle::lookup_spotify`) instead.
     async fn build_media_queue_item(
         url: Option<String>,
-        attachment: Option<serenity::model::channel::Attachment>,
+        attachment: Option<crate::routing::Attachment>,
         discord_name: &str,
         discord_id: u64,
     ) -> Result<QueueItem, String> {
@@ -672,7 +732,7 @@ impl Handler {
             })
         } else {
             let att = attachment.expect("caller ensures url xor attachment is Some");
-            validate_attachment(&att.filename, att.size as u64).map_err(|e| e.to_string())?;
+            validate_attachment(&att.filename, att.size).map_err(|e| e.to_string())?;
             Ok(QueueItem {
             item_id: 0,
                 source: MediaSource::File {
@@ -688,7 +748,9 @@ impl Handler {
     /// One resolver/enqueue path for slash commands, link modals and search
     /// selections. Slow lookup never carries an old voice authorization into
     /// the eventual mutation.
-    async fn add_track(&self, ctx: &Context, user: &serenity::all::User, request: TrackRequest) -> String {
+    pub(super) async fn add_track(&self, ctx: &Context, user: &serenity::all::User, request: TrackRequest, expected: Option<(&crate::routing::Target, Option<u64>)>) -> String {
+        let target = expected.map(|(target, _)| target.clone()).unwrap_or_else(|| self.music_target(ctx));
+        let room = expected.map(|(_, room)| room).unwrap_or_else(|| self.voice_channels(ctx, user.id).1.map(|ch| ch.get()));
         let allowed = || if request.start_if_idle {
             self.user_can_play(ctx, user.id)
         } else {
@@ -732,12 +794,41 @@ impl Handler {
         } else {
             EnqueuePos::Tail
         };
-        if !allowed() { return PLAY_VOICE_REQUIRED.into(); }
-        self.player.enqueue(item, pos, request.start_if_idle).await
+        if !allowed() {
+            return PLAY_VOICE_REQUIRED.into();
+        }
+        let Some(room) = room else {
+            return PLAY_VOICE_REQUIRED.into();
+        };
+        self.player
+            .guarded(crate::player::state::VoiceGuard {
+                generation: target.generation,
+                room,
+                user: user.id.get(),
+                may_join: request.start_if_idle,
+            })
+            .enqueue(item, pos, request.start_if_idle)
+            .await
     }
 
-    pub(super) async fn play_link(&self, ctx: &Context, user: &serenity::all::User, url: String) -> String {
-        self.add_track(ctx, user, TrackRequest { url: Some(url), attachment: None, next: false, start_if_idle: true }).await
+    pub(super) async fn play_link(
+        &self,
+        ctx: &Context,
+        user: &serenity::all::User,
+        url: String,
+    ) -> String {
+        self.add_track(
+            ctx,
+            user,
+            TrackRequest {
+                url: Some(url),
+                attachment: None,
+                next: false,
+                start_if_idle: true,
+            },
+            None,
+        )
+        .await
     }
 
     pub(super) fn media_lookup_on_cooldown(&self, user: UserId) -> bool {
@@ -759,10 +850,17 @@ impl Handler {
     ) {
         let (url, attachment, next) = Self::parse_play_queue_options(cmd);
         if url.is_none() && attachment.is_none() {
-            let text = self.player.play().await;
-            let _ = cmd.create_response(ctx, CreateInteractionResponse::Message(
-                CreateInteractionResponseMessage::new().content(text).ephemeral(true)
-            )).await;
+            let text = self.voice_player(ctx, cmd.user.id, true).play().await;
+            let _ = cmd
+                .create_response(
+                    ctx,
+                    CreateInteractionResponse::Message(
+                        CreateInteractionResponseMessage::new()
+                            .content(text)
+                            .ephemeral(true),
+                    ),
+                )
+                .await;
             return;
         }
         if url.is_some() && attachment.is_some() {
@@ -778,14 +876,33 @@ impl Handler {
             )).await;
             return;
         }
-        if cmd.defer_ephemeral(ctx).await.is_err() { return; }
-        let reply = self.add_track(ctx, &cmd.user, TrackRequest { url, attachment, next, start_if_idle: true }).await;
-        let _ = cmd.edit_response(ctx, EditInteractionResponse::new().content(super::ui::clipped(&reply, 1900))).await;
+        if cmd.defer_ephemeral(ctx).await.is_err() {
+            return;
+        }
+        let reply = self
+            .add_track(
+                ctx,
+                &cmd.user,
+                TrackRequest {
+                    url,
+                    attachment,
+                    next,
+                    start_if_idle: true,
+                },
+                None,
+            )
+            .await;
+        let _ = cmd
+            .edit_response(
+                ctx,
+                EditInteractionResponse::new().content(super::ui::clipped(&reply, 1900)),
+            )
+            .await;
     }
     /// The last `count` tracks that actually aired, newest first. Requests
     /// name whoever asked for them; the DJ's own playlist tracks don't, so
     /// the two are told apart at a glance.
-    async fn handle_history(&self, count: usize) -> String {
+    pub(super) async fn handle_history(&self, count: usize) -> String {
         let Some(store) = self.history.clone() else {
             return "⚠️ No play history is being kept — the database couldn't be opened."
                 .to_string();
@@ -806,7 +923,7 @@ impl Handler {
         render_history(&rows)
     }
 
-    async fn handle_announce(&self) -> String {
+    pub(super) async fn handle_announce(&self) -> String {
         let current = self.announce_enabled.load(Ordering::Relaxed);
         let new_val = !current;
         self.announce_enabled.store(new_val, Ordering::Relaxed);
@@ -821,7 +938,7 @@ impl Handler {
         }
     }
 
-    async fn handle_who(&self) -> String {
+    pub(super) async fn handle_who(&self) -> String {
         let lock = self.active_session.lock();
         match lock.as_ref() {
             // One name: the Web API profile lookup this used to pair with
@@ -852,7 +969,18 @@ impl Handler {
         let reply = if url.is_none() && attachment.is_none() {
             self.format_queue_listing().await
         } else {
-            self.add_track(ctx, &cmd.user, TrackRequest { url, attachment, next: false, start_if_idle: false }).await
+            self.add_track(
+                ctx,
+                &cmd.user,
+                TrackRequest {
+                    url,
+                    attachment,
+                    next: false,
+                    start_if_idle: false,
+                },
+                None,
+            )
+            .await
         };
         let _ = cmd.edit_response(ctx, EditInteractionResponse::new().content(super::ui::clipped(&reply, 1900))).await;
     }

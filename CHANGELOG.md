@@ -10,6 +10,16 @@ git tag (release) in this repository.
 
 ## Unreleased
 
+**One optional command menu controls both music bots.** Nob owns `/play`,
+`/music` and `/server`; Spotibot keeps its own playback buttons. Music follows
+the requester's existing room session or an available performer without
+moving a busy bot. Private menus retain playback, search, queue/history,
+account actions and server tools. Authenticated local requests bind to a
+specific bot session and retain outcomes across lost replies. Stop cancels
+late joins and login activation; old menus cannot control a replacement
+session. Standalone mode preserves the previous command list. Soundboard
+will add its entry when clip playback is implemented.
+
 **Nob runs alongside Spotibot from the same workspace.** A separate `nob`
 executable shares the music engine and UI while using its own env file,
 credentials, database, caches and Spotify device identity. Startup locks
