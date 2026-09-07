@@ -23,6 +23,18 @@ commit. Version preparation does not itself deploy the bots.
 
 ## Unreleased — v0.6.0
 
+**Delayed Back lookups cannot restart an abandoned session.** Stopping,
+changing accounts, losing voice or handing playback to another track cancels
+the pending navigation and answers its caller. Every history result carries
+its request ID, so a late or duplicate result cannot consume a newer Back
+request. Voice membership is checked again after the read. Same-track
+pause/seek updates and recognized Back arrivals preserve the ongoing walk.
+
+**Music joins use self-deafening without extra server permissions.** Join
+setup reports failed or timed-out requests accurately. Setup invites now
+include the permissions needed for playback cards and ordinary voice, with
+both bot and command scopes. Nob's idle card also uses its own name.
+
 **Nob's private soundboard also works over music.** `/soundboard` offers
 ten local clips per page, owner-bound expiring buttons, refresh and close.
 Free nob joins the requester's room, plays one short sound and leaves;

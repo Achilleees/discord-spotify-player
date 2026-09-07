@@ -311,12 +311,22 @@ displace a queue someone is already using.
 
 ⏮ walks the bot's own history rather than asking Spotify, because the two
 diverge the moment anyone touches a phone. The core stays pure: it emits
-`Effect::ResolvePrevious { before }`. The actor queues that read on the same
+`Effect::ResolvePrevious { request_id, before }`. The actor queues that read on the same
 worker as `RecordAired`, behind earlier history writes, so a Back press just
 after a track starts sees its row. The answer returns through the mailbox as
 `Input::PreviousResolved`; the actor never waits for the database. The read
 streams older rows in descending id order until it finds a Spotify reference,
 skipping media and invalid references without a fixed row-count cutoff.
+
+The request ID survives every worker reply, including empty results. The
+core accepts only its current pending read, so cancelled or duplicate results
+cannot take a newer caller's reply. Stop, session changes/reconnects, voice
+loss, skip, media/load starts and unrelated track movement cancel the read
+and answer its caller. Same-track updates and known Back arrivals preserve
+it. The actor also retains the caller's voice guard by request ID and checks
+current room membership and ownership again immediately before applying the
+result. This lookup correlation is independent of the transport arrival
+heuristic below: Spotify itself still supplies no command ID for a jump.
 
 Playing the result uses `SpircCmd::LoadContext`, which becomes
 `LoadRequest::from_context_uri(..., playing_track: Uri(target))` — it

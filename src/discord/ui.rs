@@ -109,14 +109,14 @@ impl CardState {
         None
     }
 
-    fn embed(&self, media_available: bool) -> CreateEmbed {
+    fn embed(&self, media_available: bool, bot_name: &str) -> CreateEmbed {
         let mut embed = match &self.view {
             Some(CardView::Spotify { title, artist, track_id, album_art_url, dj_name }) => {
                 let meta = SpotifyTrackInfo { title: title.clone(), artist: artist.clone(), album_art_url: album_art_url.clone() };
                 build_now_playing_embed(&meta, track_id, dj_name)
             }
             Some(CardView::Queued { item }) => build_priority_now_playing_embed(item),
-            None => return build_controls_embed(self.account.as_deref(), media_available),
+            None => return build_controls_embed(self.account.as_deref(), media_available, bot_name),
         };
         embed = embed.author(CreateEmbedAuthor::new(if self.paused { "Paused" } else { "Now Playing" }));
         if let Some(started_at) = self.started_at { embed = embed.timestamp(started_at); }
@@ -129,14 +129,14 @@ impl CardState {
 }
 
 /// Spawns the only public-card owner. Call once from ready()'s one-shot guard.
-pub fn spawn(ctx: Context, text_channel_id: ChannelId, media_available: bool) -> mpsc::UnboundedSender<UiMsg> {
+pub fn spawn(ctx: Context, text_channel_id: ChannelId, media_available: bool, bot_name: &'static str) -> mpsc::UnboundedSender<UiMsg> {
     let (tx, rx) = mpsc::unbounded_channel();
-    tokio::spawn(run(ctx, text_channel_id, media_available, rx));
+    tokio::spawn(run(ctx, text_channel_id, media_available, bot_name, rx));
     tx
 }
 
-async fn sync_card(ctx: &Context, channel: ChannelId, id: &mut Option<MessageId>, state: &CardState, media_available: bool, repost: bool) {
-    let embed = state.embed(media_available);
+async fn sync_card(ctx: &Context, channel: ChannelId, id: &mut Option<MessageId>, state: &CardState, media_available: bool, bot_name: &str, repost: bool) {
+    let embed = state.embed(media_available, bot_name);
     let components = state.buttons();
     if !repost {
         if let Some(current) = *id {
@@ -165,11 +165,11 @@ async fn sync_card(ctx: &Context, channel: ChannelId, id: &mut Option<MessageId>
     }
 }
 
-async fn run(ctx: Context, channel: ChannelId, media_available: bool, mut rx: mpsc::UnboundedReceiver<UiMsg>) {
+async fn run(ctx: Context, channel: ChannelId, media_available: bool, bot_name: &'static str, mut rx: mpsc::UnboundedReceiver<UiMsg>) {
     startup_sweep(&ctx, channel).await;
     let mut state = CardState::default();
     let mut card_id = None;
-    sync_card(&ctx, channel, &mut card_id, &state, media_available, true).await;
+    sync_card(&ctx, channel, &mut card_id, &state, media_available, bot_name, true).await;
     let mut refresh = tokio::time::interval(std::time::Duration::from_secs(30));
     refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     refresh.tick().await;
@@ -177,7 +177,7 @@ async fn run(ctx: Context, channel: ChannelId, media_available: bool, mut rx: mp
         let message = tokio::select! {
             message = rx.recv() => match message { Some(message) => message, None => break },
             _ = refresh.tick() => {
-                sync_card(&ctx, channel, &mut card_id, &state, media_available, false).await;
+                sync_card(&ctx, channel, &mut card_id, &state, media_available, bot_name, false).await;
                 continue;
             }
         };
@@ -194,7 +194,7 @@ async fn run(ctx: Context, channel: ChannelId, media_available: bool, mut rx: mp
             let _ = channel.send_message(&ctx, CreateMessage::new().embed(embed)).await;
         }
         if !history_only {
-            sync_card(&ctx, channel, &mut card_id, &state, media_available, repost).await;
+            sync_card(&ctx, channel, &mut card_id, &state, media_available, bot_name, repost).await;
         }
     }
 }
@@ -366,14 +366,14 @@ pub(super) fn clipped(text: &str, max: usize) -> String {
     result
 }
 
-fn build_controls_embed(active_user: Option<&str>, media_available: bool) -> CreateEmbed {
+fn build_controls_embed(active_user: Option<&str>, media_available: bool, bot_name: &str) -> CreateEmbed {
     let description = if media_available {
         "Use **Add music** to search YouTube or paste a Spotify, YouTube or SoundCloud track link.\nSpotify playback needs `/login`."
     } else {
         "Use `/login` to connect Spotify, then **Add music** to paste a track link."
     };
     let mut embed = CreateEmbed::new().color(0x5865F2u32)
-        .title("🎛️ Spotibot").description(description);
+        .title(format!("🎛️ {bot_name}")).description(description);
     if let Some(name) = active_user {
         embed = embed.field("Spotify DJ", clipped(name, 128), true)
             .footer(CreateEmbedFooter::new("Play in Spotify, add a track, or resume the queue"));
@@ -418,7 +418,7 @@ mod tests {
         let started = state.started_at;
         state.apply(UiMsg::Buttons { paused: true });
         state.apply(UiMsg::AccountChanged(Some("Second DJ".into())));
-        let embed = serde_json::to_value(state.embed(true)).unwrap();
+        let embed = serde_json::to_value(state.embed(true, "Test bot")).unwrap();
         let buttons = serde_json::to_value(state.buttons()).unwrap();
         assert_eq!(embed["author"]["name"], "Paused");
         assert_eq!(embed["fields"][1]["value"], "Second DJ");
@@ -431,8 +431,8 @@ mod tests {
         let mut state = CardState::default();
         assert!(state.apply(UiMsg::NowPlaying(spotify())).is_none());
         state.apply(UiMsg::Buttons { paused: true });
-        let first = serde_json::to_value(state.embed(true)).unwrap();
-        assert_eq!(first, serde_json::to_value(state.embed(true)).unwrap());
+        let first = serde_json::to_value(state.embed(true, "Test bot")).unwrap();
+        assert_eq!(first, serde_json::to_value(state.embed(true, "Test bot")).unwrap());
         assert!(state.apply(UiMsg::AccountChanged(None)).is_none());
         assert!(matches!(state.apply(UiMsg::NowPlaying(spotify())), Some(HistoryView::Spotify { .. })));
         assert!(!state.paused);
@@ -445,9 +445,9 @@ mod tests {
         assert_eq!(buttons[0]["components"][0]["custom_id"], "ctrl_play");
         assert_eq!(buttons[1]["components"][0]["custom_id"], "ctrl_add_music");
         assert_eq!(buttons[1]["components"][1]["custom_id"], "ctrl_queue_hint");
-        let embed = serde_json::to_value(state.embed(true)).unwrap();
+        let embed = serde_json::to_value(state.embed(true, "Test bot")).unwrap();
         assert!(embed["description"].as_str().unwrap().contains("search YouTube"));
-        let spotify_only = serde_json::to_value(state.embed(false)).unwrap();
+        let spotify_only = serde_json::to_value(state.embed(false, "Test bot")).unwrap();
         assert!(!spotify_only["description"].as_str().unwrap().contains("search YouTube"));
     }
 

@@ -239,8 +239,14 @@ pub struct PlayerState {
     /// never eviction of a still-live target. URI correlation is a heuristic:
     /// a genuine replay of one of these targets inside the TTL looks like an echo.
     recent_jumps: Vec<(SpotifyUri, Instant)>,
-    /// The ⏮ reply, held while the shell reads the history.
-    pending_reply: Option<oneshot::Sender<String>>,
+    /// The one history read still entitled to navigate, with its caller reply.
+    pending_previous: Option<PendingPrevious>,
+    /// Monotonic across session changes: an old completion must never match
+    /// a newer read, even after cancellation lets another caller try Back.
+    previous_request_id: u64,
+    /// Latest track-bearing telemetry, independent of when metadata reaches
+    /// the card. Either Playing or TrackChanged may arrive first.
+    navigation_track: Option<SpotifyUri>,
     /// A request Spotify started while a media item held the turn. It was
     /// popped from the queue there — it has to be, or `maybe_arm` would hand
     /// the same track to a queue librespot cannot take it back out of — and
@@ -269,7 +275,9 @@ impl PlayerState {
             awaiting_jump: None,
             jump_sent: None,
             recent_jumps: Vec::new(),
-            pending_reply: None,
+            pending_previous: None,
+            previous_request_id: 0,
+            navigation_track: None,
             pending_request: None,
             armed: None,
             pause_owner: None,
@@ -284,7 +292,31 @@ impl PlayerState {
         }
     }
 
-    fn clear_jumps(&mut self) {
+    pub(super) fn pending_previous_request_id(&self) -> Option<u64> {
+        self.pending_previous.as_ref().map(|pending| pending.request_id)
+    }
+
+    fn cancel_previous(&mut self, fx: &mut Vec<Effect>) {
+        if let Some(pending) = self.pending_previous.take() {
+            reply(fx, pending.reply, "⏮ Playback changed before Back finished. Try again.");
+        }
+    }
+
+    fn observe_navigation_track(&mut self, uri: &SpotifyUri, fx: &mut Vec<Effect>) {
+        // A late arrival from an already issued Back must not cancel the
+        // next lookup. Same-track pause/seek telemetry is harmless too.
+        if let Some(pending) = &self.pending_previous {
+            if pending.track_ref.as_deref() != Some(uri.to_string().as_str())
+                && !self.recent_jumps.iter().any(|(wanted, _)| wanted == uri)
+            {
+                self.cancel_previous(fx);
+            }
+        }
+        self.navigation_track = Some(uri.clone());
+    }
+
+    fn clear_jumps(&mut self, fx: &mut Vec<Effect>) {
+        self.cancel_previous(fx);
         self.awaiting_jump = None;
         self.jump_sent = None;
         self.recent_jumps.clear();
@@ -293,13 +325,20 @@ impl PlayerState {
     fn expire_jumps(&mut self, now: Instant, fx: &mut Vec<Effect>) {
         self.recent_jumps.retain(|(_, at)| now.saturating_duration_since(*at) < BACK_JUMP_TTL);
         if self.jump_sent.is_some_and(|at| now.saturating_duration_since(at) >= BACK_JUMP_TTL) {
-            self.clear_jumps();
+            self.clear_jumps(fx);
             self.history_cursor = None;
             fx.push(Effect::Ui(UiMsg::Notice(
                 "⚠️ Spotify didn't confirm the back-jump in time. Back will start from the current track.".into(),
             )));
         }
     }
+}
+
+#[derive(Debug)]
+struct PendingPrevious {
+    request_id: u64,
+    track_ref: Option<String>,
+    reply: oneshot::Sender<String>,
 }
 
 /// Where an enqueue lands in the queue.
@@ -536,7 +575,7 @@ pub enum Input {
     ActivateDevice,
     /// The history row the shell found for a ⏮, or `None` when there is
     /// nothing further back.
-    PreviousResolved { track: Option<PreviousTrack> },
+    PreviousResolved { request_id: u64, track: Option<PreviousTrack>, authorized: bool },
     /// Empty the queue without touching what is currently audible — the
     /// half of `/stop` that isn't "go to dead air".
     ClearQueue { reply: oneshot::Sender<String> },
@@ -648,7 +687,7 @@ pub enum Effect {
     /// Read the play history for the track aired before `before` (or before
     /// whatever is playing, when `None`) and feed it back as
     /// `Input::PreviousResolved`. The core never touches the database.
-    ResolvePrevious { before: Option<i64> },
+    ResolvePrevious { request_id: u64, before: Option<i64> },
     /// Spotify reported a track playing without metadata: resolve it
     /// through the live session and feed the answer back as
     /// `TransportEvent::TrackChanged` (which posts the card).
@@ -754,7 +793,7 @@ pub fn step(state: &mut PlayerState, input: Input, now: Instant) -> Vec<Effect> 
         }
 
         Input::Skip { reply: tx } => {
-            state.clear_jumps();
+            state.clear_jumps(&mut fx);
             state.history_cursor = None;
             if matches!(state.active, Active::Media { .. }) {
                 // A media skip cancels only; the next start comes from
@@ -873,7 +912,7 @@ pub fn step(state: &mut PlayerState, input: Input, now: Instant) -> Vec<Effect> 
             state.armed_snapshot = None;
             // A jump still resolving is abandoned along with everything else,
             // and a request whose airing was being held will never air now.
-            state.clear_jumps();
+            state.clear_jumps(&mut fx);
             state.history_cursor = None;
             state.pending_request = None;
             // The card is gone, so the next airing is new even if it is the
@@ -1071,7 +1110,7 @@ pub fn step(state: &mut PlayerState, input: Input, now: Instant) -> Vec<Effect> 
                 // Spotify's: the bot drives the account, so what the room
                 // heard is the authoritative record. The answer comes back
                 // as `PreviousResolved`.
-                if state.pending_reply.is_some()
+                if state.pending_previous.is_some()
                     || matches!(state.awaiting_jump, Some(PendingJump::Previous { .. }))
                     || state.recent_jumps.len() >= MAX_RECENT_JUMPS
                 {
@@ -1079,25 +1118,37 @@ pub fn step(state: &mut PlayerState, input: Input, now: Instant) -> Vec<Effect> 
                     // A target-less Previous cannot be safely overlapped.
                     reply(&mut fx, tx, "⏮ Already going back — one moment.");
                 } else {
-                    fx.push(Effect::ResolvePrevious { before: state.history_cursor });
-                    state.pending_reply = Some(tx);
+                    state.previous_request_id += 1;
+                    let request_id = state.previous_request_id;
+                    fx.push(Effect::ResolvePrevious { request_id, before: state.history_cursor });
+                    let track_ref = state.navigation_track.as_ref().map(ToString::to_string)
+                        .or_else(|| state.last_heard_track.clone()).or_else(|| match &state.sp {
+                        SpDevice::Playing(uri) | SpDevice::Paused(uri) => Some(uri.to_string()),
+                        _ => None,
+                    });
+                    state.pending_previous = Some(PendingPrevious { request_id, track_ref, reply: tx });
                 }
             } else {
                 reply(&mut fx, tx, "Nothing is playing right now.");
             }
         }
 
-        Input::PreviousResolved { track } => {
-            let Some(tx) = state.pending_reply.take() else {
-                // The reply channel is gone (a second ⏮ raced this one);
-                // resolving twice is harmless, answering twice is not.
+        Input::PreviousResolved { request_id, track, authorized } => {
+            if !state.pending_previous.as_ref().is_some_and(|pending| pending.request_id == request_id) {
+                // Cancelled or duplicate results cannot consume a newer
+                // caller's reply or navigate its session.
                 return fx;
-            };
+            }
+            let tx = state.pending_previous.take().expect("request matched").reply;
+            if !authorized {
+                reply(&mut fx, tx, "❌ Join the bot's voice channel and try Back again.");
+                return fx;
+            }
             // The read is asynchronous, so the world may have moved on: a
             // `/stop` in the meantime released the device and left the
             // channel, and `LoadContext` would re-activate it and start
             // playing from outside the call.
-            if !state.device_active {
+            if !state.device_active || matches!(state.active, Active::Media { .. }) {
                 reply(&mut fx, tx, "❌ Nothing is playing right now.");
                 return fx;
             }
@@ -1181,13 +1232,14 @@ pub fn step(state: &mut PlayerState, input: Input, now: Instant) -> Vec<Effect> 
             // the first time anyone pressed ⏮.
             state.context_uri = None;
             state.play_options = None;
+            state.navigation_track = None;
             // Same reasoning, same account boundary: an account switch comes
             // through as a bare `LinkUp` with no `LinkDown` before it, so
             // anything the previous session left in flight has to be dropped
             // here too. A jump issued to a session that no longer exists can
             // never land, and a walk position points into another DJ's
             // listening.
-            state.clear_jumps();
+            state.clear_jumps(&mut fx);
             state.history_cursor = None;
             state.pending_request = None;
             let snapshot_ok = state.armed_snapshot.as_ref().is_some_and(|s| {
@@ -1234,7 +1286,7 @@ pub fn step(state: &mut PlayerState, input: Input, now: Instant) -> Vec<Effect> 
             // Same reasoning as `SessionDisconnected`: a pending jump can no
             // longer land, so it must not outlive the link — and a request
             // whose airing was being held will never reach it.
-            state.clear_jumps();
+            state.clear_jumps(&mut fx);
             state.history_cursor = None;
             state.pending_request = None;
             // Snapshot the arm and clear it: a `Confirmed` ghost would
@@ -1269,6 +1321,7 @@ pub fn step(state: &mut PlayerState, input: Input, now: Instant) -> Vec<Effect> 
             if gen != state.link_gen {
                 return fx;
             }
+            state.cancel_previous(&mut fx);
             // Fast reconnects are not link-down: no armed-clearing, no turn
             // change — the session task rides it out. The session did just
             // tear down and reconnect, though, so if Spotify held the turn,
@@ -1348,6 +1401,8 @@ pub fn step(state: &mut PlayerState, input: Input, now: Instant) -> Vec<Effect> 
         }
 
         Input::VoiceLost => {
+            state.clear_jumps(&mut fx);
+            state.history_cursor = None;
             state.voice_generation += 1;
             state.voice = VoiceStatus::Down;
             if matches!(state.active, Active::Media { .. }) {
@@ -1472,6 +1527,7 @@ pub fn step(state: &mut PlayerState, input: Input, now: Instant) -> Vec<Effect> 
 fn handle_transport(state: &mut PlayerState, ev: TransportEvent, now: Instant, fx: &mut Vec<Effect>) {
     match ev {
         TransportEvent::Playing { uri, meta } => {
+            state.observe_navigation_track(&uri, fx);
             // TrackChanged may already have updated the card/history, so
             // movement must use the transport mirror, not last_heard_track.
             let moved = !matches!(&state.sp, SpDevice::Playing(u) | SpDevice::Paused(u) if u == &uri);
@@ -1630,6 +1686,7 @@ fn handle_transport(state: &mut PlayerState, ev: TransportEvent, now: Instant, f
         }
 
         TransportEvent::Paused { uri } => {
+            state.observe_navigation_track(&uri, fx);
             state.sp = SpDevice::Paused(uri.clone());
             state.device_active = true;
             if matches!(state.active, Active::Spotify { .. } | Active::SpotifyPending { .. }) {
@@ -1650,6 +1707,7 @@ fn handle_transport(state: &mut PlayerState, ev: TransportEvent, now: Instant, f
         }
 
         TransportEvent::Stopped => {
+            state.cancel_previous(fx);
             // The `device_active` guard is load safety: a takeover by
             // another device emits SessionDisconnected (which clears the
             // flag) and then Stopped, and reading that pair as Idle would
@@ -1672,6 +1730,7 @@ fn handle_transport(state: &mut PlayerState, ev: TransportEvent, now: Instant, f
         }
 
         TransportEvent::EndOfTrack => {
+            state.cancel_previous(fx);
             // Always a boundary, never Idle — auto-advance is imminent.
             state.sp = SpDevice::Boundary;
             if matches!(state.active, Active::Media { .. } | Active::SpotifyPending { .. }) {
@@ -1726,6 +1785,7 @@ fn handle_transport(state: &mut PlayerState, ev: TransportEvent, now: Instant, f
                 _ => false,
             };
             if was_audible {
+                state.cancel_previous(fx);
                 fx.push(Effect::ClearBridge);
             }
             if state.armed.as_ref().is_some_and(|a| a.uri == uri) {
@@ -1747,6 +1807,7 @@ fn handle_transport(state: &mut PlayerState, ev: TransportEvent, now: Instant, f
         }
 
         TransportEvent::TrackChanged { uri, meta } => {
+            state.observe_navigation_track(&uri, fx);
             // Never moves the turn. While the baseline holds it, a change
             // is shown on the card at once — a `pause(); next()` cues the
             // next track paused at 0:00 and never emits `Playing`, so
@@ -1851,7 +1912,7 @@ fn handle_transport(state: &mut PlayerState, ev: TransportEvent, now: Instant, f
             // make some later unrelated `Playing` report a mismatch for a
             // jump nobody remembers asking for. A held request's airing is
             // gone with the session too.
-            state.clear_jumps();
+            state.clear_jumps(fx);
             state.history_cursor = None;
             state.pending_request = None;
             // An unacked AddToQueue was void (F2): clear it so the next
@@ -2002,7 +2063,7 @@ fn maybe_arm(state: &mut PlayerState, now: Instant, fx: &mut Vec<Effect>) {
 /// device_active` (a load destroys the DJ's context otherwise). Sets up the
 /// pending state and its escape-hatch timer.
 fn begin_load(state: &mut PlayerState, uri: SpotifyUri, now: Instant, fx: &mut Vec<Effect>) {
-    state.clear_jumps();
+    state.clear_jumps(fx);
     state.history_cursor = None;
     ensure_voice(state, fx);
     state.pause_owner = None;
@@ -2076,7 +2137,7 @@ fn aired_spotify(
 /// Hand the turn to a media item: bump the epoch, make sure voice is coming
 /// up, and emit the gated start plus its card.
 fn start_media(state: &mut PlayerState, item: QueueItem, gate: StartGate, fx: &mut Vec<Effect>) {
-    state.clear_jumps();
+    state.clear_jumps(fx);
     state.history_cursor = None;
     state.media_epoch += 1;
     // The media card replaces whatever was up: the next Spotify `Playing`
@@ -3351,17 +3412,258 @@ mod tests {
         let fx = sim.previous();
         assert!(
             fx.iter()
-                .any(|e| matches!(e, Effect::ResolvePrevious { before: None })),
+                .any(|e| matches!(e, Effect::ResolvePrevious { before: None, .. })),
             "walks from live the first time"
         );
         assert!(spircs(&fx).is_empty(), "nothing is sent until it resolves");
     }
 
     #[test]
+    fn stale_previous_lookup_cannot_replay_after_stop_and_reactivation() {
+        let mut sim = Sim::baseline_playing();
+        sim.previous();
+        sim.stop();
+        sim.step(Input::ActivateDevice);
+        let fx = sim.step(Input::PreviousResolved { authorized: true, request_id: sim.s.previous_request_id,
+            track: Some(prev_track(7, 3, Some("spotify:playlist:old"))),
+        });
+        assert!(spircs(&fx).is_empty(), "stop revoked the old navigation intent");
+        assert_eq!(sim.s.history_cursor, None);
+    }
+
+    #[test]
+    fn stale_previous_lookup_cannot_cross_accounts() {
+        let mut sim = Sim::baseline_playing();
+        sim.previous();
+        sim.step(Input::LinkUp { gen: 2 });
+        sim.step(Input::ActivateDevice);
+        let fx = sim.step(Input::PreviousResolved { authorized: true, request_id: sim.s.previous_request_id,
+            track: Some(prev_track(7, 3, Some("spotify:playlist:old-account"))),
+        });
+        assert!(spircs(&fx).is_empty(), "an old lookup cannot control the new account");
+        assert_eq!(sim.s.history_cursor, None);
+    }
+
+    #[test]
+    fn stale_previous_lookup_cannot_interrupt_a_media_turn() {
+        let mut sim = Sim::baseline_playing();
+        sim.previous();
+        let mut fx = Vec::new();
+        start_media(&mut sim.s, media_item("new-turn"), StartGate::Immediate, &mut fx);
+        let fx = sim.step(Input::PreviousResolved { authorized: true, request_id: sim.s.previous_request_id,
+            track: Some(prev_track(7, 3, Some("spotify:playlist:old"))),
+        });
+        assert!(spircs(&fx).is_empty(), "media took the turn during the history read");
+        assert!(matches!(sim.s.active, Active::Media { .. }));
+        assert_eq!(sim.s.history_cursor, None);
+    }
+
+    fn send_test_replies(fx: Vec<Effect>) {
+        for effect in fx {
+            if let Effect::Reply(tx, text) = effect { let _ = tx.send(text); }
+        }
+    }
+
+    #[test]
+    fn stale_previous_results_never_consume_a_newer_callers_reply() {
+        let mut sim = Sim::baseline_playing();
+        let (first_tx, mut first_rx) = oneshot::channel();
+        sim.step(Input::Previous { reply: first_tx });
+        let first_id = sim.s.previous_request_id;
+        send_test_replies(sim.stop());
+        assert!(first_rx.try_recv().unwrap().contains("Playback changed"));
+
+        sim.step(Input::ActivateDevice);
+        sim.transport(TransportEvent::Playing { uri: uri(9), meta: None });
+        let (next_tx, mut next_rx) = oneshot::channel();
+        sim.step(Input::Previous { reply: next_tx });
+        let next_id = sim.s.previous_request_id;
+        assert_ne!(first_id, next_id);
+        for track in [Some(prev_track(7, 3, Some("spotify:playlist:old"))), None] {
+            let fx = sim.step(Input::PreviousResolved { request_id: first_id, track, authorized: true });
+            assert!(fx.is_empty());
+            assert_eq!(sim.s.pending_previous_request_id(), Some(next_id));
+            assert!(matches!(next_rx.try_recv(), Err(oneshot::error::TryRecvError::Empty)));
+        }
+        let fx = sim.step(Input::PreviousResolved {
+            request_id: next_id, authorized: true,
+            track: Some(prev_track(6, 2, Some("spotify:playlist:new"))),
+        });
+        assert!(matches!(&spircs(&fx)[..], [SpircCmd::LoadContext { track_uri, .. }] if *track_uri == uri(2)));
+        send_test_replies(fx);
+        assert!(next_rx.try_recv().unwrap().contains("Previous track"));
+        let duplicate = sim.step(Input::PreviousResolved {
+            request_id: next_id, authorized: true,
+            track: Some(prev_track(6, 2, Some("spotify:playlist:new"))),
+        });
+        assert!(duplicate.is_empty());
+    }
+
+    #[test]
+    fn pending_previous_is_cancelled_at_playback_boundaries() {
+        for boundary in 0..12 {
+            let mut sim = Sim::baseline_playing();
+            let (tx, mut rx) = oneshot::channel();
+            sim.step(Input::Previous { reply: tx });
+            let request_id = sim.s.previous_request_id;
+            let fx = match boundary {
+                0 => sim.skip(),
+                1 => sim.step(Input::VoiceLost),
+                2 => sim.step(Input::LinkDown { gen: 1 }),
+                3 => sim.step(Input::LinkReconnecting { gen: 1 }),
+                4 => sim.transport(TransportEvent::SessionDisconnected),
+                5 => sim.transport(TransportEvent::Stopped),
+                6 => sim.transport(TransportEvent::EndOfTrack),
+                7 => sim.transport(TransportEvent::Unavailable { uri: uri(9) }),
+                8 => sim.transport(TransportEvent::Playing { uri: uri(8), meta: None }),
+                9 => sim.transport(TransportEvent::Paused { uri: uri(8) }),
+                10 => sim.transport(TransportEvent::TrackChanged { uri: uri(8), meta: meta("next") }),
+                _ => {
+                    let mut fx = Vec::new();
+                    begin_load(&mut sim.s, uri(8), sim.now, &mut fx);
+                    fx
+                }
+            };
+            send_test_replies(fx);
+            assert!(rx.try_recv().unwrap().contains("Playback changed"), "boundary {boundary}");
+            let fx = sim.step(Input::PreviousResolved {
+                request_id, authorized: true,
+                track: Some(prev_track(7, 3, Some("spotify:playlist:old"))),
+            });
+            assert!(fx.is_empty(), "boundary {boundary}");
+        }
+    }
+
+    #[test]
+    fn pending_previous_survives_same_track_and_unrelated_bookkeeping() {
+        let mut sim = Sim::baseline_playing();
+        sim.previous();
+        let request_id = sim.s.previous_request_id;
+        sim.transport(TransportEvent::Paused { uri: uri(9) });
+        sim.transport(TransportEvent::Playing { uri: uri(9), meta: None });
+        sim.transport(TransportEvent::TrackChanged { uri: uri(9), meta: meta("same") });
+        sim.transport(TransportEvent::Unavailable { uri: uri(99) });
+        sim.transport(TransportEvent::OptionsChanged { shuffle: true, repeat_context: false, repeat_track: false });
+        sim.enqueue(media_item("later"));
+        let (reply, _) = oneshot::channel();
+        sim.step(Input::ClearQueue { reply });
+        sim.step(Input::LinkDown { gen: 0 });
+        sim.step(Input::LinkReconnecting { gen: 0 });
+        sim.step(Input::Transport { gen: 0, ev: TransportEvent::Stopped });
+        assert_eq!(sim.s.pending_previous_request_id(), Some(request_id));
+        let fx = sim.step(Input::PreviousResolved {
+            request_id, authorized: true,
+            track: Some(prev_track(7, 3, Some("spotify:playlist:current"))),
+        });
+        assert!(matches!(&spircs(&fx)[..], [SpircCmd::LoadContext { .. }]));
+    }
+
+    #[test]
+    fn pending_previous_survives_known_jump_echoes() {
+        let mut sim = Sim::baseline_playing();
+        for (row, track) in [(7, 3), (6, 2)] {
+            sim.previous();
+            sim.step(Input::PreviousResolved {
+                request_id: sim.s.previous_request_id, authorized: true,
+                track: Some(prev_track(row, track, Some("spotify:playlist:current"))),
+            });
+        }
+        sim.previous();
+        let request_id = sim.s.previous_request_id;
+        for n in [3, 2, 3, 2] {
+            sim.transport(TransportEvent::TrackChanged { uri: uri(n), meta: meta("echo") });
+            sim.transport(TransportEvent::Playing { uri: uri(n), meta: None });
+            sim.transport(TransportEvent::Paused { uri: uri(n) });
+        }
+        assert_eq!(sim.s.pending_previous_request_id(), Some(request_id));
+        let fx = sim.step(Input::PreviousResolved {
+            request_id, authorized: true,
+            track: Some(prev_track(5, 1, Some("spotify:playlist:current"))),
+        });
+        assert!(matches!(&spircs(&fx)[..], [SpircCmd::LoadContext { track_uri, .. }] if *track_uri == uri(1)));
+    }
+
+    #[test]
+    fn pending_previous_after_track_changed_survives_its_playing_event() {
+        let mut sim = Sim::baseline_playing();
+        sim.previous();
+        sim.transport(TransportEvent::TrackChanged { uri: uri(8), meta: meta("new") });
+        sim.previous();
+        let request_id = sim.s.previous_request_id;
+        sim.transport(TransportEvent::Playing { uri: uri(8), meta: None });
+        assert_eq!(sim.s.pending_previous_request_id(), Some(request_id));
+        let fx = sim.step(Input::PreviousResolved {
+            request_id, authorized: true,
+            track: Some(prev_track(8, 9, Some("spotify:playlist:current"))),
+        });
+        assert!(matches!(&spircs(&fx)[..], [SpircCmd::LoadContext { .. }]));
+    }
+
+    #[test]
+    fn pending_previous_after_transport_survives_late_metadata() {
+        for paused in [false, true] {
+            let mut sim = Sim::baseline_playing();
+            if paused {
+                sim.transport(TransportEvent::Paused { uri: uri(8) });
+            } else {
+                sim.transport(TransportEvent::Playing { uri: uri(8), meta: None });
+            }
+            // The card still holds track 9 until metadata arrives, while
+            // transport already knows track 8. Back belongs to track 8.
+            sim.previous();
+            let request_id = sim.s.previous_request_id;
+            sim.transport(TransportEvent::TrackChanged { uri: uri(8), meta: meta("new") });
+            sim.transport(TransportEvent::Paused { uri: uri(8) });
+            sim.transport(TransportEvent::Playing { uri: uri(8), meta: None });
+            assert_eq!(sim.s.pending_previous_request_id(), Some(request_id));
+            let fx = sim.step(Input::PreviousResolved {
+                request_id, authorized: true,
+                track: Some(prev_track(8, 9, Some("spotify:playlist:current"))),
+            });
+            assert!(matches!(&spircs(&fx)[..], [SpircCmd::LoadContext { .. }]));
+        }
+    }
+
+    #[test]
+    fn pending_previous_cannot_restore_a_walk_after_jump_timeout() {
+        let mut sim = Sim::baseline_playing();
+        sim.previous();
+        sim.step(Input::PreviousResolved {
+            request_id: sim.s.previous_request_id, authorized: true,
+            track: Some(prev_track(7, 3, Some("spotify:playlist:current"))),
+        });
+        sim.previous();
+        let request_id = sim.s.previous_request_id;
+        sim.advance(BACK_JUMP_TTL);
+        sim.step(Input::Tick(TimerKind::BackJump));
+        let fx = sim.step(Input::PreviousResolved {
+            request_id, authorized: true,
+            track: Some(prev_track(6, 2, Some("spotify:playlist:current"))),
+        });
+        assert!(fx.is_empty());
+        assert_eq!(sim.s.history_cursor, None);
+    }
+
+    #[test]
+    fn previous_completion_rechecks_voice_authorization_without_losing_its_reply() {
+        let mut sim = Sim::baseline_playing();
+        let (reply, mut rx) = oneshot::channel();
+        sim.step(Input::Previous { reply });
+        let fx = sim.step(Input::PreviousResolved {
+            request_id: sim.s.previous_request_id, authorized: false,
+            track: Some(prev_track(7, 3, Some("spotify:playlist:current"))),
+        });
+        assert!(spircs(&fx).is_empty());
+        send_test_replies(fx);
+        assert!(rx.try_recv().unwrap().contains("voice channel"));
+        assert_eq!(sim.s.history_cursor, None);
+    }
+
+    #[test]
     fn a_resolved_previous_reopens_the_playlist_at_that_track() {
         let mut sim = Sim::baseline_playing();
         sim.previous();
-        let fx = sim.step(Input::PreviousResolved {
+        let fx = sim.step(Input::PreviousResolved { authorized: true, request_id: sim.s.previous_request_id,
             track: Some(prev_track(7, 3, Some("spotify:playlist:abc"))),
         });
 
@@ -3390,7 +3692,7 @@ mod tests {
         sim.arm(1, id, Ack::Confirmed);
 
         sim.previous();
-        let fx = sim.step(Input::PreviousResolved {
+        let fx = sim.step(Input::PreviousResolved { authorized: true, request_id: sim.s.previous_request_id,
             track: Some(prev_track(7, 3, Some("spotify:playlist:abc"))),
         });
 
@@ -3418,7 +3720,7 @@ mod tests {
         let id = sim.push_spotify(1, "s1");
         sim.arm(1, id, Ack::Confirmed);
         sim.previous();
-        sim.step(Input::PreviousResolved {
+        sim.step(Input::PreviousResolved { authorized: true, request_id: sim.s.previous_request_id,
             track: Some(prev_track(7, 3, Some("spotify:playlist:abc"))),
         });
         // The jump lands.
@@ -3444,7 +3746,7 @@ mod tests {
             repeat_track: false,
         });
         sim.previous();
-        let fx = sim.step(Input::PreviousResolved {
+        let fx = sim.step(Input::PreviousResolved { authorized: true, request_id: sim.s.previous_request_id,
             track: Some(prev_track(7, 3, Some("spotify:playlist:abc"))),
         });
 
@@ -3499,7 +3801,7 @@ mod tests {
     fn a_track_with_no_recorded_context_falls_back_to_spotifys_own_previous() {
         let mut sim = Sim::baseline_playing();
         sim.previous();
-        let fx = sim.step(Input::PreviousResolved {
+        let fx = sim.step(Input::PreviousResolved { authorized: true, request_id: sim.s.previous_request_id,
             track: Some(prev_track(7, 3, None)),
         });
         assert_eq!(spircs(&fx), vec![SpircCmd::Previous]);
@@ -3513,7 +3815,7 @@ mod tests {
         // track we started from.
         let mut sim = Sim::baseline_playing();
         sim.previous();
-        sim.step(Input::PreviousResolved { track: Some(prev_track(7, 3, None)) });
+        sim.step(Input::PreviousResolved { authorized: true, request_id: sim.s.previous_request_id, track: Some(prev_track(7, 3, None)) });
         assert_eq!(sim.s.history_cursor, None, "not committed until it lands");
 
         sim.transport(TransportEvent::Playing { uri: uri(3), meta: Some(meta("Third")) });
@@ -3535,7 +3837,7 @@ mod tests {
         let mut sim = Sim::baseline_playing();
         sim.s.history_cursor = Some(11);
         sim.previous();
-        sim.step(Input::PreviousResolved { track: Some(prev_track(7, 9, None)) });
+        sim.step(Input::PreviousResolved { authorized: true, request_id: sim.s.previous_request_id, track: Some(prev_track(7, 9, None)) });
 
         sim.transport(TransportEvent::Playing { uri: uri(9), meta: None });
         assert_eq!(
@@ -3549,7 +3851,7 @@ mod tests {
     fn reaching_the_start_of_the_history_says_so() {
         let mut sim = Sim::baseline_playing();
         sim.previous();
-        let fx = sim.step(Input::PreviousResolved { track: None });
+        let fx = sim.step(Input::PreviousResolved { authorized: true, request_id: sim.s.previous_request_id, track: None });
         assert!(spircs(&fx).is_empty());
         assert!(reply_text(&fx).contains("Nothing further back"));
     }
@@ -3560,7 +3862,7 @@ mod tests {
         // isn't in it, and only logs about it — so we check the arrival.
         let mut sim = Sim::baseline_playing();
         sim.previous();
-        sim.step(Input::PreviousResolved {
+        sim.step(Input::PreviousResolved { authorized: true, request_id: sim.s.previous_request_id,
             track: Some(prev_track(7, 3, Some("spotify:playlist:abc"))),
         });
 
@@ -3579,7 +3881,7 @@ mod tests {
     fn the_playlist_moving_on_puts_us_back_live() {
         let mut sim = Sim::baseline_playing();
         sim.previous();
-        sim.step(Input::PreviousResolved {
+        sim.step(Input::PreviousResolved { authorized: true, request_id: sim.s.previous_request_id,
             track: Some(prev_track(7, 3, Some("spotify:playlist:abc"))),
         });
         // The jump lands.
@@ -3597,7 +3899,7 @@ mod tests {
             let mut sim = Sim::baseline_playing();
             for n in [3, 2, 1] {
                 sim.previous();
-                sim.step(Input::PreviousResolved {
+                sim.step(Input::PreviousResolved { authorized: true, request_id: sim.s.previous_request_id,
                     track: Some(prev_track(n as i64, n, Some("spotify:playlist:abc"))),
                 });
             }
@@ -3612,7 +3914,7 @@ mod tests {
                 assert_eq!(sim.s.sp, SpDevice::Playing(uri(n)), "telemetry still follows reality");
             }
             let fx = sim.previous();
-            assert!(fx.iter().any(|e| matches!(e, Effect::ResolvePrevious { before: Some(1) })));
+            assert!(fx.iter().any(|e| matches!(e, Effect::ResolvePrevious { before: Some(1), .. })));
         }
     }
 
@@ -3621,7 +3923,7 @@ mod tests {
         let mut sim = Sim::baseline_playing();
         for n in [3, 2] {
             sim.previous();
-            sim.step(Input::PreviousResolved {
+            sim.step(Input::PreviousResolved { authorized: true, request_id: sim.s.previous_request_id,
                 track: Some(prev_track(n as i64, n, Some("spotify:playlist:abc"))),
             });
         }
@@ -3641,7 +3943,7 @@ mod tests {
         let mut sim = Sim::baseline_playing();
         for id in [7, 6] {
             sim.previous();
-            sim.step(Input::PreviousResolved {
+            sim.step(Input::PreviousResolved { authorized: true, request_id: sim.s.previous_request_id,
                 track: Some(prev_track(id, 3, Some("spotify:playlist:abc"))),
             });
         }
@@ -3655,13 +3957,13 @@ mod tests {
     fn back_jump_timers_revalidate_and_timeout_only_the_latest_jump() {
         let mut sim = Sim::baseline_playing();
         sim.previous();
-        let fx = sim.step(Input::PreviousResolved {
+        let fx = sim.step(Input::PreviousResolved { authorized: true, request_id: sim.s.previous_request_id,
             track: Some(prev_track(7, 3, Some("spotify:playlist:abc"))),
         });
         assert!(fx.iter().any(|e| matches!(e, Effect::SetTimer(TimerKind::BackJump, d) if *d == BACK_JUMP_TTL)));
         sim.advance(Duration::from_secs(1));
         sim.previous();
-        sim.step(Input::PreviousResolved {
+        sim.step(Input::PreviousResolved { authorized: true, request_id: sim.s.previous_request_id,
             track: Some(prev_track(6, 2, Some("spotify:playlist:abc"))),
         });
         sim.advance(BACK_JUMP_TTL - Duration::from_secs(1));
@@ -3673,7 +3975,7 @@ mod tests {
         assert_eq!(sim.s.history_cursor, None);
         assert!(fx.iter().any(|e| matches!(e, Effect::Ui(UiMsg::Notice(s)) if s.contains("in time"))));
         assert!(sim.step(Input::Tick(TimerKind::BackJump)).is_empty());
-        assert!(sim.previous().iter().any(|e| matches!(e, Effect::ResolvePrevious { before: None })));
+        assert!(sim.previous().iter().any(|e| matches!(e, Effect::ResolvePrevious { before: None, .. })));
     }
 
     #[test]
@@ -3681,7 +3983,7 @@ mod tests {
         let mut sim = Sim::baseline_playing();
         for n in [3, 2] {
             sim.previous();
-            sim.step(Input::PreviousResolved {
+            sim.step(Input::PreviousResolved { authorized: true, request_id: sim.s.previous_request_id,
                 track: Some(prev_track(n as i64, n, Some("spotify:playlist:abc"))),
             });
         }
@@ -3700,7 +4002,7 @@ mod tests {
         let mut sim = Sim::baseline_playing();
         for n in 1..=MAX_RECENT_JUMPS as u64 {
             sim.previous();
-            sim.step(Input::PreviousResolved {
+            sim.step(Input::PreviousResolved { authorized: true, request_id: sim.s.previous_request_id,
                 track: Some(prev_track(n as i64, n, Some("spotify:playlist:abc"))),
             });
         }
@@ -3720,18 +4022,18 @@ mod tests {
     fn context_less_back_waits_for_context_echoes_then_recovers() {
         let mut sim = Sim::baseline_playing();
         sim.previous();
-        sim.step(Input::PreviousResolved {
+        sim.step(Input::PreviousResolved { authorized: true, request_id: sim.s.previous_request_id,
             track: Some(prev_track(7, 3, Some("spotify:playlist:abc"))),
         });
         sim.previous();
-        let fx = sim.step(Input::PreviousResolved { track: Some(prev_track(6, 2, None)) });
+        let fx = sim.step(Input::PreviousResolved { authorized: true, request_id: sim.s.previous_request_id, track: Some(prev_track(6, 2, None)) });
         assert!(reply_text(&fx).contains("Already going back"));
         assert!(spircs(&fx).is_empty());
         assert_eq!(sim.s.history_cursor, Some(7));
         sim.transport(TransportEvent::Playing { uri: uri(3), meta: None });
         sim.advance(BACK_JUMP_TTL);
         sim.previous();
-        let fx = sim.step(Input::PreviousResolved { track: Some(prev_track(6, 2, None)) });
+        let fx = sim.step(Input::PreviousResolved { authorized: true, request_id: sim.s.previous_request_id, track: Some(prev_track(6, 2, None)) });
         assert_eq!(spircs(&fx), vec![SpircCmd::Previous]);
         assert!(reply_text(&sim.previous()).contains("Already going back"));
         sim.advance(BACK_JUMP_TTL);
@@ -3743,7 +4045,7 @@ mod tests {
     fn track_changed_before_previous_arrival_still_commits_movement() {
         let mut sim = Sim::baseline_playing();
         sim.previous();
-        sim.step(Input::PreviousResolved { track: Some(prev_track(7, 3, None)) });
+        sim.step(Input::PreviousResolved { authorized: true, request_id: sim.s.previous_request_id, track: Some(prev_track(7, 3, None)) });
         sim.transport(TransportEvent::TrackChanged { uri: uri(3), meta: meta("previous") });
         sim.transport(TransportEvent::Playing { uri: uri(3), meta: None });
         assert_eq!(sim.s.history_cursor, Some(7));
@@ -3754,7 +4056,7 @@ mod tests {
         for action in 0..7 {
             let mut sim = Sim::baseline_playing();
             sim.previous();
-            sim.step(Input::PreviousResolved {
+            sim.step(Input::PreviousResolved { authorized: true, request_id: sim.s.previous_request_id,
                 track: Some(prev_track(7, 3, Some("spotify:playlist:abc"))),
             });
             match action {
@@ -3776,7 +4078,7 @@ mod tests {
 
     #[test]
     fn a_second_back_press_waits_instead_of_stealing_the_first_reply() {
-        // Overwriting `pending_reply` would drop the first caller's channel
+        // Overwriting `pending_previous` would drop the first caller's channel
         // (their interaction times out) and walk back twice for one intent.
         let mut sim = Sim::baseline_playing();
         let first = sim.previous();
@@ -3833,7 +4135,7 @@ mod tests {
         // two-track bounce the cursor exists to prevent.
         let mut sim = Sim::baseline_playing();
         sim.previous();
-        sim.step(Input::PreviousResolved {
+        sim.step(Input::PreviousResolved { authorized: true, request_id: sim.s.previous_request_id,
             track: Some(prev_track(7, 3, Some("spotify:playlist:abc"))),
         });
         sim.transport(TransportEvent::Playing { uri: uri(3), meta: Some(meta("jumped-to")) });
@@ -3852,7 +4154,7 @@ mod tests {
         let mut sim = Sim::baseline_playing();
         sim.previous();
         sim.stop();
-        let fx = sim.step(Input::PreviousResolved {
+        let fx = sim.step(Input::PreviousResolved { authorized: true, request_id: sim.s.previous_request_id,
             track: Some(prev_track(7, 3, Some("spotify:playlist:abc"))),
         });
         assert!(spircs(&fx).is_empty(), "nothing is sent to a released device");
@@ -3864,7 +4166,7 @@ mod tests {
         // mismatch for a jump nobody remembers asking for.
         let mut sim = Sim::baseline_playing();
         sim.previous();
-        sim.step(Input::PreviousResolved {
+        sim.step(Input::PreviousResolved { authorized: true, request_id: sim.s.previous_request_id,
             track: Some(prev_track(7, 3, Some("spotify:playlist:abc"))),
         });
         sim.transport(TransportEvent::SessionDisconnected);
@@ -3885,7 +4187,7 @@ mod tests {
         // string, and it shipped to the channel that way.
         let mut sim = Sim::baseline_playing();
         sim.previous();
-        sim.step(Input::PreviousResolved {
+        sim.step(Input::PreviousResolved { authorized: true, request_id: sim.s.previous_request_id,
             track: Some(prev_track(7, 3, Some("spotify:playlist:abc"))),
         });
         let fx = sim.transport(TransportEvent::Playing { uri: uri(99), meta: Some(meta("x")) });

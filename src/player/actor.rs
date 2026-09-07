@@ -270,6 +270,7 @@ enum StoreRequest {
     /// back-navigation walks, so an out-of-order insert misorders the walk.
     Aired(crate::player::state::AiredTrack),
     ResolvePrevious {
+        request_id: u64,
         before: Option<i64>,
         reply: mpsc::UnboundedSender<Input>,
     },
@@ -314,7 +315,7 @@ fn run_store_worker(
                         }
                     }
                 }
-                StoreRequest::ResolvePrevious { before, reply } => {
+                StoreRequest::ResolvePrevious { request_id, before, reply } => {
                     let track = history.as_ref().and_then(|history| {
                         match history.aired_before(before, |row| {
                             SpotifyUri::from_uri(&row.track_ref).is_ok()
@@ -334,7 +335,7 @@ fn run_store_worker(
                             }
                         }
                     });
-                    let _ = reply.send(Input::PreviousResolved { track });
+                    let _ = reply.send(Input::PreviousResolved { request_id, track, authorized: true });
                 }
             }
         }
@@ -361,6 +362,7 @@ pub fn spawn(deps: PlayerDeps) -> PlayerHandle {
         store_tx,
         tx,
         state: PlayerState::new(),
+        previous_authorization: None,
         pending_gate: None,
         feeder_cancel: None,
         feeder_paused: Arc::new(AtomicBool::new(false)),
@@ -379,6 +381,8 @@ struct Actor {
     /// completions come back as inputs.
     tx: mpsc::UnboundedSender<Input>,
     state: PlayerState,
+    /// Voice membership captured for the one Back read still allowed to finish.
+    previous_authorization: Option<PreviousAuthorization>,
     /// The gate of the most recent `AfterSpotifyPauseAck` start, fired on
     /// the next `Transport(Paused)` (the runner has a fallback timeout, so
     /// a swallowed ack can't wedge it).
@@ -402,10 +406,16 @@ struct Actor {
 impl Actor {
     async fn run(mut self, mut rx: mpsc::UnboundedReceiver<Input>) {
         while let Some(input) = rx.recv().await {
-            let Some((input, requester)) = authorize_input(input, &*self.deps.authorize_voice)
+            let Some((mut input, guard)) = authorize_input(input, &*self.deps.authorize_voice)
             else {
                 continue;
             };
+            let requester = guard.as_ref().map(|guard| guard.user);
+            authorize_previous_completion(
+                &mut input,
+                &mut self.previous_authorization,
+                &*self.deps.authorize_voice,
+            );
             reset_audio_for_input(&self.deps.bridge, &input);
             // Shell-side handling that reads raw inputs rather than core
             // decisions, run on receipt before the step.
@@ -444,6 +454,17 @@ impl Actor {
             };
             let queue_rev = self.state.queue.revision();
             let effects = step(&mut self.state, input, Instant::now());
+            if let Some(request_id) = effects.iter().find_map(|effect| match effect {
+                Effect::ResolvePrevious { request_id, .. } => Some(*request_id),
+                _ => None,
+            }) {
+                self.previous_authorization = Some(PreviousAuthorization { request_id, guard });
+            }
+            if self.previous_authorization.as_ref().is_some_and(|pending| {
+                Some(pending.request_id) != self.state.pending_previous_request_id()
+            }) {
+                self.previous_authorization = None;
+            }
             tracing::debug!(
                 target: "player",
                 active = ?self.state.active,
@@ -634,15 +655,16 @@ impl Actor {
                 });
             }
 
-            Effect::ResolvePrevious { before } => {
+            Effect::ResolvePrevious { request_id, before } => {
                 // The same FIFO as RecordAired: a lookup cannot race ahead
                 // of the row for the track the room is hearing right now.
                 // Sending stays synchronous; the worker returns via our mailbox.
                 if self.store_tx.send(StoreRequest::ResolvePrevious {
+                    request_id,
                     before,
                     reply: self.tx.clone(),
                 }).is_err() {
-                    let _ = self.tx.send(Input::PreviousResolved { track: None });
+                    let _ = self.tx.send(Input::PreviousResolved { request_id, track: None, authorized: true });
                 }
             }
 
@@ -994,17 +1016,40 @@ async fn run_media(
     }
 }
 
+struct PreviousAuthorization {
+    request_id: u64,
+    guard: Option<VoiceGuard>,
+}
+
+/// A stale result must never consume a newer caller's authorization. Trusted
+/// internal requests have no guard; guarded requests recheck current membership.
+fn authorize_previous_completion(
+    input: &mut Input,
+    pending: &mut Option<PreviousAuthorization>,
+    authorize: &dyn Fn(&VoiceGuard) -> bool,
+) {
+    let Input::PreviousResolved { request_id, authorized, .. } = input else {
+        return;
+    };
+    if !pending.as_ref().is_some_and(|pending| pending.request_id == *request_id) {
+        *authorized = false;
+        return;
+    }
+    let pending = pending.take().expect("request matched");
+    *authorized &= pending.guard.as_ref().is_none_or(authorize);
+}
+
 fn authorize_input(
     input: Input,
     authorize: &dyn Fn(&VoiceGuard) -> bool,
-) -> Option<(Input, Option<u64>)> {
+) -> Option<(Input, Option<VoiceGuard>)> {
     match input {
         Input::Guarded { guard, input } => {
             if !authorize(&guard) {
                 reject_guarded(*input);
                 return None;
             }
-            Some((*input, Some(guard.user)))
+            Some((*input, Some(guard)))
         }
         input => Some((input, None)),
     }
@@ -1287,6 +1332,87 @@ mod tests {
         assert!(authorize_input(input, &|guard| guard.allows(4, None, Some(10))).is_none());
     }
 
+    #[test]
+    fn back_completion_rechecks_the_requesters_voice_before_navigation() {
+        for (generation, bot_room, user_room, allowed) in [
+            (3, Some(10), Some(10), true),
+            (3, Some(10), None, false),
+            (3, Some(10), Some(20), false),
+            (4, Some(20), Some(10), false),
+        ] {
+            let mut state = PlayerState::new();
+            state.device_active = true;
+            state.sp = SpDevice::Playing(SpotifyUri::from_uri(&aired(9).track_ref).unwrap());
+            state.active = Active::Spotify { track: None };
+            let (reply, mut received) = oneshot::channel();
+            let (input, guard) = authorize_input(Input::Guarded {
+                guard: VoiceGuard { generation: 3, room: 10, user: 1, may_join: false },
+                input: Box::new(Input::Previous { reply }),
+            }, &|guard| guard.allows(3, Some(10), Some(10))).unwrap();
+            let now = Instant::now();
+            let effects = step(&mut state, input, now);
+            let request_id = effects.iter().find_map(|effect| match effect {
+                Effect::ResolvePrevious { request_id, .. } => Some(*request_id),
+                _ => None,
+            }).expect("the admitted Back starts a history read");
+            let mut pending = Some(PreviousAuthorization { request_id, guard });
+            let mut completion = Input::PreviousResolved {
+                request_id,
+                track: Some(PreviousTrack {
+                    id: 7,
+                    uri: SpotifyUri::from_uri(&aired(7).track_ref).unwrap(),
+                    context_uri: Some("spotify:playlist:test".into()),
+                }),
+                authorized: true,
+            };
+            authorize_previous_completion(&mut completion, &mut pending,
+                &|guard| guard.allows(generation, bot_room, user_room));
+            let effects = step(&mut state, completion, now);
+            assert_eq!(effects.iter().any(|effect| matches!(effect,
+                Effect::Spirc(SpircCmd::LoadContext { .. }))), allowed);
+            for effect in effects {
+                if let Effect::Reply(reply, text) = effect {
+                    reply.send(text).unwrap();
+                }
+            }
+            assert!(!received.try_recv().expect("the caller always gets a reply").is_empty());
+            assert!(pending.is_none());
+        }
+    }
+
+    #[test]
+    fn stale_back_completion_cannot_steal_a_newer_callers_voice_guard() {
+        let mut pending = Some(PreviousAuthorization {
+            request_id: 2,
+            guard: Some(VoiceGuard { generation: 3, room: 10, user: 1, may_join: false }),
+        });
+        let mut stale = Input::PreviousResolved { request_id: 1, track: None, authorized: true };
+        authorize_previous_completion(&mut stale, &mut pending,
+            &|_| panic!("a stale completion cannot authorize against another caller"));
+        assert!(matches!(stale, Input::PreviousResolved { authorized: false, .. }));
+        assert_eq!(pending.as_ref().unwrap().request_id, 2);
+        let mut current = Input::PreviousResolved { request_id: 2, track: None, authorized: true };
+        authorize_previous_completion(&mut current, &mut pending,
+            &|guard| guard.allows(3, Some(10), Some(10)));
+        assert!(matches!(current, Input::PreviousResolved { authorized: true, .. }));
+        assert!(pending.is_none());
+        authorize_previous_completion(&mut current, &mut pending,
+            &|_| panic!("a duplicate completion cannot reuse authorization"));
+        assert!(matches!(current, Input::PreviousResolved { authorized: false, .. }));
+    }
+
+    #[test]
+    fn trusted_internal_back_reads_preserve_existing_rejection() {
+        for authorized in [false, true] {
+            let mut pending = Some(PreviousAuthorization { request_id: 1, guard: None });
+            let mut input = Input::PreviousResolved { request_id: 1, track: None, authorized };
+            authorize_previous_completion(&mut input, &mut pending,
+                &|_| panic!("an internal request has no Discord caller"));
+            assert!(matches!(input, Input::PreviousResolved { authorized: result, .. } if result == authorized));
+            assert!(pending.is_none());
+        }
+    }
+
     fn aired(n: u64) -> AiredTrack {
         AiredTrack {
             source: AiredSource::Baseline,
@@ -1300,12 +1426,12 @@ mod tests {
     }
 
     fn lookup(before: Option<i64>, reply: &mpsc::UnboundedSender<Input>) -> StoreRequest {
-        StoreRequest::ResolvePrevious { before, reply: reply.clone() }
+        StoreRequest::ResolvePrevious { request_id: 1, before, reply: reply.clone() }
     }
 
     fn resolved(rx: &mut mpsc::UnboundedReceiver<Input>) -> Option<PreviousTrack> {
         match rx.try_recv().expect("every lookup must answer") {
-            Input::PreviousResolved { track } => track,
+            Input::PreviousResolved { track, .. } => track,
             _ => panic!("unexpected worker reply"),
         }
     }
@@ -1320,6 +1446,33 @@ mod tests {
         }
         drop(tx);
         run_store_worker(history, None, rx);
+    }
+
+    #[test]
+    fn history_replies_keep_distinct_request_ids_for_populated_empty_and_missing_stores() {
+        for mode in 0..3 {
+            let history = (mode != 0).then(|| Arc::new(HistoryStore::open(":memory:").unwrap()));
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let mut requests = Vec::new();
+            if mode == 2 {
+                requests.extend([StoreRequest::Aired(aired(1)), StoreRequest::Aired(aired(2))]);
+            }
+            requests.extend([
+                StoreRequest::ResolvePrevious { request_id: 17, before: None, reply: tx.clone() },
+                StoreRequest::ResolvePrevious { request_id: 42, before: Some(1), reply: tx },
+            ]);
+            run_batch(history, requests);
+            for (expected_id, expected_track) in [(17, (mode == 2).then_some(1)), (42, None)] {
+                match rx.try_recv().expect("every lookup answers in FIFO order") {
+                    Input::PreviousResolved { request_id, track, authorized: true } => {
+                        assert_eq!(request_id, expected_id);
+                        assert_eq!(track.map(|track| track.id), expected_track);
+                    }
+                    _ => panic!("unexpected store reply"),
+                }
+            }
+            assert!(rx.try_recv().is_err());
+        }
     }
 
     #[test]
@@ -1409,7 +1562,7 @@ mod tests {
         let reply = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
             .await.expect("worker must answer").unwrap();
         match reply {
-            Input::PreviousResolved { track: Some(track) } => assert_eq!(track.id, 1),
+            Input::PreviousResolved { request_id: 1, track: Some(track), authorized: true } => assert_eq!(track.id, 1),
             _ => panic!("expected the track before the latest queued airing"),
         }
     }

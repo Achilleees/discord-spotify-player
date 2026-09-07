@@ -1,10 +1,17 @@
 use crate::config::Config;
 use dialoguer::{Confirm, Input, Password, Select};
-use serenity::all::{ChannelType, Http};
+use serenity::all::{ChannelType, Http, Permissions};
 use std::path::Path;
 
 const DISCORD_DEV_PORTAL: &str = "https://discord.com/developers/applications";
-const BOT_PERMISSIONS: u64 = 7340032; // Connect + Speak + Mute Members
+// Ordinary voice playback and its text-channel cards; stage/server tools
+// have separate permissions that operators grant only where needed.
+const BOT_PERMISSIONS: u64 = Permissions::VIEW_CHANNEL.bits()
+    | Permissions::SEND_MESSAGES.bits()
+    | Permissions::EMBED_LINKS.bits()
+    | Permissions::READ_MESSAGE_HISTORY.bits()
+    | Permissions::CONNECT.bits()
+    | Permissions::SPEAK.bits();
 const MAX_TOKEN_ATTEMPTS: u32 = 3;
 
 #[derive(Debug)]
@@ -70,7 +77,7 @@ pub async fn run_setup_wizard() -> Result<Config, SetupError> {
     let app_info = http.get_current_application_info().await?;
     let app_id = app_info.id;
     let invite_url = format!(
-        "https://discord.com/oauth2/authorize?client_id={}&scope=bot&permissions={}",
+        "https://discord.com/oauth2/authorize?client_id={}&scope=bot%20applications.commands&permissions={}",
         app_id, BOT_PERMISSIONS
     );
     println!();

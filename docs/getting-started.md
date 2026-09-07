@@ -60,12 +60,23 @@ and falls back to the setup wizard automatically.
    the bot uses `GUILDS`, `GUILD_VOICE_STATES`, and `GUILD_MEMBERS` (the
    last one is privileged; without it the voice-channel gates can't see who
    is in the call).
-4. Invite the bot to your server with at least the **Connect**, **Speak**,
-   and **Mute Members** permissions (permission integer `7340032`), plus
-   `applications.commands` scope so it can register slash commands.
+4. Invite the bot with the `bot` and `applications.commands` scopes. For
+   ordinary voice playback and its cards, grant **View Channel**, **Send
+   Messages**, **Embed Links**, **Read Message History**, **Connect** and
+   **Speak** (permission integer `3230720`, as used by the setup wizard).
 5. Right-click your server and voice channel (with Developer Mode enabled in
    Discord) to copy their IDs for `DISCORD_GUILD_ID` and
    `DISCORD_CHANNEL_ID`.
+
+Check channel overrides too: voice access belongs on the voice channel, and
+the message permissions belong on `DISCORD_TEXT_CHANNEL_ID` (or the voice
+channel's text chat when that setting is omitted). See Discord's
+[permission reference](https://docs.discord.com/developers/topics/permissions).
+Music joins self-deafen through the gateway and need no **Deafen Members**
+permission. Stage channels additionally need **Mute Members** to let the bot
+[unsuppress itself](https://docs.discord.com/developers/resources/voice#modify-current-user-voice-state);
+grant it on the stage channel if you use stages. Nob's server tools have
+their own permission requirements in [two-bots.md](two-bots.md).
 
 ## Required environment variables
 

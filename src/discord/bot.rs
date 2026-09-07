@@ -305,14 +305,32 @@ async fn join_voice_inner(
                 return false;
             }
             tracing::info!(channel = %target_channel, "joined voice channel");
-            // Self-deafen so users know we're not listening
-            let bot_id = ctx.cache.current_user().id;
-            let _ = guild_id.edit_member(&ctx, bot_id,
-                serenity::builder::EditMember::new().deafen(true)).await;
-            tracing::info!("self-deafened");
+            // Update our own gateway voice state, not the guild member's
+            // server-deaf flag. The transition guard excludes replacement
+            // calls, and retirement cancels even a wait for the call lock.
+            tokio::select! {
+                biased;
+                _ = lease.cancelled.cancelled() => return false,
+                result = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                    let mut call = call.lock().await;
+                    call.deafen(true).await
+                }) => match result {
+                    Ok(Ok(())) => tracing::info!("requested voice self-deafen"),
+                    Ok(Err(error)) => tracing::warn!(?error, "failed to request voice self-deafen"),
+                    Err(_) => tracing::warn!("voice self-deafen request timed out"),
+                },
+            }
+            // Self-deafening failure is nonfatal to music playback. Never
+            // continue delayed setup for a retired music connection.
+            if !owner.current(&lease) {
+                return false;
+            }
             // On a stage channel the bot joins as a suppressed audience member;
             // unsuppress so its audio is actually heard.
             if let Ok(serenity::all::Channel::Guild(gc)) = target_channel.to_channel(&ctx).await {
+                if !owner.current(&lease) {
+                    return false;
+                }
                 if gc.kind == serenity::all::ChannelType::Stage {
                     let builder = serenity::builder::EditVoiceState::new().suppress(false);
                     if let Err(e) = gc.edit_own_voice_state(&ctx, builder).await {
@@ -395,7 +413,7 @@ impl EventHandler for Handler {
             // runs before it drains its mailbox, so sends queued below by
             // auto_start_stored_session can never race ahead of it — see
             // `ui::run`.
-            let tx = ui::spawn(ctx.clone(), self.text_channel_id, self.ytdlp_available);
+            let tx = ui::spawn(ctx.clone(), self.text_channel_id, self.ytdlp_available, self.config.profile.name());
             *self.ui_tx.lock() = Some(tx);
         }
 

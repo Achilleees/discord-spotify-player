@@ -67,6 +67,8 @@ src/
 │                            (enqueue/play/skip/stop/stop_without_leaving/
 │                            toggle_pause/previous/clear_queue/restore_queue/
 │                            query/lookup_spotify); runs media runners as spawns
+│                            and rechecks the Back caller's voice guard after
+│                            its request-correlated history read completes
 │
 ├── spotify/
 │   ├── mod.rs              re-exports (SpircCommand, EnsureOutcome, SessionSupervisor)
